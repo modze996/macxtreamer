@@ -40,12 +40,31 @@ Note: The produced binary name may vary with Cargo settings (case sensitivity). 
 ## Installation
 Simplest: use the generated binary from `target/release/`.
 
-Optional (macOS App Bundle): Use a tool like `cargo-bundle` to create a `.app` bundle. Not strictly configured in this project, but if desired:
+Optional (macOS App Bundle): Use `cargo-bundle` to create a `.app` bundle:
 ```bash
 cargo install cargo-bundle
 cargo bundle --release
 ```
 The `.app` bundle will show up under `target/release/bundle/osx/`.
+
+### App Icon
+- Generate assets (once):
+	- cargo run --bin genicon
+	- cargo run --bin mkiconset
+	- iconutil -c icns assets/macxtreamer.iconset -o assets/icon.icns
+- The app also embeds a generated icon at runtime for the window/Dock.
+
+### Create DMG (optional)
+```bash
+scripts/make_dmg.sh target/release/bundle/osx/MacXtreamer.app target/release/MacXtreamer.dmg
+```
+
+### Sign & Notarize (optional)
+1) Fill TEAM_ID, IDENTITY, Apple ID in `scripts/sign_and_notarize.sh`.
+2) Run:
+```bash
+scripts/sign_and_notarize.sh target/release/bundle/osx/MacXtreamer.app
+```
 
 ## Configuration
 On first start, set the following in “Settings”:

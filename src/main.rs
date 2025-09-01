@@ -16,6 +16,7 @@ mod api;
 mod player;
 mod storage;
 mod search;
+mod icon;
 
 use models::{Config, Category, Item, Episode, RecentItem, FavItem, Row};
 use api::{fetch_categories, fetch_items, fetch_series_episodes};
@@ -45,10 +46,11 @@ enum Msg {
 
 #[tokio::main]
 async fn main() -> Result<(), eframe::Error> {
-    let options = eframe::NativeOptions {
-        viewport: egui::ViewportBuilder::default().with_inner_size(egui::vec2(1500.0, 1600.0)),
-        ..Default::default()
-    };
+    let icon = icon::generate_icon(256);
+    let viewport = egui::ViewportBuilder::default()
+        .with_inner_size(egui::vec2(1500.0, 1600.0))
+        .with_icon(icon);
+    let options = eframe::NativeOptions { viewport, ..Default::default() };
     eframe::run_native(
         "MacXtreamer",
         options,
