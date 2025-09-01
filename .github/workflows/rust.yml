@@ -1,22 +1,88 @@
-name: Rust
+name: CI & Release
 
 on:
   push:
     branches: [ "main" ]
+    tags: [ "v*" ]
   pull_request:
     branches: [ "main" ]
+  workflow_dispatch:
 
 env:
   CARGO_TERM_COLOR: always
 
+permissions:
+  contents: write
+
 jobs:
-  build:
-
+  build_and_test:
+    name: Build & Test (Linux)
     runs-on: ubuntu-latest
-
     steps:
-    - uses: actions/checkout@v4
-    - name: Build
-      run: cargo build --verbose
-    - name: Run tests
-      run: cargo test --verbose
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Build
+        run: cargo build --verbose
+      - name: Test
+        run: cargo test --verbose
+
+  release_linux:
+    name: Release Linux x86_64
+    if: startsWith(github.ref, 'refs/tags/')
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Build (release)
+        run: cargo build --release --verbose
+      - name: Package tar.gz
+        id: package
+        run: |
+          BIN=macxtreamer
+          OUT="MacXtreamer-linux-x86_64.tar.gz"
+          tar -C target/release -czf "$OUT" "$BIN"
+          echo "asset=$OUT" >> "$GITHUB_OUTPUT"
+      - name: Upload artifact (workflow)
+        uses: actions/upload-artifact@v4
+        with:
+          name: linux
+          path: ${{ steps.package.outputs.asset }}
+      - name: Upload to GitHub Release
+        uses: softprops/action-gh-release@v2
+        if: startsWith(github.ref, 'refs/tags/')
+        with:
+          files: |
+            ${{ steps.package.outputs.asset }}
+
+  release_macos:
+    name: Release macOS
+    if: startsWith(github.ref, 'refs/tags/')
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Install cargo-bundle
+        run: cargo install cargo-bundle --locked || true
+      - name: Build bundle (.app)
+        run: cargo bundle --release
+      - name: Create DMG
+        run: bash scripts/make_dmg.sh target/release/bundle/osx/MacXtreamer.app target/release/MacXtreamer.dmg
+      - name: Zip .app
+        run: ditto -c -k --sequesterRsrc --keepParent target/release/bundle/osx/MacXtreamer.app MacXtreamer-macos.app.zip
+      - name: Upload artifacts (workflow)
+        uses: actions/upload-artifact@v4
+        with:
+          name: macos
+          path: |
+            target/release/MacXtreamer.dmg
+            MacXtreamer-macos.app.zip
+      - name: Upload to GitHub Release
+        uses: softprops/action-gh-release@v2
+        if: startsWith(github.ref, 'refs/tags/')
+        with:
+          files: |
+            target/release/MacXtreamer.dmg
+            MacXtreamer-macos.app.zip
