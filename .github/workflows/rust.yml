@@ -69,7 +69,7 @@ jobs:
       - name: Build bundle (.app)
         run: cargo bundle --release
       - name: Create DMG
-        run: bash scripts/make_dmg.sh target/release/bundle/osx/MacXtreamer.app target/release/MacXtreamer.dmg
+        run: ./create_dmg.sh
       - name: Zip .app
         run: ditto -c -k --sequesterRsrc --keepParent target/release/bundle/osx/MacXtreamer.app MacXtreamer-macos.app.zip
       - name: Upload artifacts (workflow)
