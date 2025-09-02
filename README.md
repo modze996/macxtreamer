@@ -38,7 +38,7 @@ Run (release binary):
 Note: The produced binary name may vary with Cargo settings (case sensitivity). Use `cargo build --release` and check `target/release/`.
 
 ## Installation
-Simplest: use the generated binary from `target/release/`.
+Simplest: use the generated binary from `target/release/`. Take a look on chapter "Bypass signing checks for DMG/App (Gatekeeper)" as there is currently only a not signed version.
 
 Optional (macOS App Bundle): Use `cargo-bundle` to create a `.app` bundle:
 ```bash
@@ -59,13 +59,6 @@ The `.app` bundle will show up under `target/release/bundle/osx/`.
 scripts/make_dmg.sh target/release/bundle/osx/MacXtreamer.app target/release/MacXtreamer.dmg
 ```
 
-### Sign & Notarize (optional)
-1) Fill TEAM_ID, IDENTITY, Apple ID in `scripts/sign_and_notarize.sh`.
-2) Run:
-```bash
-scripts/sign_and_notarize.sh target/release/bundle/osx/MacXtreamer.app
-```
-
 ## Configuration
 On first start, set the following in “Settings”:
 - URL (server address)
@@ -79,18 +72,6 @@ Paths (macOS):
 - Config: `~/Library/Application Support/MacXtreamer/xtream_config.txt`
 - Data (Recently/Favorites): `~/Library/Application Support/MacXtreamer/`
 - Cache (JSON/Covers): `~/Library/Caches/MacXtreamer/cache/` and `.../images/`
-
-Example `xtream_config.txt` (key=value):
-```
-address=https://your-server
-username=YOUR_USER
-password=YOUR_PASS
-player_command=vlc --fullscreen --no-video-title-show --network-caching=2000 URL
-theme=dark
-cover_ttl_days=7
-cover_parallel=6
-font_scale=1.15
-```
 
 ### Player command and placeholder
 The player command supports the placeholder `URL`. It will be replaced with the actual stream URL. If `URL` is missing, the URL will be appended at the end.
@@ -120,6 +101,41 @@ If `vlc` is not in PATH, use the full path, e.g.:
 - VLC doesn’t launch: Check `player_command` (path correct? `URL` placeholder present?)
 - No content: Check `address`, `username`, `password` in Settings/Config.
 - Font too big/small: The app uses an increased default scale; you can change `font_scale` in the config file.
+
+### macOS: Bypass signing checks for DMG/App (Gatekeeper)
+If you’re testing a locally built DMG or .app that isn’t signed/notarized yet, macOS Gatekeeper may block it. You can allow it temporarily from the command line:
+
+Option A: Allow apps from anywhere (system-wide until changed)
+```bash
+sudo spctl --master-disable
+```
+You can later re-enable Gatekeeper with:
+```bash
+sudo spctl --master-enable
+```
+
+Option B: Allow just this app (recommended)
+1) Remove the quarantine attribute from the app bundle (or DMG mount):
+```bash
+# If mounted at /Volumes/MacXtreamer/MacXtreamer.app
+xattr -dr com.apple.quarantine "/Volumes/MacXtreamer/MacXtreamer.app"
+
+# Or after copying to /Applications
+xattr -dr com.apple.quarantine "/Applications/MacXtreamer.app"
+```
+2) Explicitly allow the app via spctl:
+```bash
+spctl --add --label "MacXtreamer" "/Applications/MacXtreamer.app"
+spctl --enable --label "MacXtreamer"
+```
+3) First run may still prompt; open once via right-click → Open, or:
+```bash
+open "/Applications/MacXtreamer.app"
+```
+
+Notes:
+- You may need admin rights for some commands.
+- For distribution to other users, prefer proper signing and notarization.
 
 ## License
 See `LICENSE`.
