@@ -131,6 +131,28 @@ struct MacXtreamer {
 }
 
 impl MacXtreamer {
+    fn create_and_play_m3u(&self, entries: &[(String, String)]) -> Result<(), String> {
+        if entries.is_empty() {
+            return Err("No episodes to play".into());
+        }
+        let mut path = std::env::temp_dir();
+        let ts = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        path.push(format!("macxtreamer_binge_{}.m3u", ts));
+        let mut buf = String::from("#EXTM3U\n");
+        for (title, url) in entries {
+            buf.push_str(&format!("#EXTINF:-1,{}\n{}\n", title, url));
+        }
+        std::fs::write(&path, buf).map_err(|e| format!("Failed to write playlist: {}", e))?;
+        if let Some(p) = path.to_str() {
+            let _ = start_player(&self.config, p);
+            Ok(())
+        } else {
+            Err("Invalid playlist path".into())
+        }
+    }
     fn clear_caches_and_reload(&mut self) {
         // Clear on-disk caches (JSON + images)
         clear_all_caches();
@@ -1158,6 +1180,26 @@ impl eframe::App for MacXtreamer {
                                     }
                                     if ui.small_button("Copy").clicked() {
                                         ui.output_mut(|o| o.copied_text = url.clone());
+                                    }
+                                    if r.info == "SeriesEpisode" {
+                                        if ui.small_button("binge watch since here").clicked() {
+                                            // Build playlist from the currently visible/sorted rows starting at i
+                                            let mut entries: Vec<(String, String)> = Vec::new();
+                                            for rr in rows.iter().skip(i) {
+                                                if rr.info == "SeriesEpisode" {
+                                                    let u = build_url_by_type(
+                                                        &self.config,
+                                                        &rr.id,
+                                                        &rr.info,
+                                                        rr.container_extension.as_deref(),
+                                                    );
+                                                    entries.push((rr.name.clone(), u));
+                                                }
+                                            }
+                                            if let Err(e) = self.create_and_play_m3u(&entries) {
+                                                self.last_error = Some(e);
+                                            }
+                                        }
                                     }
                                     if ui.small_button("Fav").clicked() {
                                         toggle_favorite(&FavItem {
