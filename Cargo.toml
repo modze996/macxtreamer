@@ -1,7 +1,8 @@
 [package]
+name = "macxtreamer"
 version = "0.1.0"
 edition = "2024"
-name = "macxtreamer" 
+default-run = "macxtreamer"
 
 [dependencies]
 eframe = "0.24"
@@ -14,7 +15,7 @@ directories = "5"
 image = { version = "0.24", default-features = false, features = ["png", "jpeg"] }
 
 [package.metadata.bundle]
-name = "MacXtreamer"
+name = "macxtreamer"
 identifier = "com.yourdomain.macxtreamer"
 icon = ["assets/icon.icns"]
 copyright = "© 2025"
