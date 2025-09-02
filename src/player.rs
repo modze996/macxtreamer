@@ -1,6 +1,7 @@
 use std::io;
 use std::process::Command;
 use crate::models::Config;
+use crate::logger::{log_line, log_command, log_error};
 
 fn base_url(addr: &str) -> String {
     // Strip trailing / and optional /player_api.php to get the service root
@@ -77,12 +78,46 @@ pub fn start_player(cfg: &Config, stream_url: &str) -> io::Result<()> {
         if using_vlc && cfg.reuse_vlc && is_vlc_running() {
             // Reuse existing VLC instance by asking macOS to open the URL in VLC
             // This avoids spawning a new VLC process each time.
-            let _ = Command::new("open").arg("-a").arg("VLC").arg(stream_url).spawn()?;
+            log_line("Reusing running VLC via 'open -a VLC <URL>'");
+            log_line(&format!("URL={}", stream_url));
+            let mut child = Command::new("open").arg("-a").arg("VLC").arg(stream_url).spawn()?;
+            let _ = child.wait();
             return Ok(());
         }
     }
 
-    let _ = Command::new(program).args(parts).spawn()?;
+    // Log and spawn the command; try to capture basic status
+    log_command(&program, &parts);
+    match Command::new(&program).args(&parts).spawn() {
+        Ok(mut child) => {
+            let _ = child.wait();
+        }
+        Err(e) => {
+            log_error("Failed to spawn player", &e);
+            // macOS fallback: try `open -a VLC` if VLC was intended
+            #[cfg(target_os = "macos")]
+            {
+                if using_vlc {
+                    let mut cmd = Command::new("open");
+                    if !cfg.reuse_vlc {
+                        cmd.arg("-n"); // force new instance if reuse is disabled
+                    }
+                    cmd.arg("-a").arg("VLC");
+                    if !parts.is_empty() {
+                        cmd.arg("--args").args(&parts);
+                    }
+                    log_line("FALLBACK: open -a VLC (from failed spawn)");
+                    if let Ok(mut child) = cmd.spawn() {
+                        let _ = child.wait();
+                        return Ok(());
+                    } else {
+                        log_line("FALLBACK failed: could not run 'open -a VLC'");
+                    }
+                }
+            }
+            return Err(e);
+        }
+    }
     Ok(())
 }
 

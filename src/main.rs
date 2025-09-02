@@ -17,6 +17,7 @@ mod models;
 mod player;
 mod search;
 mod storage;
+mod logger;
 
 use api::{fetch_categories, fetch_items, fetch_series_episodes};
 use cache::{file_age_secs, image_cache_path, clear_all_caches};
@@ -125,6 +126,8 @@ struct MacXtreamer {
     // Async messaging
     tx: Sender<Msg>,
     rx: Receiver<Msg>,
+    show_log: bool,
+    log_text: String,
 }
 
 impl MacXtreamer {
@@ -186,6 +189,8 @@ impl MacXtreamer {
             sort_asc: true,
             tx,
             rx,
+            show_log: false,
+            log_text: String::new(),
         };
         app.current_theme = if app.config.theme.is_empty() {
             "dark".into()
@@ -753,6 +758,12 @@ impl eframe::App for MacXtreamer {
                         // Clear disk + memory caches and force a full fresh reload
                         self.clear_caches_and_reload();
                     }
+                    if ui.button("Open Log").clicked() {
+                        // Read log file and open viewer
+                        let path = crate::logger::log_path();
+                        self.log_text = std::fs::read_to_string(path).unwrap_or_else(|_| "(no log)".into());
+                        self.show_log = true;
+                    }
                     // Reuse VLC toggle
                     let mut reuse = self.config.reuse_vlc;
                     if ui.checkbox(&mut reuse, "Reuse VLC").on_hover_text("Open URLs in the already running VLC instance").changed() {
@@ -1240,6 +1251,34 @@ impl eframe::App for MacXtreamer {
             } else {
                 self.show_config = open;
             }
+        }
+
+        // Log viewer window
+        if self.show_log {
+            let mut open = self.show_log;
+            egui::Window::new("Application Log")
+                .default_width(840.0)
+                .default_height(420.0)
+                .open(&mut open)
+                .show(ctx, |ui| {
+                    ui.horizontal(|ui| {
+                        if ui.small_button("Refresh").clicked() {
+                            let path = crate::logger::log_path();
+                            self.log_text = std::fs::read_to_string(path).unwrap_or_else(|_| "(no log)".into());
+                        }
+                        if ui.small_button("Clear").clicked() {
+                            let path = crate::logger::log_path();
+                            let _ = std::fs::write(path, "");
+                            self.log_text.clear();
+                        }
+                    });
+                    egui::ScrollArea::vertical()
+                        .stick_to_bottom(true)
+                        .show(ui, |ui| {
+                            ui.monospace(&self.log_text);
+                        });
+                });
+            self.show_log = open;
         }
 
         // (kein zweites Bottom-Panel)
