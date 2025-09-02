@@ -78,6 +78,12 @@ pub async fn fetch_series_episodes(cfg: &Config, series_id: &str) -> Result<Vec<
         let res = reqwest::get(&url).await?;
         let json = res.json::<Value>().await?;
         let mut out = Vec::new();
+        // Series-level cover lives at info.movie_image (fallback to info.cover)
+        let series_cover = json
+            .get("info")
+            .and_then(|i| i.get("movie_image").or_else(|| i.get("cover")))
+            .and_then(|x| x.as_str())
+            .map(|s| s.to_string());
         if let Some(episodes_by_season) = json.get("episodes").and_then(|x| x.as_object()) {
             for (_season, eps) in episodes_by_season.iter() {
                 if let Some(arr) = eps.as_array() {
@@ -94,7 +100,13 @@ pub async fn fetch_series_episodes(cfg: &Config, series_id: &str) -> Result<Vec<
                         let name = ep.get("title").or_else(|| ep.get("name")).and_then(|x| x.as_str()).unwrap_or_default().to_string();
                         let container_extension = ep.get("container_extension").and_then(|x| x.as_str()).unwrap_or("mp4").to_string();
                         let stream_url = ep.get("stream_url").and_then(|x| x.as_str()).map(|s| s.to_string());
-                        out.push(Episode { episode_id, name, container_extension, stream_url });
+                        // Prefer episode-specific image if present, else series-level cover
+                        let ep_cover = ep
+                            .get("cover")
+                            .and_then(|x| x.as_str())
+                            .map(|s| s.to_string())
+                            .or_else(|| series_cover.clone());
+                        out.push(Episode { episode_id, name, container_extension, stream_url, cover: ep_cover });
                     }
                 }
             }

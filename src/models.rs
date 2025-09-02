@@ -57,6 +57,8 @@ pub struct Episode {
     pub container_extension: String,
     #[serde(default)]
     pub stream_url: Option<String>,
+    #[serde(default)]
+    pub cover: Option<String>,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]

@@ -666,14 +666,14 @@ impl eframe::App for MacXtreamer {
                 } => match episodes {
                     Ok(eps) => {
                         self.content_rows.clear();
-                        for ep in eps {
+            for ep in eps {
                             self.content_rows.push(Row {
                                 name: ep.name,
                                 id: ep.episode_id,
                                 info: "SeriesEpisode".to_string(),
                                 container_extension: Some(ep.container_extension),
                                 stream_url: ep.stream_url.clone(),
-                                cover_url: None,
+                cover_url: ep.cover.clone(),
                                 year: None,
                                 rating_5based: None,
                                 genre: None,
