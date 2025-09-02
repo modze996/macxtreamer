@@ -30,6 +30,16 @@ pub fn image_cache_path(url: &str) -> Option<PathBuf> {
 
 pub fn ensure_cache_dir() { let _ = fs::create_dir_all(cache_dir()); }
 
+/// Remove all cached data (JSON + images) from disk.
+/// Safe to call even if the cache directory does not exist.
+pub fn clear_all_caches() {
+    let dir = cache_dir();
+    // Best-effort removal; ignore errors (e.g., files in use) to avoid crashing the UI.
+    let _ = fs::remove_dir_all(&dir);
+    // Recreate base dir so subsequent writes succeed.
+    let _ = fs::create_dir_all(&dir);
+}
+
 pub fn file_age_secs(path: &PathBuf) -> Option<u64> {
     if let Ok(meta) = fs::metadata(path) {
         if let Ok(modified) = meta.modified() {

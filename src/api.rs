@@ -82,7 +82,15 @@ pub async fn fetch_series_episodes(cfg: &Config, series_id: &str) -> Result<Vec<
             for (_season, eps) in episodes_by_season.iter() {
                 if let Some(arr) = eps.as_array() {
                     for ep in arr {
-                        let episode_id = ep.get("id").or_else(|| ep.get("episode_id")).and_then(|x| x.as_i64()).map(|n| n.to_string()).unwrap_or_default();
+                        // Read ID from several possible shapes (string or number)
+                        let read_id = |v: &Value| -> Option<String> {
+                            v.as_str().map(|s| s.to_string()).or_else(|| v.as_i64().map(|n| n.to_string()))
+                        };
+                        let episode_id = ep.get("episode_id")
+                            .and_then(read_id)
+                            .or_else(|| ep.get("id").and_then(read_id))
+                            .or_else(|| ep.get("stream_id").and_then(read_id))
+                            .unwrap_or_default();
                         let name = ep.get("title").or_else(|| ep.get("name")).and_then(|x| x.as_str()).unwrap_or_default().to_string();
                         let container_extension = ep.get("container_extension").and_then(|x| x.as_str()).unwrap_or("mp4").to_string();
                         let stream_url = ep.get("stream_url").and_then(|x| x.as_str()).map(|s| s.to_string());

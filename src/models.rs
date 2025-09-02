@@ -15,6 +15,8 @@ pub struct Config {
     pub cover_parallel: u32,      // 6 default
     #[serde(default)]
     pub font_scale: f32,          // 1.0..=?, default increased (e.g., 1.15)
+    #[serde(default)]
+    pub reuse_vlc: bool,          // default true
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -63,6 +65,8 @@ pub struct RecentItem {
     pub name: String,
     pub info: String,
     pub stream_url: String,
+    #[serde(default)]
+    pub container_extension: Option<String>,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -71,6 +75,8 @@ pub struct FavItem {
     pub info: String,
     pub name: String,
     pub stream_url: Option<String>,
+    #[serde(default)]
+    pub container_extension: Option<String>,
 }
 
 #[derive(Debug, Clone)]
