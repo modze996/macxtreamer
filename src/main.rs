@@ -128,9 +128,15 @@ struct MacXtreamer {
     rx: Receiver<Msg>,
     show_log: bool,
     log_text: String,
+    initial_config_pending: bool,
 }
 
 impl MacXtreamer {
+    fn config_is_complete(&self) -> bool {
+        !(self.config.address.trim().is_empty()
+            || self.config.username.trim().is_empty()
+            || self.config.password.trim().is_empty())
+    }
     fn create_and_play_m3u(&self, entries: &[(String, String)]) -> Result<(), String> {
         if entries.is_empty() {
             return Err("No episodes to play".into());
@@ -173,7 +179,11 @@ impl MacXtreamer {
         self.spawn_preload_all();
     }
     fn new() -> Self {
-        let config = read_config().unwrap_or_default();
+        let read_result = read_config();
+        let (config, had_file) = match read_result {
+            Ok(c) => (c, true),
+            Err(_) => (Config::default(), false),
+        };
         let (tx, rx) = mpsc::channel();
         let mut app = Self {
             config,
@@ -213,7 +223,13 @@ impl MacXtreamer {
             rx,
             show_log: false,
             log_text: String::new(),
+            initial_config_pending: false,
         };
+        // Determine initial config readiness
+        if !had_file || !app.config_is_complete() {
+            app.show_config = true;
+            app.initial_config_pending = true;
+        }
         app.current_theme = if app.config.theme.is_empty() {
             "dark".into()
         } else {
@@ -229,13 +245,16 @@ impl MacXtreamer {
             app.config.font_scale = 1.15;
         }
         app.cover_sem = Arc::new(Semaphore::new(app.config.cover_parallel as usize));
-        app.reload_categories();
-        // Starte Preloading im Hintergrund
-        app.spawn_preload_all();
+        // Only preload/load categories if config is complete
+        if app.config_is_complete() {
+            app.reload_categories();
+            app.spawn_preload_all();
+        }
         app
     }
 
     fn reload_categories(&mut self) {
+    if !self.config_is_complete() { return; }
         self.is_loading = true;
         self.loading_total = 3;
         self.loading_done = 0;
@@ -262,6 +281,7 @@ impl MacXtreamer {
     }
 
     fn spawn_load_items(&self, kind: &str, category_id: String) {
+    if !self.config_is_complete() { return; }
         let cfg = self.config.clone();
         let tx = self.tx.clone();
         let kind_s = kind.to_string();
@@ -275,6 +295,7 @@ impl MacXtreamer {
     }
 
     fn spawn_load_episodes(&self, series_id: String) {
+    if !self.config_is_complete() { return; }
         let cfg = self.config.clone();
         let tx = self.tx.clone();
         let sid = series_id;
@@ -356,6 +377,7 @@ impl MacXtreamer {
         if self.indexing {
             return;
         }
+    if !self.config_is_complete() { return; }
         self.indexing = true;
         let tx = self.tx.clone();
         let cfg = self.config.clone();
@@ -432,6 +454,7 @@ impl MacXtreamer {
     }
 
     fn spawn_preload_all(&mut self) {
+    if !self.config_is_complete() { return; }
         // Nur einmal zu Beginn sinnvoll; löst Caching aller Kategorien/Items aus, inkl. Cover
         let cfg = self.config.clone();
         let tx = self.tx.clone();
@@ -779,6 +802,9 @@ impl eframe::App for MacXtreamer {
                     if ui.button("Reload").clicked() {
                         // Clear disk + memory caches and force a full fresh reload
                         self.clear_caches_and_reload();
+                    }
+                    if self.initial_config_pending && !self.config_is_complete() {
+                        ui.colored_label(Color32::YELLOW, "Please complete settings to start");
                     }
                     if ui.button("Open Log").clicked() {
                         // Read log file and open viewer
@@ -1433,7 +1459,14 @@ impl eframe::App for MacXtreamer {
                 self.config.cover_parallel
             } as usize;
             self.cover_sem = Arc::new(Semaphore::new(permits));
-            self.reload_categories();
+            if self.config_is_complete() {
+                // Only start loading now if config became complete
+                self.reload_categories();
+                if self.initial_config_pending {
+                    self.spawn_preload_all();
+                    self.initial_config_pending = false;
+                }
+            }
             self.show_config = false;
             self.pending_save_config = false;
             self.config_draft = None;
