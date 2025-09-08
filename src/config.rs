@@ -28,9 +28,18 @@ pub fn read_config() -> Result<Config, io::Error> {
                 "cover_ttl_days" => cfg.cover_ttl_days = v.trim().parse::<u32>().unwrap_or(7),
                 "cover_parallel" => cfg.cover_parallel = v.trim().parse::<u32>().unwrap_or(6),
                 "font_scale" => cfg.font_scale = v.trim().parse::<f32>().unwrap_or(1.15),
+                "download_dir" => cfg.download_dir = v.trim().to_string(),
                 "reuse_vlc" => cfg.reuse_vlc = v.trim().parse::<u8>().map(|n| n != 0).unwrap_or(true),
+                "cover_uploads_per_frame" => cfg.cover_uploads_per_frame = v.trim().parse::<u32>().unwrap_or(3),
+                "cover_decode_parallel" => cfg.cover_decode_parallel = v.trim().parse::<u32>().unwrap_or(2),
+                "texture_cache_limit" => cfg.texture_cache_limit = v.trim().parse::<u32>().unwrap_or(512),
                 _ => {}
             }
+        }
+    }
+    if cfg.download_dir.trim().is_empty() {
+        if let Ok(home) = std::env::var("HOME") {
+            cfg.download_dir = format!("{}/Downloads/macxtreamer", home);
         }
     }
     Ok(cfg)
@@ -48,6 +57,10 @@ pub fn save_config(cfg: &Config) -> Result<(), io::Error> {
     if cfg.cover_ttl_days != 0 { writeln!(f, "cover_ttl_days={}", cfg.cover_ttl_days)?; }
     if cfg.cover_parallel != 0 { writeln!(f, "cover_parallel={}", cfg.cover_parallel)?; }
     if cfg.font_scale != 0.0 { writeln!(f, "font_scale={:.2}", cfg.font_scale)?; }
+    if !cfg.download_dir.is_empty() { writeln!(f, "download_dir={}", cfg.download_dir)?; }
     writeln!(f, "reuse_vlc={}", if cfg.reuse_vlc { 1 } else { 0 })?;
+    if cfg.cover_uploads_per_frame != 0 { writeln!(f, "cover_uploads_per_frame={}", cfg.cover_uploads_per_frame)?; }
+    if cfg.cover_decode_parallel != 0 { writeln!(f, "cover_decode_parallel={}", cfg.cover_decode_parallel)?; }
+    if cfg.texture_cache_limit != 0 { writeln!(f, "texture_cache_limit={}", cfg.texture_cache_limit)?; }
     Ok(())
 }

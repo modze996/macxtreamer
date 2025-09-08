@@ -17,6 +17,14 @@ pub struct Config {
     pub font_scale: f32,          // 1.0..=?, default increased (e.g., 1.15)
     #[serde(default)]
     pub reuse_vlc: bool,          // default true
+    #[serde(default)]
+    pub download_dir: String,     // default ~/Downloads/macxtreamer
+    #[serde(default)]
+    pub cover_uploads_per_frame: u32, // default 3
+    #[serde(default)]
+    pub cover_decode_parallel: u32,   // default 2
+    #[serde(default)]
+    pub texture_cache_limit: u32,     // default 512
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -92,6 +100,7 @@ pub struct Row {
     pub year: Option<String>,
     pub rating_5based: Option<f32>,
     pub genre: Option<String>,
+    pub path: Option<String>,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]

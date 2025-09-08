@@ -76,12 +76,11 @@ pub fn start_player(cfg: &Config, stream_url: &str) -> io::Result<()> {
     #[cfg(target_os = "macos")]
     {
         if using_vlc && cfg.reuse_vlc && is_vlc_running() {
-            // Reuse existing VLC instance by asking macOS to open the URL in VLC
-            // This avoids spawning a new VLC process each time.
-            log_line("Reusing running VLC via 'open -a VLC <URL>'");
+            log_line("Reusing running VLC via 'open -a VLC <URL>' (non-blocking)");
             log_line(&format!("URL={}", stream_url));
-            let mut child = Command::new("open").arg("-a").arg("VLC").arg(stream_url).spawn()?;
-            let _ = child.wait();
+            if let Ok(child) = Command::new("open").arg("-a").arg("VLC").arg(stream_url).spawn() {
+                log_line(&format!("Spawned 'open' pid={}", child.id()));
+            }
             return Ok(());
         }
     }
@@ -89,8 +88,8 @@ pub fn start_player(cfg: &Config, stream_url: &str) -> io::Result<()> {
     // Log and spawn the command; try to capture basic status
     log_command(&program, &parts);
     match Command::new(&program).args(&parts).spawn() {
-        Ok(mut child) => {
-            let _ = child.wait();
+        Ok(child) => {
+            log_line(&format!("Spawned player pid={} program={} args={:?}", child.id(), program, parts));
         }
         Err(e) => {
             log_error("Failed to spawn player", &e);
@@ -106,9 +105,9 @@ pub fn start_player(cfg: &Config, stream_url: &str) -> io::Result<()> {
                     if !parts.is_empty() {
                         cmd.arg("--args").args(&parts);
                     }
-                    log_line("FALLBACK: open -a VLC (from failed spawn)");
-                    if let Ok(mut child) = cmd.spawn() {
-                        let _ = child.wait();
+                    log_line("FALLBACK: open -a VLC (from failed spawn, non-blocking)");
+                    if let Ok(child) = cmd.spawn() {
+                        log_line(&format!("Fallback spawned pid={}", child.id()));
                         return Ok(());
                     } else {
                         log_line("FALLBACK failed: could not run 'open -a VLC'");
