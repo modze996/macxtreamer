@@ -25,6 +25,12 @@ pub struct Config {
     pub cover_decode_parallel: u32,   // default 2
     #[serde(default)]
     pub texture_cache_limit: u32,     // default 512
+    #[serde(default)]
+    pub category_parallel: u32,       // default 6
+    #[serde(default)]
+    pub cover_height: f32,            // default 60.0
+    #[serde(default)]
+    pub enable_downloads: bool,       // default false
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]

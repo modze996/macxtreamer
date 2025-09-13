@@ -137,5 +137,33 @@ Notes:
 - You may need admin rights for some commands.
 - For distribution to other users, prefer proper signing and notarization.
 
+## Android / Fire TV (Option A)
+This repo contains an Android TV app (Compose + Media3) that reuses a Rust core via JNI.
+
+### Prerequisites
+- Android Studio (Giraffe or newer), Android SDK + NDK
+- cargo-ndk installed: `cargo install cargo-ndk`
+- Set `ANDROID_NDK_HOME` (or ensure Android Studio manages the NDK and cargo-ndk finds it)
+
+### Build native Rust core for Android
+```bash
+scripts/build_android_core.sh
+```
+This will build `macxtreamer_core` for common ABIs and copy `.so` files into `mobile/android/app/src/main/jniLibs/`.
+
+### Build and run the Android app
+- Open `mobile/android` in Android Studio, sync Gradle, then Run on a device/emulator (Fire TV/Android TV recommended).
+
+### Try it
+1) Launch the app, go to the VOD tab
+2) Enter address, username, password, tap “Save config”
+3) Tap “Fetch VOD Cats”, choose a category
+4) Tap an item to play it; a Player screen opens with ExoPlayer
+5) Live and Series tabs provide basic category/item browsing as well
+
+Notes:
+- The JNI bridge currently returns JSON for categories/items. The UI maps minimal fields (id, name).
+- Playback URL building uses the same logic as desktop (info: Movie/Live/SeriesEpisode). Container extensions default to mp4/m3u8.
+
 ## License
 See `LICENSE`.
