@@ -422,6 +422,7 @@ impl MacXtreamer {
             app.config.cover_height = 60.0;
         }
         app.cover_height = app.config.cover_height;
+        // enable_downloads defaults to false via #[serde(default)] - no initialization needed
         app.cover_sem = Arc::new(Semaphore::new(app.config.cover_parallel as usize));
         app.decode_sem = Arc::new(Semaphore::new(app.config.cover_decode_parallel as usize));
         // Only preload/load categories if config is complete
