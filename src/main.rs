@@ -1,132 +1,41 @@
 use eframe::egui::{self, Color32, RichText};
-use image::GenericImageView;
 use egui_extras::TableBuilder;
-use std::collections::HashSet;
-use std::collections::VecDeque;
-use std::collections::{HashMap, HashSet as HashSet2};
-// std::fs is used via fully-qualified paths where needed; avoid importing the module.
+use image::GenericImageView;
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::time::Duration;
-use tokio::sync::Semaphore;
 use tokio::io::AsyncReadExt;
+use tokio::sync::Semaphore;
 
 mod api;
+mod app_state;
 mod cache;
 mod config;
+mod downloads;
 mod icon;
+mod images;
 mod logger;
 mod models;
 mod player;
 mod search;
 mod storage;
+mod ui_helpers;
 
 use api::{fetch_categories, fetch_items, fetch_series_episodes};
+use app_state::{Msg, SortKey, ViewState};
 use cache::{clear_all_caches, file_age_secs, image_cache_path};
-use reqwest::header::{ETAG, IF_MODIFIED_SINCE, IF_NONE_MATCH, LAST_MODIFIED};
 use config::{read_config, save_config};
-use models::{Category, Config, Episode, FavItem, Item, RecentItem, Row};
-// use crate::logger::log_line; // re-enabled later when spawning actual download
+use downloads::{BulkOptions, sanitize_filename};
+use images::image_meta_path;
+use models::{Category, Config, FavItem, Item, RecentItem, Row};
+use ui_helpers::{colored_text_by_type, render_loading_spinner, format_file_size, file_path_to_uri};
 use player::{build_url_by_type, start_player};
+use reqwest::header::{ETAG, IF_MODIFIED_SINCE, IF_NONE_MATCH, LAST_MODIFIED};
 use search::search_items;
 use storage::{add_to_recently, load_favorites, load_recently_played, toggle_favorite};
-
-// Helper: path to sidecar metadata for an image cache file (stores ETag/Last-Modified)
-fn image_meta_path(url: &str) -> Option<std::path::PathBuf> {
-    image_cache_path(url).and_then(|p| {
-        let fname = p.file_name()?.to_string_lossy().to_string();
-        let mut meta = p.clone();
-        meta.set_file_name(format!("{}.meta", fname));
-        Some(meta)
-    })
-}
-
-#[derive(Debug, Clone, Default)]
-struct BulkOptions {
-    only_not_downloaded: bool,
-    season: Option<u32>,
-    max_count: u32, // 0 = all
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum SortKey {
-    Name,
-    Year,
-    Rating,
-    Genre,
-}
-
-enum Msg {
-    LiveCategories(Result<Vec<Category>, String>),
-    VodCategories(Result<Vec<Category>, String>),
-    SeriesCategories(Result<Vec<Category>, String>),
-    ItemsLoaded {
-        kind: String,
-        items: Result<Vec<Item>, String>,
-    },
-    EpisodesLoaded {
-        series_id: String,
-        episodes: Result<Vec<Episode>, String>,
-    },
-    CoverLoaded {
-        url: String,
-        bytes: Vec<u8>,
-    },
-    CoverDecoded {
-        url: String,
-        rgba: Vec<u8>,
-        w: u32,
-        h: u32,
-    },
-    IndexBuilt {
-        movies: usize,
-        series: usize,
-    },
-    SearchReady(Vec<Row>),
-    IndexData {
-        movies: Vec<(Item, String)>,
-        series: Vec<(Item, String)>,
-    },
-    PreloadSet {
-        total: usize,
-    },
-    PreloadTick,
-    PrefetchCovers(Vec<String>),
-    SeriesEpisodesForDownload {
-        series_id: String,
-        episodes: Result<Vec<Episode>, String>,
-    },
-    DownloadStarted {
-        id: String,
-        path: String,
-    },
-    DownloadProgress {
-        id: String,
-        received: u64,
-        total: Option<u64>,
-    },
-    DownloadFinished {
-        id: String,
-        path: String,
-    },
-    DownloadError {
-        id: String,
-        error: String,
-    },
-    DownloadCancelled {
-        id: String,
-    },
-    DownloadsScanned(Vec<ScannedDownload>),
-}
-
-#[derive(Debug, Clone)]
-enum ViewState {
-    Items { kind: String, category_id: String },
-    Episodes { series_id: String },
-    Search { query: String },
-}
 
 #[tokio::main]
 async fn main() -> Result<(), eframe::Error> {
@@ -159,7 +68,7 @@ struct MacXtreamer {
     favorites: Vec<FavItem>,
     // UI assets
     textures: HashMap<String, egui::TextureHandle>,
-    pending_covers: HashSet2<String>,
+    pending_covers: HashSet<String>,
     // Queue of cover bytes waiting to be decoded & uploaded as textures (budgeted per frame)
     pending_texture_uploads: VecDeque<(String, Vec<u8>, u32, u32)>,
     // URLs currently queued for upload, and for background decode, to avoid duplicates
@@ -219,6 +128,16 @@ struct MacXtreamer {
 }
 
 #[derive(Debug, Clone)]
+struct DownloadMeta {
+    id: String,
+    name: String,
+    info: String,
+    container_extension: Option<String>,
+    size: Option<u64>,
+    modified: Option<std::time::SystemTime>,
+}
+
+#[derive(Debug, Clone)]
 struct DownloadState {
     received: u64,
     total: Option<u64>,
@@ -244,17 +163,7 @@ impl Default for DownloadState {
 }
 
 #[derive(Debug, Clone)]
-struct DownloadMeta {
-    id: String,
-    name: String,
-    info: String,
-    container_extension: Option<String>,
-    size: Option<u64>,
-    modified: Option<std::time::SystemTime>,
-}
-
-#[derive(Debug, Clone)]
-struct ScannedDownload {
+pub struct ScannedDownload {
     id: String,
     name: String,
     info: String,
@@ -298,13 +207,13 @@ impl MacXtreamer {
         // Clear in-memory caches
         self.textures.clear();
         self.pending_covers.clear();
-    self.pending_texture_uploads.clear();
-    self.pending_texture_urls.clear();
-    self.pending_decode_urls.clear();
+        self.pending_texture_uploads.clear();
+        self.pending_texture_urls.clear();
+        self.pending_decode_urls.clear();
         self.all_movies.clear();
-    self.all_series.clear();
+        self.all_series.clear();
         self.content_rows.clear();
-    self.index_paths.clear();
+        self.index_paths.clear();
         // Reset loading state and kick off a fresh load
         self.is_loading = true;
         self.loading_done = 0;
@@ -334,7 +243,7 @@ impl MacXtreamer {
             recently: load_recently_played(),
             favorites: load_favorites(),
             textures: HashMap::new(),
-            pending_covers: HashSet2::new(),
+            pending_covers: HashSet::new(),
             pending_texture_uploads: VecDeque::new(),
             pending_texture_urls: HashSet::new(),
             pending_decode_urls: HashSet::new(),
@@ -372,7 +281,11 @@ impl MacXtreamer {
             show_downloads: false,
             index_paths: HashMap::new(),
             confirm_bulk: None,
-            bulk_opts_draft: BulkOptions { only_not_downloaded: true, season: None, max_count: 0 },
+            bulk_opts_draft: BulkOptions {
+                only_not_downloaded: true,
+                season: None,
+                max_count: 0,
+            },
             bulk_options_by_series: HashMap::new(),
             pending_bulk_downloads: Vec::new(),
             http_client: reqwest::Client::builder()
@@ -448,7 +361,7 @@ impl MacXtreamer {
         let tx_live = self.tx.clone();
         let tx_vod = self.tx.clone();
         let tx_series = self.tx.clone();
-    tokio::spawn(async move {
+        tokio::spawn(async move {
             let r = fetch_categories(&cfg_live, "get_live_categories").await;
             let _ = tx_live.send(Msg::LiveCategories(r.map_err(|e| e.to_string())));
         });
@@ -676,7 +589,10 @@ impl MacXtreamer {
                 movies: all_movies.len(),
                 series: all_series.len(),
             });
-            let _ = tx.send(Msg::IndexData { movies: all_movies, series: all_series });
+            let _ = tx.send(Msg::IndexData {
+                movies: all_movies,
+                series: all_series,
+            });
         });
     }
 
@@ -733,7 +649,7 @@ impl MacXtreamer {
                 fetch_categories(&cfg, "get_series_categories"),
                 fetch_categories(&cfg, "get_live_categories")
             );
-            
+
             let vod = vod_result.unwrap_or_default();
             let ser = ser_result.unwrap_or_default();
             let live = live_result.unwrap_or_default();
@@ -745,7 +661,11 @@ impl MacXtreamer {
             });
 
             // Create semaphore to limit concurrent requests (avoid overwhelming server)
-            let category_parallel = if cfg.category_parallel == 0 { 6 } else { cfg.category_parallel } as usize;
+            let category_parallel = if cfg.category_parallel == 0 {
+                6
+            } else {
+                cfg.category_parallel
+            } as usize;
             let sem = Arc::new(tokio::sync::Semaphore::new(category_parallel));
             let mut live_tasks = Vec::new();
             let mut content_tasks = Vec::new();
@@ -858,56 +778,33 @@ impl MacXtreamer {
         PathBuf::from(raw)
     }
 
-    fn sanitize_title_for_fs(title: &str) -> String {
-        let mut out = String::with_capacity(title.len());
-        let mut last_underscore = false;
-        for ch in title.chars() {
-            let keep = ch.is_ascii_alphanumeric();
-            if keep {
-                out.push(ch);
-                last_underscore = false;
-            } else if matches!(ch, ' ' | '-' | '_' | '.' ) {
-                if !last_underscore {
-                    out.push('_');
-                    last_underscore = true;
-                }
-            }
-            // other chars dropped
-            if out.len() >= 120 { break; }
-        }
-        while out.ends_with('_') { out.pop(); }
-        if out.is_empty() { "download".into() } else { out }
-    }
 
     fn local_file_path(&self, id: &str, name: &str, container_ext: Option<&str>) -> PathBuf {
         // Filename now based on (sanitized) title instead of id.
         let mut dir = self.expand_download_dir();
         let ext = container_ext.unwrap_or("mp4").trim_start_matches('.');
-        let mut base = Self::sanitize_title_for_fs(name);
-        if base.len() < 2 { base = id.to_string(); }
+        let mut base = sanitize_filename(name);
+        if base.len() < 2 {
+            base = id.to_string();
+        }
         let filename = format!("{base}.{ext}");
         dir.push(filename);
         dir
     }
 
-    fn local_file_exists(&self, id: &str, name: &str, container_ext: Option<&str>) -> Option<PathBuf> {
+    fn local_file_exists(
+        &self,
+        id: &str,
+        name: &str,
+        container_ext: Option<&str>,
+    ) -> Option<PathBuf> {
         let p = self.local_file_path(id, name, container_ext);
         if p.exists() { Some(p) } else { None }
     }
 
     // (Old local_file_exists(id, ext) removed)
 
-    fn file_path_to_uri(p: &Path) -> String {
-        // Simple percent-encode spaces only (sufficient for our filenames)
-        let s = p.to_string_lossy().replace(' ', "%20");
-        if s.starts_with('/') {
-            format!("file://{}", s)
-        } else if s.starts_with("file://") {
-            s
-        } else {
-            format!("file://{}", s)
-        }
-    }
+
 
     fn spawn_download(&mut self, row: &Row) {
         if !self.config_is_complete() {
@@ -923,8 +820,10 @@ impl MacXtreamer {
             return;
         }
         // If file already on disk (maybe previous session) play immediately
-    if let Some(path) = self.local_file_exists(&id, &row.name, row.container_extension.as_deref()) {
-            let uri = Self::file_path_to_uri(&path);
+        if let Some(path) =
+            self.local_file_exists(&id, &row.name, row.container_extension.as_deref())
+        {
+            let uri = file_path_to_uri(&path);
             let _ = start_player(&self.config, &uri);
             return;
         }
@@ -962,7 +861,13 @@ impl MacXtreamer {
     }
 
     // Enqueue a download job without auto-playing if the file already exists (used for bulk)
-    fn spawn_download_bulk(&mut self, id: String, name: String, info: String, container_extension: Option<String>) {
+    fn spawn_download_bulk(
+        &mut self,
+        id: String,
+        name: String,
+        info: String,
+        container_extension: Option<String>,
+    ) {
         if !self.config_is_complete() {
             return;
         }
@@ -975,7 +880,10 @@ impl MacXtreamer {
             return;
         }
         // Skip if file already exists (no auto-play in bulk)
-    if self.local_file_exists(&id, &name, container_extension.as_deref()).is_some() {
+        if self
+            .local_file_exists(&id, &name, container_extension.as_deref())
+            .is_some()
+        {
             return;
         }
         // If currently downloading just ignore
@@ -1044,7 +952,8 @@ impl MacXtreamer {
             &meta.info,
             meta.container_extension.as_deref(),
         );
-    let target_path = self.local_file_path(&meta.id, &meta.name, meta.container_extension.as_deref());
+        let target_path =
+            self.local_file_path(&meta.id, &meta.name, meta.container_extension.as_deref());
         let tmp_path = target_path.with_extension(format!(
             "{}.part",
             target_path
@@ -1151,8 +1060,10 @@ impl MacXtreamer {
 
     fn resolve_play_url(&self, row: &Row) -> String {
         if row.info == "Movie" || row.info == "SeriesEpisode" {
-        if let Some(p) = self.local_file_exists(&row.id, &row.name, row.container_extension.as_deref()) {
-                return Self::file_path_to_uri(&p);
+            if let Some(p) =
+                self.local_file_exists(&row.id, &row.name, row.container_extension.as_deref())
+            {
+                return file_path_to_uri(&p);
             }
         }
         if row.info == "SeriesEpisode" {
@@ -1177,7 +1088,9 @@ impl MacXtreamer {
     fn scan_download_directory(&mut self) {
         let now = std::time::Instant::now();
         if let Some(last) = self.last_download_scan {
-            if now.duration_since(last) < Duration::from_secs(5) { return; }
+            if now.duration_since(last) < Duration::from_secs(5) {
+                return;
+            }
         }
         self.last_download_scan = Some(now);
         let dir = self.expand_download_dir();
@@ -1187,23 +1100,55 @@ impl MacXtreamer {
             if let Ok(mut rd) = tokio::fs::read_dir(&dir).await {
                 while let Ok(Some(entry)) = rd.next_entry().await {
                     let path = entry.path();
-                    if path.extension().and_then(|e| e.to_str()) == Some("part") { continue; }
+                    if path.extension().and_then(|e| e.to_str()) == Some("part") {
+                        continue;
+                    }
                     if let Ok(md) = entry.metadata().await {
                         if md.is_file() {
-                            let mut id = path.file_stem().and_then(|s| s.to_str()).unwrap_or_default().to_string();
+                            let mut id = path
+                                .file_stem()
+                                .and_then(|s| s.to_str())
+                                .unwrap_or_default()
+                                .to_string();
                             let mut name = id.clone();
                             let mut info = "Movie".to_string();
-                            let mut container_extension = path.extension().and_then(|s| s.to_str()).map(|s| s.to_string());
-                            let sidecar = path.with_extension(format!("{}.json", path.extension().and_then(|e| e.to_str()).unwrap_or_default()));
+                            let mut container_extension = path
+                                .extension()
+                                .and_then(|s| s.to_str())
+                                .map(|s| s.to_string());
+                            let sidecar = path.with_extension(format!(
+                                "{}.json",
+                                path.extension()
+                                    .and_then(|e| e.to_str())
+                                    .unwrap_or_default()
+                            ));
                             if let Ok(data) = tokio::fs::read(&sidecar).await {
                                 if let Ok(js) = serde_json::from_slice::<serde_json::Value>(&data) {
-                                    if let Some(v) = js.get("id").and_then(|v| v.as_str()) { id = v.to_string(); }
-                                    if let Some(v) = js.get("name").and_then(|v| v.as_str()) { name = v.to_string(); }
-                                    if let Some(v) = js.get("info").and_then(|v| v.as_str()) { info = v.to_string(); }
-                                    if let Some(v) = js.get("ext").and_then(|v| v.as_str()) { container_extension = Some(v.to_string()); }
+                                    if let Some(v) = js.get("id").and_then(|v| v.as_str()) {
+                                        id = v.to_string();
+                                    }
+                                    if let Some(v) = js.get("name").and_then(|v| v.as_str()) {
+                                        name = v.to_string();
+                                    }
+                                    if let Some(v) = js.get("info").and_then(|v| v.as_str()) {
+                                        info = v.to_string();
+                                    }
+                                    if let Some(v) = js.get("ext").and_then(|v| v.as_str()) {
+                                        container_extension = Some(v.to_string());
+                                    }
                                 }
                             }
-                            out.push(ScannedDownload { id, name, info, container_extension, path: path.to_string_lossy().into(), size: md.len(), modified: md.modified().unwrap_or(std::time::SystemTime::UNIX_EPOCH) });
+                            out.push(ScannedDownload {
+                                id,
+                                name,
+                                info,
+                                container_extension,
+                                path: path.to_string_lossy().into(),
+                                size: md.len(),
+                                modified: md
+                                    .modified()
+                                    .unwrap_or(std::time::SystemTime::UNIX_EPOCH),
+                            });
                         }
                     }
                 }
@@ -1229,13 +1174,13 @@ impl eframe::App for MacXtreamer {
             // Get the default style as baseline
             let default_style = egui::Style::default();
             let mut style = default_style;
-            
+
             // Apply our scale to the default font sizes (not current ones)
             let scale = self.current_font_scale.max(0.6).min(2.0);
             style.text_styles.iter_mut().for_each(|(_, ts)| {
                 ts.size *= scale;
             });
-            
+
             ctx.set_style(style);
             self.font_scale_applied = true;
         }
@@ -1428,21 +1373,27 @@ impl eframe::App for MacXtreamer {
                                     rating_5based: it.rating_5based,
                                     genre: it.genre.clone(),
                                     path: Some(match info {
-                                        "Movie" => format!("VOD / {}", self
-                                            .vod_categories
-                                            .get(self.selected_vod.unwrap_or(0))
-                                            .map(|c| c.name.clone())
-                                            .unwrap_or_else(|| "?".into())),
-                                        "Series" => format!("Series / {}", self
-                                            .series_categories
-                                            .get(self.selected_series.unwrap_or(0))
-                                            .map(|c| c.name.clone())
-                                            .unwrap_or_else(|| "?".into())),
-                                        "Channel" => format!("Live / {}", self
-                                            .playlists
-                                            .get(self.selected_playlist.unwrap_or(0))
-                                            .map(|c| c.name.clone())
-                                            .unwrap_or_else(|| "?".into())),
+                                        "Movie" => format!(
+                                            "VOD / {}",
+                                            self.vod_categories
+                                                .get(self.selected_vod.unwrap_or(0))
+                                                .map(|c| c.name.clone())
+                                                .unwrap_or_else(|| "?".into())
+                                        ),
+                                        "Series" => format!(
+                                            "Series / {}",
+                                            self.series_categories
+                                                .get(self.selected_series.unwrap_or(0))
+                                                .map(|c| c.name.clone())
+                                                .unwrap_or_else(|| "?".into())
+                                        ),
+                                        "Channel" => format!(
+                                            "Live / {}",
+                                            self.playlists
+                                                .get(self.selected_playlist.unwrap_or(0))
+                                                .map(|c| c.name.clone())
+                                                .unwrap_or_else(|| "?".into())
+                                        ),
                                         _ => "".into(),
                                     }),
                                 });
@@ -1489,8 +1440,7 @@ impl eframe::App for MacXtreamer {
                 },
                 Msg::CoverLoaded { url, bytes } => {
                     // Offload decoding/resizing to a background worker to avoid UI hitches
-                    if self.textures.contains_key(&url) || self.pending_decode_urls.contains(&url)
-                    {
+                    if self.textures.contains_key(&url) || self.pending_decode_urls.contains(&url) {
                         // Nothing to do
                     } else {
                         self.pending_decode_urls.insert(url.clone());
@@ -1510,7 +1460,8 @@ impl eframe::App for MacXtreamer {
                                             let new_w = ((w as f32) * (target_h as f32)
                                                 / (h as f32))
                                                 .round()
-                                                .max(1.0) as u32;
+                                                .max(1.0)
+                                                as u32;
                                             img = img.resize_exact(
                                                 new_w,
                                                 target_h,
@@ -1560,8 +1511,12 @@ impl eframe::App for MacXtreamer {
                     self.all_movies = movies.iter().map(|(i, _)| i.clone()).collect();
                     self.all_series = series.iter().map(|(i, _)| i.clone()).collect();
                     self.index_paths.clear();
-                    for (it, p) in movies.into_iter() { self.index_paths.insert(it.id, p); }
-                    for (it, p) in series.into_iter() { self.index_paths.insert(it.id, p); }
+                    for (it, p) in movies.into_iter() {
+                        self.index_paths.insert(it.id, p);
+                    }
+                    for (it, p) in series.into_iter() {
+                        self.index_paths.insert(it.id, p);
+                    }
                 }
                 Msg::PreloadSet { total } => {
                     self.is_loading = true;
@@ -1579,7 +1534,10 @@ impl eframe::App for MacXtreamer {
                     // Hinweis: covers_to_prefetch wird vor dem Loop deklariert
                     covers_to_prefetch.extend(urls);
                 }
-                Msg::SeriesEpisodesForDownload { series_id: sid, episodes } => {
+                Msg::SeriesEpisodesForDownload {
+                    series_id: sid,
+                    episodes,
+                } => {
                     match episodes {
                         Ok(list) => {
                             // Read options for this series
@@ -1598,26 +1556,50 @@ impl eframe::App for MacXtreamer {
                                     for pat in ["s", "season "] {
                                         if let Some(idx) = name_lower.find(pat) {
                                             let tail = &name_lower[idx + pat.len()..];
-                                            let num: String = tail.chars().take_while(|c| c.is_ascii_digit()).collect();
-                                            if let Ok(n) = num.parse::<u32>() { if n == season_want { season_hit = true; break; } }
+                                            let num: String = tail
+                                                .chars()
+                                                .take_while(|c| c.is_ascii_digit())
+                                                .collect();
+                                            if let Ok(n) = num.parse::<u32>() {
+                                                if n == season_want {
+                                                    season_hit = true;
+                                                    break;
+                                                }
+                                            }
                                         }
                                     }
                                     if !season_hit {
                                         // Try pattern like '1x02'
                                         let mut last_digit_seq = String::new();
                                         for ch in name_lower.chars() {
-                                            if ch.is_ascii_digit() { last_digit_seq.push(ch); }
-                                            else if ch == 'x' && !last_digit_seq.is_empty() {
-                                                if let Ok(n) = last_digit_seq.parse::<u32>() { if n == season_want { season_hit = true; } }
+                                            if ch.is_ascii_digit() {
+                                                last_digit_seq.push(ch);
+                                            } else if ch == 'x' && !last_digit_seq.is_empty() {
+                                                if let Ok(n) = last_digit_seq.parse::<u32>() {
+                                                    if n == season_want {
+                                                        season_hit = true;
+                                                    }
+                                                }
                                                 last_digit_seq.clear();
-                                            } else { last_digit_seq.clear(); }
+                                            } else {
+                                                last_digit_seq.clear();
+                                            }
                                         }
-                                        if !season_hit { continue; }
+                                        if !season_hit {
+                                            continue;
+                                        }
                                     }
                                 }
                                 // Skip already downloaded if desired
                                 if opts.only_not_downloaded {
-                                    if let Some(p) = self.local_file_exists(&ep.episode_id, &ep.name, Some(&ep.container_extension)) { let _ = p; continue; }
+                                    if let Some(p) = self.local_file_exists(
+                                        &ep.episode_id,
+                                        &ep.name,
+                                        Some(&ep.container_extension),
+                                    ) {
+                                        let _ = p;
+                                        continue;
+                                    }
                                 }
                                 // Enqueue
                                 self.pending_bulk_downloads.push((
@@ -1627,7 +1609,9 @@ impl eframe::App for MacXtreamer {
                                     Some(ep.container_extension.clone()),
                                 ));
                                 added += 1;
-                                if opts.max_count > 0 && added >= opts.max_count { break; }
+                                if opts.max_count > 0 && added >= opts.max_count {
+                                    break;
+                                }
                             }
                             self.show_downloads = true;
                         }
@@ -1688,19 +1672,67 @@ impl eframe::App for MacXtreamer {
                     for d in &list {
                         // Falls bereits bekannt (Session-Download), Pfad/Progress nicht überschreiben
                         if let Some(st) = self.downloads.get_mut(&d.id) {
-                            if st.path.is_none() { st.path = Some(d.path.clone()); }
-                            if !st.finished { st.finished = true; }
+                            if st.path.is_none() {
+                                st.path = Some(d.path.clone());
+                            }
+                            if !st.finished {
+                                st.finished = true;
+                            }
                             if let Some(meta) = self.download_meta.get_mut(&d.id) {
                                 meta.size = Some(d.size);
                                 meta.modified = Some(d.modified);
                             }
                         } else {
                             // Neue Session-unabhängige Einträge hinzufügen (nur Meta minimal)
-                            self.downloads.insert(d.id.clone(), DownloadState { finished: true, path: Some(d.path.clone()), ..Default::default() });
+                            self.downloads.insert(
+                                d.id.clone(),
+                                DownloadState {
+                                    finished: true,
+                                    path: Some(d.path.clone()),
+                                    ..Default::default()
+                                },
+                            );
                             self.download_order.push(d.id.clone());
-                            self.download_meta.insert(d.id.clone(), DownloadMeta { id: d.id.clone(), name: d.name.clone(), info: d.info.clone(), container_extension: d.container_extension.clone(), size: Some(d.size), modified: Some(d.modified) });
+                            self.download_meta.insert(
+                                d.id.clone(),
+                                DownloadMeta {
+                                    id: d.id.clone(),
+                                    name: d.name.clone(),
+                                    info: d.info.clone(),
+                                    container_extension: d.container_extension.clone(),
+                                    size: Some(d.size),
+                                    modified: Some(d.modified),
+                                },
+                            );
                         }
                     }
+                }
+                Msg::SearchResults {
+                    query: _query,
+                    results,
+                } => {
+                    // Convert search results to content rows
+                    let mut rows = Vec::new();
+                    for item in results {
+                        rows.push(Row {
+                            name: item.name.clone(),
+                            id: item.id.clone(),
+                            info: format!(
+                                "Year: {} - Rating: {:.1}/5",
+                                item.year.clone().unwrap_or("N/A".to_string()),
+                                item.rating_5based.unwrap_or(0.0)
+                            ),
+                            container_extension: Some(item.container_extension.clone()),
+                            stream_url: item.stream_url.clone(),
+                            cover_url: item.cover.clone(),
+                            year: item.year.clone(),
+                            rating_5based: item.rating_5based,
+                            genre: item.genre.clone(),
+                            path: None,
+                        });
+                    }
+                    self.content_rows = rows;
+                    self.is_loading = false;
                 }
             }
         }
@@ -1712,25 +1744,21 @@ impl eframe::App for MacXtreamer {
 
         // Verarbeite pro Frame nur ein kleines Budget an Texture-Uploads,
         // um Frame-Drops beim Scrollen zu vermeiden.
-    {
-            let max_uploads_per_frame: usize = self
-                .config
-                .cover_uploads_per_frame
-                .max(1)
-                .min(16) as usize;
+        {
+            let max_uploads_per_frame: usize =
+                self.config.cover_uploads_per_frame.max(1).min(16) as usize;
             let mut done = 0usize;
             while done < max_uploads_per_frame {
-                let Some((url, rgba_bytes, w, h)) = self.pending_texture_uploads.pop_front() else { break };
+                let Some((url, rgba_bytes, w, h)) = self.pending_texture_uploads.pop_front() else {
+                    break;
+                };
                 if !self.textures.contains_key(&url) {
                     let color_image = egui::ColorImage::from_rgba_unmultiplied(
                         [w as usize, h as usize],
                         &rgba_bytes,
                     );
-                    let tex = ctx.load_texture(
-                        url.clone(),
-                        color_image,
-                        egui::TextureOptions::LINEAR,
-                    );
+                    let tex =
+                        ctx.load_texture(url.clone(), color_image, egui::TextureOptions::LINEAR);
                     self.textures.insert(url.clone(), tex);
                 }
                 // Upload (oder Versuch) abgeschlossen -> Flags bereinigen
@@ -1748,7 +1776,9 @@ impl eframe::App for MacXtreamer {
             if self.textures.len() > limit {
                 let remove_count = self.textures.len() - limit;
                 let keys: Vec<String> = self.textures.keys().take(remove_count).cloned().collect();
-                for k in keys { self.textures.remove(&k); }
+                for k in keys {
+                    self.textures.remove(&k);
+                }
             }
         }
 
@@ -1763,15 +1793,23 @@ impl eframe::App for MacXtreamer {
                 ui.horizontal(|ui| {
                     ui.heading("MacXtreamer");
                     if !self.view_stack.is_empty() {
-                        if ui.button("Back").on_hover_text("Go to previous view").clicked() {
+                        if ui
+                            .button("Back")
+                            .on_hover_text("Go to previous view")
+                            .clicked()
+                        {
                             if let Some(prev) = self.view_stack.pop() {
                                 match &prev {
                                     ViewState::Items { kind, category_id } => {
-                                        self.is_loading = true; self.loading_total = 1; self.loading_done = 0;
+                                        self.is_loading = true;
+                                        self.loading_total = 1;
+                                        self.loading_done = 0;
                                         self.spawn_load_items(kind, category_id.clone());
                                     }
                                     ViewState::Episodes { series_id } => {
-                                        self.is_loading = true; self.loading_total = 1; self.loading_done = 0;
+                                        self.is_loading = true;
+                                        self.loading_total = 1;
+                                        self.loading_done = 0;
                                         self.spawn_load_episodes(series_id.clone());
                                     }
                                     ViewState::Search { query } => {
@@ -1788,7 +1826,7 @@ impl eframe::App for MacXtreamer {
                         self.clear_caches_and_reload();
                     }
                     if self.initial_config_pending && !self.config_is_complete() {
-                        ui.colored_label(Color32::YELLOW, "Please complete settings to start");
+                        ui.label(colored_text_by_type("Please complete settings to start", "warning"));
                     }
                     if ui.button("Open Log").clicked() {
                         // Read log file and open viewer
@@ -1841,26 +1879,32 @@ impl eframe::App for MacXtreamer {
                     ui.separator();
                     ui.horizontal(|ui| {
                         ui.label("Text size");
-                        
+
                         // Use tracking variable for consistent state
                         let current_percent = (self.current_font_scale * 100.0).round() as i32;
                         let min_percent = 60;
                         let max_percent = 200;
-                        
+
                         // Decrease button
-                        if ui.add_enabled(current_percent > min_percent, egui::Button::new("−")).clicked() {
+                        if ui
+                            .add_enabled(current_percent > min_percent, egui::Button::new("−"))
+                            .clicked()
+                        {
                             let new_percent = (current_percent - 5).max(min_percent);
                             self.current_font_scale = new_percent as f32 / 100.0;
                             self.config.font_scale = self.current_font_scale;
                             self.font_scale_applied = false;
                             self.pending_save_config = true;
                         }
-                        
+
                         // Display percentage
                         ui.label(format!("{}%", current_percent));
-                        
-                        // Increase button  
-                        if ui.add_enabled(current_percent < max_percent, egui::Button::new("+")).clicked() {
+
+                        // Increase button
+                        if ui
+                            .add_enabled(current_percent < max_percent, egui::Button::new("+"))
+                            .clicked()
+                        {
                             let new_percent = (current_percent + 5).min(max_percent);
                             self.current_font_scale = new_percent as f32 / 100.0;
                             self.config.font_scale = self.current_font_scale;
@@ -1876,13 +1920,20 @@ impl eframe::App for MacXtreamer {
                         };
                         ui.horizontal(|ui| {
                             ui.spinner(); // Add spinning indicator
-                            ui.label(format!("Loading… {}% ({}/{})", pct, self.loading_done, self.loading_total));
+                            ui.label(format!(
+                                "Loading… {}% ({}/{})",
+                                pct, self.loading_done, self.loading_total
+                            ));
                         });
                     }
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                         if ui.button("Search").clicked() {
-                            if let Some(cv) = &self.current_view { self.view_stack.push(cv.clone()); }
-                            self.current_view = Some(ViewState::Search { query: self.search_text.clone() });
+                            if let Some(cv) = &self.current_view {
+                                self.view_stack.push(cv.clone());
+                            }
+                            self.current_view = Some(ViewState::Search {
+                                query: self.search_text.clone(),
+                            });
                             self.start_search();
                         }
                         let resp = egui::TextEdit::singleline(&mut self.search_text)
@@ -1898,7 +1949,7 @@ impl eframe::App for MacXtreamer {
                         }
                     });
                     if self.indexing {
-                        ui.label("Indexing…");
+                        render_loading_spinner(ui, "Indexing");
                     }
                 });
 
@@ -1915,8 +1966,13 @@ impl eframe::App for MacXtreamer {
                                     .selectable_label(self.selected_playlist == Some(i), &c.name)
                                     .clicked()
                                 {
-                                    if let Some(cv) = &self.current_view { self.view_stack.push(cv.clone()); }
-                                    self.current_view = Some(ViewState::Items { kind: "subplaylist".into(), category_id: c.id.clone() });
+                                    if let Some(cv) = &self.current_view {
+                                        self.view_stack.push(cv.clone());
+                                    }
+                                    self.current_view = Some(ViewState::Items {
+                                        kind: "subplaylist".into(),
+                                        category_id: c.id.clone(),
+                                    });
                                     self.selected_playlist = Some(i);
                                     self.selected_vod = None;
                                     self.selected_series = None;
@@ -1938,8 +1994,13 @@ impl eframe::App for MacXtreamer {
                                     .selectable_label(self.selected_vod == Some(i), &c.name)
                                     .clicked()
                                 {
-                                    if let Some(cv) = &self.current_view { self.view_stack.push(cv.clone()); }
-                                    self.current_view = Some(ViewState::Items { kind: "vod".into(), category_id: c.id.clone() });
+                                    if let Some(cv) = &self.current_view {
+                                        self.view_stack.push(cv.clone());
+                                    }
+                                    self.current_view = Some(ViewState::Items {
+                                        kind: "vod".into(),
+                                        category_id: c.id.clone(),
+                                    });
                                     self.selected_vod = Some(i);
                                     self.selected_playlist = None;
                                     self.selected_series = None;
@@ -1961,8 +2022,13 @@ impl eframe::App for MacXtreamer {
                                     .selectable_label(self.selected_series == Some(i), &c.name)
                                     .clicked()
                                 {
-                                    if let Some(cv) = &self.current_view { self.view_stack.push(cv.clone()); }
-                                    self.current_view = Some(ViewState::Items { kind: "series".into(), category_id: c.id.clone() });
+                                    if let Some(cv) = &self.current_view {
+                                        self.view_stack.push(cv.clone());
+                                    }
+                                    self.current_view = Some(ViewState::Items {
+                                        kind: "series".into(),
+                                        category_id: c.id.clone(),
+                                    });
                                     self.selected_series = Some(i);
                                     self.selected_playlist = None;
                                     self.selected_vod = None;
@@ -2010,7 +2076,8 @@ impl eframe::App for MacXtreamer {
                                     ui.weak("Nothing played yet.");
                                 } else {
                                     for it in &self.recently {
-                                        if ui.button(format!("{} ({})", it.name, it.info)).clicked() {
+                                        if ui.button(format!("{} ({})", it.name, it.info)).clicked()
+                                        {
                                             let url = build_url_by_type(
                                                 &self.config,
                                                 &it.id,
@@ -2047,14 +2114,15 @@ impl eframe::App for MacXtreamer {
                                                     self.spawn_load_episodes(it.id.clone());
                                                 }
                                             } else {
-                                                let url = it.stream_url.clone().unwrap_or_else(|| {
-                                                    build_url_by_type(
-                                                        &self.config,
-                                                        &it.id,
-                                                        &it.info,
-                                                        it.container_extension.as_deref(),
-                                                    )
-                                                });
+                                                let url =
+                                                    it.stream_url.clone().unwrap_or_else(|| {
+                                                        build_url_by_type(
+                                                            &self.config,
+                                                            &it.id,
+                                                            &it.info,
+                                                            it.container_extension.as_deref(),
+                                                        )
+                                                    });
                                                 if ui.small_button("Play").clicked() {
                                                     let _ = start_player(&self.config, &url);
                                                 }
@@ -2259,8 +2327,12 @@ impl eframe::App for MacXtreamer {
                         row.col(|ui| {
                             if r.info == "Series" {
                                 if ui.link(&r.name).clicked() {
-                                    if let Some(cv) = &self.current_view { self.view_stack.push(cv.clone()); }
-                                    self.current_view = Some(ViewState::Episodes { series_id: r.id.clone() });
+                                    if let Some(cv) = &self.current_view {
+                                        self.view_stack.push(cv.clone());
+                                    }
+                                    self.current_view = Some(ViewState::Episodes {
+                                        series_id: r.id.clone(),
+                                    });
                                     self.is_loading = true;
                                     self.loading_total = 1;
                                     self.loading_done = 0;
@@ -2296,15 +2368,24 @@ impl eframe::App for MacXtreamer {
                             ui.horizontal_wrapped(|ui| {
                                 if r.info == "Series" {
                                     if ui.small_button("Episodes").clicked() {
-                                        if let Some(cv) = &self.current_view { self.view_stack.push(cv.clone()); }
-                                        self.current_view = Some(ViewState::Episodes { series_id: r.id.clone() });
+                                        if let Some(cv) = &self.current_view {
+                                            self.view_stack.push(cv.clone());
+                                        }
+                                        self.current_view = Some(ViewState::Episodes {
+                                            series_id: r.id.clone(),
+                                        });
                                         self.is_loading = true;
                                         self.loading_total = 1;
                                         self.loading_done = 0;
                                         self.spawn_load_episodes(r.id.clone());
                                     }
                                     // Für Series kein direktes File, aber wir bieten Download (öffnet Episoden zum Downloaden)
-                                    if self.config.enable_downloads && ui.small_button("Download all").on_hover_text("Queue all episodes for download").clicked() {
+                                    if self.config.enable_downloads
+                                        && ui
+                                            .small_button("Download all")
+                                            .on_hover_text("Queue all episodes for download")
+                                            .clicked()
+                                    {
                                         self.confirm_bulk = Some((r.id.clone(), r.name.clone()));
                                     }
                                 } else {
@@ -2339,7 +2420,11 @@ impl eframe::App for MacXtreamer {
                                     if ui.small_button("Copy").clicked() {
                                         ui.output_mut(|o| o.copied_text = url.clone());
                                     }
-                                    if r.info == "Movie" || r.info == "SeriesEpisode" || r.info == "Series" || r.info == "VOD" {
+                                    if r.info == "Movie"
+                                        || r.info == "SeriesEpisode"
+                                        || r.info == "Series"
+                                        || r.info == "VOD"
+                                    {
                                         let st_opt = self.downloads.get(&r.id).cloned();
                                         let existing = self.local_file_exists(
                                             &r.id,
@@ -2379,7 +2464,7 @@ impl eframe::App for MacXtreamer {
                                                     }
                                                 }
                                             } else if st.error.is_some() {
-                                                ui.colored_label(Color32::RED, "Download failed");
+                                                ui.label(colored_text_by_type("Download failed", "error"));
                                                 if ui.small_button("Retry").clicked() {
                                                     self.downloads.remove(&r.id);
                                                     self.spawn_download(r);
@@ -2428,7 +2513,9 @@ impl eframe::App for MacXtreamer {
                                                 }
                                             }
                                         } else {
-                                            if self.config.enable_downloads && ui.small_button("Download").clicked() {
+                                            if self.config.enable_downloads
+                                                && ui.small_button("Download").clicked()
+                                            {
                                                 self.spawn_download(r);
                                             }
                                         }
@@ -2439,7 +2526,7 @@ impl eframe::App for MacXtreamer {
                                             let mut entries: Vec<(String, String)> = Vec::new();
                                             for rr in rows.iter().skip(i) {
                                                 if rr.info == "SeriesEpisode" {
-                                                let url = build_url_by_type(
+                                                    let url = build_url_by_type(
                                                         &self.config,
                                                         &rr.id,
                                                         &rr.info,
@@ -2510,16 +2597,36 @@ impl eframe::App for MacXtreamer {
                     }
                     ui.horizontal(|ui| {
                         if ui
-                            .button("Apply VLC defaults")
-                            .on_hover_text("Apply sensible VLC parameters for streaming")
+                            .button("IPTV Optimized")
+                            .on_hover_text("Apply VLC parameters optimized for IPTV/Xtream Codes streaming")
                             .clicked()
                         {
-                            draft.player_command = "vlc --fullscreen --no-video-title-show --network-caching=2000 URL".to_string();
+                            draft.player_command = crate::player::get_optimized_vlc_command("default").to_string();
+                        }
+                        if ui
+                            .button("Live TV")
+                            .on_hover_text("Minimal buffering for live TV channels")
+                            .clicked()
+                        {
+                            draft.player_command = crate::player::get_optimized_vlc_command("live").to_string();
+                        }
+                        if ui
+                            .button("VOD/Movies")
+                            .on_hover_text("Larger buffer for better quality VOD playback")
+                            .clicked()
+                        {
+                            draft.player_command = crate::player::get_optimized_vlc_command("vod").to_string();
+                        }
+                        if ui
+                            .button("Error Fix")
+                            .on_hover_text("Maximum compatibility for problematic streams")
+                            .clicked()
+                        {
+                            draft.player_command = crate::player::get_optimized_vlc_command("errorfix").to_string();
                         }
                         // Show the currently effective command (with placeholder visible)
                         let preview = if draft.player_command.trim().is_empty() {
-                            "vlc --fullscreen --no-video-title-show --network-caching=2000 URL"
-                                .to_string()
+                            crate::player::get_optimized_vlc_command("default").to_string()
                         } else {
                             draft.player_command.clone()
                         };
@@ -2708,7 +2815,7 @@ impl eframe::App for MacXtreamer {
             self.show_log = open;
         }
 
-    // (Bottom panel already rendered above CentralPanel)
+        // (Bottom panel already rendered above CentralPanel)
 
         // Handle deferred save to avoid mutable borrow inside Window closure
         if self.pending_save_config {
@@ -2721,10 +2828,18 @@ impl eframe::App for MacXtreamer {
             } as usize;
             self.cover_sem = Arc::new(Semaphore::new(permits));
             // Apply decode parallelism immediately
-            let dpermits = if self.config.cover_decode_parallel == 0 { 2 } else { self.config.cover_decode_parallel } as usize;
+            let dpermits = if self.config.cover_decode_parallel == 0 {
+                2
+            } else {
+                self.config.cover_decode_parallel
+            } as usize;
             self.decode_sem = Arc::new(Semaphore::new(dpermits));
             // Apply cover height and font scale immediately
-            self.cover_height = if self.config.cover_height == 0.0 { 60.0 } else { self.config.cover_height };
+            self.cover_height = if self.config.cover_height == 0.0 {
+                60.0
+            } else {
+                self.config.cover_height
+            };
             self.font_scale_applied = false; // Force font scale reapplication
             if self.config_is_complete() {
                 // Only start loading now if config became complete
@@ -2743,7 +2858,9 @@ impl eframe::App for MacXtreamer {
         if self.show_downloads {
             let mut open = self.show_downloads;
             // Beim Öffnen einen Scan initiieren (throttled)
-            if open { self.scan_download_directory(); }
+            if open {
+                self.scan_download_directory();
+            }
             egui::Window::new("Downloads")
                 .default_width(620.0)
                 .default_height(400.0)
@@ -2773,36 +2890,93 @@ impl eframe::App for MacXtreamer {
                     let order_snapshot: Vec<String> = self.download_order.clone();
                     egui::ScrollArea::vertical().show(ui, |ui| {
                         for id in order_snapshot {
-                            let (meta_name, waiting, finished, error_opt, frac_opt, received_kb, total_known, path_opt, cancel_flag, size_opt, modified_opt) = if let (Some(meta), Some(st)) = (self.download_meta.get(&id), self.downloads.get(&id)) {
-                                let frac = st.total.map(|t| (st.received as f32 / t as f32).min(1.0));
-                                (meta.name.clone(), st.waiting, st.finished, st.error.clone(), frac, st.received / 1024, st.total.is_some(), st.path.clone(), st.cancel_flag.clone(), meta.size, meta.modified)
-                            } else { continue };
+                            let (
+                                meta_name,
+                                waiting,
+                                finished,
+                                error_opt,
+                                frac_opt,
+                                received_kb,
+                                total_known,
+                                path_opt,
+                                cancel_flag,
+                                size_opt,
+                                modified_opt,
+                            ) = if let (Some(meta), Some(st)) =
+                                (self.download_meta.get(&id), self.downloads.get(&id))
+                            {
+                                let frac =
+                                    st.total.map(|t| (st.received as f32 / t as f32).min(1.0));
+                                (
+                                    meta.name.clone(),
+                                    st.waiting,
+                                    st.finished,
+                                    st.error.clone(),
+                                    frac,
+                                    st.received / 1024,
+                                    st.total.is_some(),
+                                    st.path.clone(),
+                                    st.cancel_flag.clone(),
+                                    meta.size,
+                                    meta.modified,
+                                )
+                            } else {
+                                continue;
+                            };
                             let is_done_ok = finished && error_opt.is_none();
                             ui.horizontal(|ui| {
                                 ui.label(format!("{} ({})", meta_name, id));
-                                if let Some(sz) = size_opt { ui.weak(format!("{:.1} MB", (sz as f64)/ (1024.0*1024.0))); }
-                                if waiting { ui.weak("waiting"); }
-                                else if finished {
-                                    if let Some(err) = error_opt.as_ref() { ui.colored_label(Color32::RED, format!("error: {}", err)); }
-                                    else { ui.colored_label(Color32::GREEN, "done"); }
+                                if let Some(sz) = size_opt {
+                                    ui.weak(format_file_size(Some(sz)));
+                                }
+                                if waiting {
+                                    ui.weak("waiting");
+                                } else if finished {
+                                    if let Some(err) = error_opt.as_ref() {
+                                        ui.label(colored_text_by_type(&format!("error: {}", err), "error"));
+                                    } else {
+                                        ui.label(colored_text_by_type("done", "success"));
+                                    }
                                 } else {
                                     let frac = frac_opt.unwrap_or(0.0);
-                                    let pct = if total_known { format!("{:.0}%", frac * 100.0) } else { format!("{} KB", received_kb) };
-                                    ui.add(egui::ProgressBar::new(frac).desired_width(160.0).text(pct));
-                                    if let Some(flag) = &cancel_flag { if ui.small_button("Cancel").clicked() { flag.store(true, Ordering::Relaxed); } }
+                                    let pct = if total_known {
+                                        format!("{:.0}%", frac * 100.0)
+                                    } else {
+                                        format!("{} KB", received_kb)
+                                    };
+                                    ui.add(
+                                        egui::ProgressBar::new(frac).desired_width(160.0).text(pct),
+                                    );
+                                    if let Some(flag) = &cancel_flag {
+                                        if ui.small_button("Cancel").clicked() {
+                                            flag.store(true, Ordering::Relaxed);
+                                        }
+                                    }
                                 }
                                 if is_done_ok {
                                     if let Some(p) = &path_opt {
                                         if ui.small_button("Play").clicked() {
-                                            let uri = Self::file_path_to_uri(Path::new(p));
+                                            let uri = file_path_to_uri(Path::new(p));
                                             let _ = start_player(&self.config, &uri);
                                         }
-                                        if ui.small_button("Delete").on_hover_text("Remove local file").clicked() {
-                                            if let Err(e) = std::fs::remove_file(p) { self.last_error = Some(format!("Failed to delete: {}", e)); }
-                                            else { self.scan_download_directory(); }
+                                        if ui
+                                            .small_button("Delete")
+                                            .on_hover_text("Remove local file")
+                                            .clicked()
+                                        {
+                                            if let Err(e) = std::fs::remove_file(p) {
+                                                self.last_error =
+                                                    Some(format!("Failed to delete: {}", e));
+                                            } else {
+                                                self.scan_download_directory();
+                                            }
                                         }
                                     }
-                                    if let Some(mt) = modified_opt { if let Ok(delta) = mt.elapsed() { ui.weak(format!("{}m ago", delta.as_secs()/60)); } }
+                                    if let Some(mt) = modified_opt {
+                                        if let Ok(delta) = mt.elapsed() {
+                                            ui.weak(format!("{}m ago", delta.as_secs() / 60));
+                                        }
+                                    }
                                 }
                             });
                         }
@@ -2829,18 +3003,25 @@ impl eframe::App for MacXtreamer {
                     ui.horizontal(|ui| {
                         ui.label("Season (optional)");
                         let mut s = opts.season.unwrap_or(0) as i32;
-                        if ui.add(egui::DragValue::new(&mut s).clamp_range(0..=99)).changed() {
+                        if ui
+                            .add(egui::DragValue::new(&mut s).clamp_range(0..=99))
+                            .changed()
+                        {
                             opts.season = if s <= 0 { None } else { Some(s as u32) };
                         }
                     });
                     ui.horizontal(|ui| {
                         ui.label("Max episodes (0=all)");
                         let mut m = opts.max_count as i32;
-                        if ui.add(egui::DragValue::new(&mut m).clamp_range(0..=2000)).changed() {
+                        if ui
+                            .add(egui::DragValue::new(&mut m).clamp_range(0..=2000))
+                            .changed()
+                        {
                             opts.max_count = m.max(0) as u32;
                         }
                     });
-                    self.bulk_options_by_series.insert(series_id.clone(), opts.clone());
+                    self.bulk_options_by_series
+                        .insert(series_id.clone(), opts.clone());
                     ui.horizontal(|ui| {
                         if ui.button("Yes, download").clicked() {
                             // Fetch episodes and enqueue with current options
@@ -2852,7 +3033,9 @@ impl eframe::App for MacXtreamer {
                         }
                     });
                 });
-            if !open { self.confirm_bulk = None; }
+            if !open {
+                self.confirm_bulk = None;
+            }
         }
 
         // Process any pending bulk downloads enqueued by messages to avoid borrow conflicts

@@ -58,9 +58,71 @@ pub fn build_url_by_type(cfg: &Config, id: &str, info: &str, container_ext: Opti
     }
 }
 
+/// Get optimized VLC command for different streaming types
+/// 
+/// Key IPTV/Xtream Codes optimizations & error fixes:
+/// - network-caching: Buffer for network streams (ms)
+/// - live-caching: Additional buffer for live streams 
+/// - audio-resampler=soxr: High-quality audio resampling (fixes audio errors)
+/// - aout=pulse,alsa,oss: Multiple audio output fallbacks (fixes "no audio output")
+/// - clock-master=audio: Use audio clock as master (fixes sync issues)
+/// - avcodec-*: Error resilience and bug workarounds for problematic streams
+/// - pts-offset=0: Reset timestamp offset (fixes PCR timing errors)
+/// - ts-es-id-pid: Better MPEG-TS stream handling
+/// - audio-desync=0: Disable audio desync compensation
+/// - network-synchronisation: Better sync for network streams
+/// - drop-late-frames/skip-frames: Handle network delays gracefully
+/// - rtsp-tcp: Force TCP for better reliability
+/// - http-reconnect: Auto-reconnect on connection drops
+/// - adaptive-logic=rate: Adaptive bitrate based on connection
+/// - hls-segment-threads: Parallel HLS segment loading
+/// - prefetch-buffer-size: Pre-buffer data amount
+pub fn get_optimized_vlc_command(stream_type: &str) -> &'static str {
+    match stream_type {
+        "live" | "channel" => {
+            // Optimized for live TV/IPTV streams - fixes audio output and PCR timing errors
+            "vlc --fullscreen --no-video-title-show --network-caching=4000 --live-caching=2000 --audio-resampler=soxr --audio-time-stretch --force-dolby-surround=0 --aout=pulse,alsa,oss --audio-desync=0 --clock-master=audio --clock-jitter=0 --network-synchronisation --avcodec-skiploopfilter=4 --avcodec-skip-frame=0 --avcodec-skip-idct=0 --sout-x264-preset=ultrafast --drop-late-frames --skip-frames --intf=dummy --no-video-title --no-snapshot-preview --no-stats --no-osd --rtsp-tcp --http-reconnect --adaptive-logic=rate --hls-segment-threads=6 --prefetch-buffer-size=2097152 --demux-filter=record --ts-es-id-pid --ts-seek-percent --pts-offset=0 {URL}"
+        },
+        "vod" | "movie" => {
+            // Optimized for VOD with audio/video sync fixes
+            "vlc --fullscreen --no-video-title-show --network-caching=8000 --file-caching=5000 --audio-resampler=soxr --audio-time-stretch --force-dolby-surround=0 --aout=pulse,alsa,oss --audio-desync=0 --clock-master=audio --sout-mux-caching=3000 --sout-udp-caching=3000 --cr-average=2000 --avcodec-skiploopfilter=0 --avcodec-skip-frame=0 --avcodec-skip-idct=0 --intf=dummy --no-video-title --no-snapshot-preview --no-stats --rtsp-tcp --http-reconnect --adaptive-logic=rate --hls-segment-threads=4 --prefetch-buffer-size=8388608 --pts-offset=0 {URL}"
+        },
+        "series" => {
+            // Balanced settings for series episodes with error handling
+            "vlc --fullscreen --no-video-title-show --network-caching=6000 --file-caching=4000 --audio-resampler=soxr --audio-time-stretch --force-dolby-surround=0 --aout=pulse,alsa,oss --audio-desync=0 --clock-master=audio --sout-mux-caching=2500 --cr-average=1500 --avcodec-skiploopfilter=2 --avcodec-skip-frame=0 --avcodec-skip-idct=0 --intf=dummy --no-video-title --no-snapshot-preview --no-stats --rtsp-tcp --http-reconnect --adaptive-logic=rate --hls-segment-threads=4 --prefetch-buffer-size=4194304 --pts-offset=0 {URL}"
+        },
+        "errorfix" => {
+            // Maximum compatibility for problematic streams with all error mitigation
+            "vlc --fullscreen --no-video-title-show --network-caching=10000 --live-caching=5000 --file-caching=8000 --audio-resampler=soxr --audio-time-stretch --force-dolby-surround=0 --aout=pulse,alsa,oss,dummy --audio-desync=0 --clock-master=input --input-slave= --audio-track-id=-1 --sub-track-id=-1 --video-track-id=-1 --program=-1 --audio-language= --sub-language= --avcodec-skiploopfilter=4 --avcodec-skip-frame=0 --avcodec-skip-idct=0 --avcodec-hurry-up=0 --avcodec-error-resilience=1 --avcodec-workaround-bugs=1 --sout-x264-preset=ultrafast --drop-late-frames --skip-frames --intf=dummy --no-video-title --no-snapshot-preview --no-stats --no-osd --rtsp-tcp --http-reconnect --adaptive-logic=rate --hls-segment-threads=2 --prefetch-buffer-size=16777216 --demux-filter=record --ts-es-id-pid --ts-seek-percent --pts-offset=0 --clock-jitter=5000 --input-repeat=999 --start-time=0 {URL}"
+        },
+        _ => {
+            // Default optimized for IPTV/Xtream Codes streaming with comprehensive error fixes
+            "vlc --fullscreen --no-video-title-show --network-caching=5000 --live-caching=3000 --audio-resampler=soxr --audio-time-stretch --force-dolby-surround=0 --aout=pulse,alsa,oss --audio-desync=0 --clock-master=audio --clock-jitter=0 --network-synchronisation --sout-mux-caching=2000 --file-caching=2000 --sout-udp-caching=2000 --cr-average=1000 --avcodec-skiploopfilter=4 --avcodec-skip-frame=0 --avcodec-skip-idct=0 --sout-x264-preset=ultrafast --drop-late-frames --skip-frames --intf=dummy --no-video-title --no-snapshot-preview --no-stats --no-osd --rtsp-tcp --http-reconnect --adaptive-logic=rate --hls-segment-threads=4 --prefetch-buffer-size=4194304 --demux-filter=record --ts-es-id-pid --ts-seek-percent --pts-offset=0 {URL}"
+        }
+    }
+}
+
+/// Detect stream type from URL patterns
+pub fn detect_stream_type(stream_url: &str) -> &'static str {
+    if stream_url.contains("/live/") {
+        "live"
+    } else if stream_url.contains("/movie/") {
+        "vod"
+    } else if stream_url.contains("/series/") {
+        "series"
+    } else if stream_url.ends_with(".m3u8") || stream_url.contains("playlist.m3u8") {
+        "live" // HLS streams are usually live
+    } else if stream_url.ends_with(".mp4") || stream_url.ends_with(".mkv") || stream_url.ends_with(".avi") {
+        "vod" // Video files are usually VOD
+    } else {
+        "default"
+    }
+}
+
 pub fn start_player(cfg: &Config, stream_url: &str) -> io::Result<()> {
-    // Platzhalter "URL" wird ersetzt, sonst am Ende angehängt. Empty => VLC-Defaults.
-    let default_cmd = "vlc --fullscreen --no-video-title-show --network-caching=2000 {URL}";
+    // Auto-detect stream type and use appropriate VLC parameters, or user's custom command
+    let stream_type = detect_stream_type(stream_url);
+    let default_cmd = get_optimized_vlc_command(stream_type);
     let cmd = if cfg.player_command.trim().is_empty() { default_cmd } else { &cfg.player_command };
     let mut parts: Vec<String> = cmd.split_whitespace().map(|s| s.to_string()).collect();
     let mut replaced = false;
@@ -129,4 +191,46 @@ fn is_vlc_running() -> bool {
         .status()
         .map(|s| s.success())
         .unwrap_or(false)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_stream_type_detection() {
+        assert_eq!(detect_stream_type("http://server:8080/live/user/pass/12345.m3u8"), "live");
+        assert_eq!(detect_stream_type("http://server:8080/movie/user/pass/12345.mp4"), "vod");
+        assert_eq!(detect_stream_type("http://server:8080/series/user/pass/12345.mkv"), "series");
+        assert_eq!(detect_stream_type("http://example.com/stream.m3u8"), "live");
+        assert_eq!(detect_stream_type("http://example.com/video.mp4"), "vod");
+        assert_eq!(detect_stream_type("http://example.com/unknown"), "default");
+    }
+
+    #[test]
+    fn test_optimized_commands_contain_key_params() {
+        let live_cmd = get_optimized_vlc_command("live");
+        let vod_cmd = get_optimized_vlc_command("vod");
+        
+        // All commands should have these IPTV-optimized parameters
+        for cmd in &[live_cmd, vod_cmd] {
+            assert!(cmd.contains("--network-caching"));
+            assert!(cmd.contains("--rtsp-tcp"));
+            assert!(cmd.contains("--http-reconnect"));
+            assert!(cmd.contains("--adaptive-logic=rate"));
+        }
+        
+        // Live streams should have minimal caching
+        assert!(live_cmd.contains("--network-caching=4000"));
+        assert!(live_cmd.contains("--live-caching=2000"));
+        
+        // VOD should have larger buffer
+        assert!(vod_cmd.contains("--network-caching=8000"));
+        
+        // All commands should have audio error fixes
+        assert!(live_cmd.contains("--audio-resampler=soxr"));
+        assert!(vod_cmd.contains("--aout=pulse,alsa,oss"));
+        assert!(live_cmd.contains("--clock-master=audio"));
+        assert!(vod_cmd.contains("--pts-offset=0"));
+    }
 }
