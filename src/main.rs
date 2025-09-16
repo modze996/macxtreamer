@@ -122,6 +122,8 @@ struct MacXtreamer {
     http_client: reqwest::Client,
     // Zeitpunkt letzter Verzeichnis-Scan (optional Throttling)
     last_download_scan: Option<std::time::Instant>,
+    // Flag to check for next downloads after message processing
+    should_check_downloads: bool,
     // Navigation
     current_view: Option<ViewState>,
     view_stack: Vec<ViewState>,
@@ -293,12 +295,14 @@ impl MacXtreamer {
                 .pool_max_idle_per_host(8) // Allow more connections per host
                 .tcp_nodelay(true)
                 .tcp_keepalive(Some(Duration::from_secs(30)))
-                .timeout(Duration::from_secs(15)) // Add reasonable timeout
-                .connect_timeout(Duration::from_secs(5)) // Fast connection timeout
-                .http2_prior_knowledge() // Use HTTP/2 if available
+                .timeout(Duration::from_secs(60)) // Längeres Timeout für große Downloads
+                .connect_timeout(Duration::from_secs(10)) // Längeres Connect-Timeout
+                .user_agent("MacXtreamer/1.0") // User-Agent hinzufügen
+                .danger_accept_invalid_certs(true) // Akzeptiere ungültige Zertifikate
                 .build()
                 .unwrap_or_else(|_| reqwest::Client::new()),
             last_download_scan: None,
+            should_check_downloads: false,
             current_view: None,
             view_stack: Vec::new(),
         };
@@ -336,6 +340,9 @@ impl MacXtreamer {
         }
         app.cover_height = app.config.cover_height;
         // enable_downloads defaults to false via #[serde(default)] - no initialization needed
+        if app.config.max_parallel_downloads == 0 {
+            app.config.max_parallel_downloads = 1;
+        }
         app.cover_sem = Arc::new(Semaphore::new(app.config.cover_parallel as usize));
         app.decode_sem = Arc::new(Semaphore::new(app.config.cover_decode_parallel as usize));
         // Only preload/load categories if config is complete
@@ -612,7 +619,7 @@ impl MacXtreamer {
             let rows: Vec<Row> = results
                 .into_iter()
                 .map(|s| Row {
-                    name: s.name,
+                    name: s.name.clone(),
                     id: s.id,
                     info: s.info,
                     container_extension: if s.container_extension.is_empty() {
@@ -622,7 +629,8 @@ impl MacXtreamer {
                     },
                     stream_url: None,
                     cover_url: s.cover,
-                    year: s.year,
+                    year: s.year.clone(),
+                    release_date: s.release_date.clone().or_else(|| extract_year_from_title(&s.name)),
                     rating_5based: s.rating_5based,
                     genre: s.genre,
                     path: None,
@@ -926,7 +934,7 @@ impl MacXtreamer {
     }
 
     fn maybe_start_next_download(&mut self) {
-        let max_parallel = 2usize;
+        let max_parallel = if self.config.max_parallel_downloads == 0 { 1 } else { self.config.max_parallel_downloads as usize };
         if self.active_downloads() >= max_parallel {
             return;
         }
@@ -973,20 +981,25 @@ impl MacXtreamer {
             if let Some(parent) = target_path.parent() {
                 let _ = tokio::fs::create_dir_all(parent).await;
             }
+            println!("Starting download: id={}, url={}", id, url);
             let mut resp = match client.get(&url).send().await {
                 Ok(r) => r,
                 Err(e) => {
+                    let error_msg = format!("Network error: {} (URL: {})", e, url);
+                    println!("Download failed - {}", error_msg);
                     let _ = tx.send(Msg::DownloadError {
                         id: id.clone(),
-                        error: e.to_string(),
+                        error: error_msg,
                     });
                     return;
                 }
             };
             if !resp.status().is_success() {
+                let error_msg = format!("HTTP {} - {} (URL: {})", resp.status().as_u16(), resp.status().canonical_reason().unwrap_or("Unknown"), url);
+                println!("Download failed - {}", error_msg);
                 let _ = tx.send(Msg::DownloadError {
                     id: id.clone(),
-                    error: format!("HTTP {}", resp.status()),
+                    error: error_msg,
                 });
                 return;
             }
@@ -1357,7 +1370,7 @@ impl eframe::App for MacXtreamer {
                                     }
                                 }
                                 self.content_rows.push(Row {
-                                    name: it.name,
+                                    name: it.name.clone(),
                                     id: it.id,
                                     info: info.to_string(),
                                     container_extension: if info == "Movie"
@@ -1370,6 +1383,7 @@ impl eframe::App for MacXtreamer {
                                     stream_url: it.stream_url.clone(),
                                     cover_url: it.cover.clone(),
                                     year: it.year.clone(),
+                                    release_date: it.release_date.clone().or_else(|| extract_year_from_title(&it.name)).or_else(|| it.year.clone()),
                                     rating_5based: it.rating_5based,
                                     genre: it.genre.clone(),
                                     path: Some(match info {
@@ -1424,6 +1438,7 @@ impl eframe::App for MacXtreamer {
                                 stream_url: ep.stream_url.clone(),
                                 cover_url: ep.cover.clone(),
                                 year: None,
+                                release_date: None,
                                 rating_5based: None,
                                 genre: None,
                                 path: Some("Series / Episodes".into()),
@@ -1643,11 +1658,17 @@ impl eframe::App for MacXtreamer {
                     //     let uri = Self::file_path_to_uri(Path::new(&p));
                     //     let _ = start_player(&self.config, &uri);
                     // }
+                    
+                    // Flag to check for next downloads after message processing
+                    self.should_check_downloads = true;
                 }
                 Msg::DownloadError { id, error } => {
                     let st = self.downloads.entry(id).or_default();
                     st.error = Some(error);
                     st.finished = true;
+                    
+                    // Flag to check for next downloads after message processing
+                    self.should_check_downloads = true;
                 }
                 Msg::DownloadCancelled { id } => {
                     if let Some(st) = self.downloads.get_mut(&id) {
@@ -1726,6 +1747,7 @@ impl eframe::App for MacXtreamer {
                             stream_url: item.stream_url.clone(),
                             cover_url: item.cover.clone(),
                             year: item.year.clone(),
+                            release_date: item.release_date.clone().or_else(|| extract_year_from_title(&item.name)).or_else(|| item.year.clone()),
                             rating_5based: item.rating_5based,
                             genre: item.genre.clone(),
                             path: None,
@@ -1735,6 +1757,12 @@ impl eframe::App for MacXtreamer {
                     self.is_loading = false;
                 }
             }
+        }
+
+        // Check for next downloads if flagged
+        if self.should_check_downloads {
+            self.should_check_downloads = false;
+            self.maybe_start_next_download();
         }
 
         // Wenn Nachrichten eingetroffen sind oder wir laden, sicherstellen, dass ein weiterer Frame kommt
@@ -2158,6 +2186,14 @@ impl eframe::App for MacXtreamer {
                         }
                         rows.sort_by(|a, b| parse_year(&a.year).cmp(&parse_year(&b.year)));
                     }
+                    SortKey::ReleaseDate => {
+                        fn parse_year(y: &Option<String>) -> i32 {
+                            y.as_deref()
+                                .and_then(|s| s.parse::<i32>().ok())
+                                .unwrap_or(0)
+                        }
+                        rows.sort_by(|a, b| parse_year(&a.release_date).cmp(&parse_year(&b.release_date)));
+                    }
                     SortKey::Rating => {
                         rows.sort_by(|a, b| {
                             let av = a.rating_5based.unwrap_or(-1.0);
@@ -2193,6 +2229,7 @@ impl eframe::App for MacXtreamer {
                 .column(egui_extras::Column::initial(140.0)) // ID
                 .column(egui_extras::Column::initial(120.0)) // Info
                 .column(egui_extras::Column::initial(80.0)) // Year
+                .column(egui_extras::Column::initial(100.0)) // Release Date
                 .column(egui_extras::Column::initial(80.0)) // Rating
                 .column(egui_extras::Column::initial(200.0)) // Genre (resizable)
                 .column(egui_extras::Column::initial(220.0)) // Path
@@ -2235,6 +2272,22 @@ impl eframe::App for MacXtreamer {
                                 self.sort_asc = !self.sort_asc;
                             } else {
                                 self.sort_key = Some(SortKey::Year);
+                                self.sort_asc = true;
+                            }
+                        }
+                    });
+                    header.col(|ui| {
+                        let selected = self.sort_key == Some(SortKey::ReleaseDate);
+                        let label = if selected {
+                            format!("Release Date {}", if self.sort_asc { "▲" } else { "▼" })
+                        } else {
+                            "Release Date".to_string()
+                        };
+                        if ui.small_button(label).clicked() {
+                            if selected {
+                                self.sort_asc = !self.sort_asc;
+                            } else {
+                                self.sort_key = Some(SortKey::ReleaseDate);
                                 self.sort_asc = true;
                             }
                         }
@@ -2350,6 +2403,9 @@ impl eframe::App for MacXtreamer {
                         });
                         row.col(|ui| {
                             ui.label(r.year.clone().unwrap_or_default());
+                        });
+                        row.col(|ui| {
+                            ui.label(r.release_date.clone().unwrap_or_default());
                         });
                         row.col(|ui| {
                             ui.label(
@@ -2759,6 +2815,16 @@ impl eframe::App for MacXtreamer {
                         }
                     });
                     ui.horizontal(|ui| {
+                        ui.label("Max parallel downloads:");
+                        let mut max_downloads = if draft.max_parallel_downloads == 0 { 1 } else { draft.max_parallel_downloads } as f32;
+                        if ui.add(egui::Slider::new(&mut max_downloads, 1.0..=5.0).integer().text("downloads"))
+                            .on_hover_text("Maximum number of simultaneous downloads (1-5)")
+                            .changed()
+                        {
+                            draft.max_parallel_downloads = max_downloads as u32;
+                        }
+                    });
+                    ui.horizontal(|ui| {
                         if ui.button("Save").clicked() {
                             if let Some(d) = &self.config_draft {
                                 self.config = d.clone();
@@ -3047,6 +3113,25 @@ impl eframe::App for MacXtreamer {
             }
         }
     }
+}
+
+/// Extract year from title in format "Title (YYYY)"
+fn extract_year_from_title(title: &str) -> Option<String> {
+    // Look for year in parentheses at the end of the title
+    if let Some(start) = title.rfind('(') {
+        if let Some(end) = title[start..].find(')') {
+            let year_candidate = &title[start + 1..start + end];
+            // Check if it's a 4-digit year between 1900 and 2099
+            if year_candidate.len() == 4 {
+                if let Ok(year) = year_candidate.parse::<i32>() {
+                    if year >= 1900 && year <= 2099 {
+                        return Some(year_candidate.to_string());
+                    }
+                }
+            }
+        }
+    }
+    None
 }
 
 // (Hilfs-Module für Config/Cache/API/Player/Storage/Suche sind ausgelagert)

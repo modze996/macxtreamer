@@ -1,4 +1,15 @@
 use crate::{models::*, CoreConfig};
+use std::time::Duration;
+
+lazy_static::lazy_static! {
+    static ref HTTP_CLIENT: reqwest::Client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(60))
+        .connect_timeout(Duration::from_secs(10))
+        .user_agent("MacXtreamer/1.0")
+        .danger_accept_invalid_certs(true)
+        .build()
+        .unwrap_or_else(|_| reqwest::Client::new());
+}
 
 pub async fn fetch_categories(cfg: &CoreConfig, kind: &str) -> Result<Vec<Category>, String> {
     let url = match kind {
@@ -7,7 +18,7 @@ pub async fn fetch_categories(cfg: &CoreConfig, kind: &str) -> Result<Vec<Catego
     "get_live_categories" => format!("{}/player_api.php?username={}&password={}&action=get_live_categories", cfg.address, cfg.username, cfg.password),
         _ => return Ok(vec![]),
     };
-    let res = reqwest::get(url).await.map_err(|e| e.to_string())?;
+    let res = HTTP_CLIENT.get(url).send().await.map_err(|e| e.to_string())?;
     if !res.status().is_success() { return Err(format!("HTTP {}", res.status())); }
     let cats: Vec<Category> = res.json().await.map_err(|e| e.to_string())?;
     Ok(cats)
@@ -19,7 +30,8 @@ pub async fn fetch_items(cfg: &CoreConfig, kind: &str, id: &str) -> Result<Vec<I
         "{}/player_api.php?username={}&password={}&action={}&category_id={}",
         cfg.address, cfg.username, cfg.password, action, id
     );
-    let res = reqwest::get(url).await.map_err(|e| e.to_string())?;
+    println!("Core API fetch: {}", url);
+    let res = HTTP_CLIENT.get(url).send().await.map_err(|e| e.to_string())?;
     if !res.status().is_success() { return Err(format!("HTTP {}", res.status())); }
     let body = res.text().await.map_err(|e| e.to_string())?;
     // Mapping vereinfachen; echte Struktur in App anpassen
@@ -32,7 +44,43 @@ pub async fn fetch_items(cfg: &CoreConfig, kind: &str, id: &str) -> Result<Vec<I
         let url = o.get("stream_url").and_then(|x| x.as_str()).map(|s| s.to_string());
         let ext = o.get("container_extension").and_then(|x| x.as_str()).map(|s| s.to_string());
         let cover = o.get("cover").or_else(|| o.get("cover_url")).and_then(|x| x.as_str()).map(|s| s.to_string());
-        out.push(Item { id, name, stream_url: url, container_extension: ext, cover_url: cover });
+        
+        // Neue Felder hinzufügen
+        let plot = o.get("plot").and_then(|x| x.as_str()).map(|s| s.to_string());
+        let cast = o.get("cast").and_then(|x| x.as_str()).map(|s| s.to_string());
+        let director = o.get("director").and_then(|x| x.as_str()).map(|s| s.to_string());
+        let genre = o.get("genre").and_then(|x| x.as_str()).map(|s| s.to_string());
+        let release_date = o.get("releaseDate")
+            .or_else(|| o.get("release_date"))
+            .and_then(|x| x.as_str())
+            .map(|s| s.to_string());
+        let rating = o.get("rating").and_then(|x| x.as_str()).map(|s| s.to_string());
+        let rating_5based = o.get("rating_5based").and_then(|x| x.as_str()).map(|s| s.to_string());
+        let tmdb = o.get("tmdb").and_then(|x| x.as_str()).map(|s| s.to_string());
+        let youtube_trailer = o.get("youtube_trailer").and_then(|x| x.as_str()).map(|s| s.to_string());
+        
+        let backdrop_path = o.get("backdrop_path")
+            .and_then(|x| x.as_array())
+            .map(|arr| arr.iter().filter_map(|v| v.as_str()).map(|s| s.to_string()).collect())
+            .unwrap_or_default();
+            
+        out.push(Item { 
+            id, 
+            name, 
+            stream_url: url, 
+            container_extension: ext, 
+            cover_url: cover,
+            plot,
+            cast,
+            director,
+            genre,
+            release_date,
+            rating,
+            rating_5based,
+            tmdb,
+            youtube_trailer,
+            backdrop_path,
+        });
     }
     Ok(out)
 }

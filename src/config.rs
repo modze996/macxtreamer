@@ -36,6 +36,7 @@ pub fn read_config() -> Result<Config, io::Error> {
                 "category_parallel" => cfg.category_parallel = v.trim().parse::<u32>().unwrap_or(6),
                 "cover_height" => cfg.cover_height = v.trim().parse::<f32>().unwrap_or(60.0),
                 "enable_downloads" => cfg.enable_downloads = v.trim().parse::<u8>().map(|n| n != 0).unwrap_or(false),
+                "max_parallel_downloads" => cfg.max_parallel_downloads = v.trim().parse::<u32>().unwrap_or(1),
                 _ => {}
             }
         }
@@ -68,5 +69,6 @@ pub fn save_config(cfg: &Config) -> Result<(), io::Error> {
     if cfg.category_parallel != 0 { writeln!(f, "category_parallel={}", cfg.category_parallel)?; }
     if cfg.cover_height != 0.0 { writeln!(f, "cover_height={:.1}", cfg.cover_height)?; }
     writeln!(f, "enable_downloads={}", if cfg.enable_downloads { 1 } else { 0 })?;
+    if cfg.max_parallel_downloads != 0 { writeln!(f, "max_parallel_downloads={}", cfg.max_parallel_downloads)?; }
     Ok(())
 }

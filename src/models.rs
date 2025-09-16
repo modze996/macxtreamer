@@ -31,6 +31,8 @@ pub struct Config {
     pub cover_height: f32,            // default 60.0
     #[serde(default)]
     pub enable_downloads: bool,       // default false
+    #[serde(default)]
+    pub max_parallel_downloads: u32,  // default 1
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -53,6 +55,8 @@ pub struct Item {
     pub cover: Option<String>,
     #[serde(default)]
     pub year: Option<String>,
+    #[serde(default)]
+    pub release_date: Option<String>,
     #[serde(default)]
     pub rating_5based: Option<f32>,
     #[serde(default)]
@@ -104,6 +108,7 @@ pub struct Row {
     pub stream_url: Option<String>,
     pub cover_url: Option<String>,
     pub year: Option<String>,
+    pub release_date: Option<String>,
     pub rating_5based: Option<f32>,
     pub genre: Option<String>,
     pub path: Option<String>,
@@ -117,6 +122,7 @@ pub struct SearchItem {
     pub container_extension: String,
     pub cover: Option<String>,
     pub year: Option<String>,
+    pub release_date: Option<String>,
     pub rating_5based: Option<f32>,
     pub genre: Option<String>,
 }

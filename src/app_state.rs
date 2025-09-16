@@ -13,6 +13,7 @@ use crate::models::{Category, Config, Episode, FavItem, Item, RecentItem, Row};
 pub enum SortKey {
     Name,
     Year,
+    ReleaseDate,
     Rating,
     Genre,
 }
@@ -359,6 +360,7 @@ impl AppState {
                 let ordering = match sort_key {
                     SortKey::Name => a.name.cmp(&b.name),
                     SortKey::Year => a.year.as_deref().unwrap_or("").cmp(b.year.as_deref().unwrap_or("")),
+                    SortKey::ReleaseDate => a.year.as_deref().unwrap_or("").cmp(b.year.as_deref().unwrap_or("")), // Fallback to year for now
                     SortKey::Rating => a.rating_5based.unwrap_or(0.0).partial_cmp(&b.rating_5based.unwrap_or(0.0)).unwrap_or(std::cmp::Ordering::Equal),
                     SortKey::Genre => a.genre.as_deref().unwrap_or("").cmp(b.genre.as_deref().unwrap_or("")),
                 };

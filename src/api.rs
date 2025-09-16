@@ -49,7 +49,8 @@ pub async fn fetch_items(cfg: &Config, kind: &str, category_id: &str) -> Result<
                 if let Some(plot) = v.get("plot").and_then(|x| x.as_str()) { item.plot = plot.to_string(); }
                 if let Some(url) = v.get("stream_url").and_then(|x| x.as_str()) { item.stream_url = Some(url.to_string()); }
                 if let Some(cover) = v.get("cover").or_else(|| v.get("stream_icon")).and_then(|x| x.as_str()) { item.cover = Some(cover.to_string()); }
-                if let Some(year) = v.get("year").or_else(|| v.get("releasedate")).and_then(|x| x.as_str()) { item.year = Some(year.to_string()); }
+                if let Some(year) = v.get("year").and_then(|x| x.as_str()) { item.year = Some(year.to_string()); }
+                if let Some(release_date) = v.get("releaseDate").or_else(|| v.get("release_date")).or_else(|| v.get("releasedate")).and_then(|x| x.as_str()) { item.release_date = Some(release_date.to_string()); }
         // Ratings: handle both "rating_5based" (number or string) and "rating" (string/number), normalize to 0..5
         let read_f32 = |val: &serde_json::Value| -> Option<f32> {
             val.as_f64().map(|x| x as f32)
