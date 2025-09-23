@@ -97,6 +97,7 @@ pub enum Msg {
         query: String,
         results: Vec<Item>,
     },
+    JustWatchRecommendations(Result<Vec<crate::models::JustWatchRecommendation>, String>),
 }
 
 #[derive(Debug, Clone)]

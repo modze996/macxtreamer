@@ -126,3 +126,48 @@ pub struct SearchItem {
     pub rating_5based: Option<f32>,
     pub genre: Option<String>,
 }
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct JustWatchRecommendation {
+    pub title: String,
+    pub year: Option<String>,
+    pub genre: Option<String>,
+    pub provider: Option<String>,
+    pub content_type: String, // "movie" or "series"
+    pub url: Option<String>,
+    pub cover_url: Option<String>,
+    pub rating: Option<f32>,
+    #[serde(default)]
+    pub description: Option<String>,
+    #[serde(default)]
+    pub director: Option<String>,
+    #[serde(default)]
+    pub cast: Option<Vec<String>>,
+    #[serde(default)]
+    pub runtime: Option<String>,
+    #[serde(default)]
+    pub age_rating: Option<String>,
+    #[serde(default)]
+    pub imdb_rating: Option<f32>,
+}
+
+impl Default for JustWatchRecommendation {
+    fn default() -> Self {
+        Self {
+            title: String::new(),
+            year: None,
+            genre: None,
+            provider: None,
+            content_type: "movie".to_string(),
+            url: None,
+            cover_url: None,
+            rating: None,
+            description: None,
+            director: None,
+            cast: None,
+            runtime: None,
+            age_rating: None,
+            imdb_rating: None,
+        }
+    }
+}
