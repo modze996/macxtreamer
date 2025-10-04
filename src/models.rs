@@ -18,6 +18,12 @@ pub struct Config {
     #[serde(default)]
     pub reuse_vlc: bool,          // default true
     #[serde(default)]
+    pub vlc_network_caching_ms: u32, // network-caching in ms for VLC (live)
+    #[serde(default)]
+    pub vlc_live_caching_ms: u32,    // live-caching in ms for VLC
+    #[serde(default)]
+    pub vlc_prefetch_buffer_bytes: u64, // prefetch buffer size in bytes
+    #[serde(default)]
     pub download_dir: String,     // default ~/Downloads/macxtreamer
     #[serde(default)]
     pub cover_uploads_per_frame: u32, // default 3
@@ -149,6 +155,8 @@ pub struct JustWatchRecommendation {
     pub age_rating: Option<String>,
     #[serde(default)]
     pub imdb_rating: Option<f32>,
+    #[serde(default)]
+    pub trailer_url: Option<String>,
 }
 
 impl Default for JustWatchRecommendation {
@@ -168,6 +176,7 @@ impl Default for JustWatchRecommendation {
             runtime: None,
             age_rating: None,
             imdb_rating: None,
+            trailer_url: None,
         }
     }
 }

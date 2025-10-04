@@ -80,8 +80,9 @@ pub fn build_url_by_type(cfg: &Config, id: &str, info: &str, container_ext: Opti
 pub fn get_optimized_vlc_command(stream_type: &str) -> &'static str {
     match stream_type {
         "live" | "channel" => {
-            // Optimized for live TV/IPTV streams - fixes audio output and PCR timing errors
-            "vlc --fullscreen --no-video-title-show --network-caching=4000 --live-caching=2000 --audio-resampler=soxr --audio-time-stretch --force-dolby-surround=0 --aout=pulse,alsa,oss --audio-desync=0 --clock-master=audio --clock-jitter=0 --network-synchronisation --avcodec-skiploopfilter=4 --avcodec-skip-frame=0 --avcodec-skip-idct=0 --sout-x264-preset=ultrafast --drop-late-frames --skip-frames --intf=dummy --no-video-title --no-snapshot-preview --no-stats --no-osd --rtsp-tcp --http-reconnect --adaptive-logic=rate --hls-segment-threads=6 --prefetch-buffer-size=2097152 --demux-filter=record --ts-es-id-pid --ts-seek-percent --pts-offset=0 {URL}"
+            // Optimized for live TV/IPTV streams - increase buffering to improve stability on flaky networks
+            // Significantly raise network-caching and live-caching (values in ms) and increase prefetch buffer (bytes)
+            "vlc --fullscreen --no-video-title-show --network-caching=20000 --live-caching=10000 --audio-resampler=soxr --audio-time-stretch --force-dolby-surround=0 --aout=pulse,alsa,oss --audio-desync=0 --clock-master=audio --clock-jitter=0 --network-synchronisation --avcodec-skiploopfilter=4 --avcodec-skip-frame=0 --avcodec-skip-idct=0 --sout-x264-preset=ultrafast --drop-late-frames --skip-frames --intf=dummy --no-video-title --no-snapshot-preview --no-stats --no-osd --rtsp-tcp --http-reconnect --adaptive-logic=rate --hls-segment-threads=6 --prefetch-buffer-size=8388608 --demux-filter=record --ts-es-id-pid --ts-seek-percent --pts-offset=0 {URL}"
         },
         "vod" | "movie" => {
             // Optimized for VOD with audio/video sync fixes
@@ -122,8 +123,34 @@ pub fn detect_stream_type(stream_url: &str) -> &'static str {
 pub fn start_player(cfg: &Config, stream_url: &str) -> io::Result<()> {
     // Auto-detect stream type and use appropriate VLC parameters, or user's custom command
     let stream_type = detect_stream_type(stream_url);
-    let default_cmd = get_optimized_vlc_command(stream_type);
-    let cmd = if cfg.player_command.trim().is_empty() { default_cmd } else { &cfg.player_command };
+    // If user provided a custom player command, prefer it. Otherwise build a VLC command using
+    // the buffer values from config so the user can tune caching without editing code.
+    let cmd = if !cfg.player_command.trim().is_empty() {
+        cfg.player_command.trim().to_string()
+    } else {
+        // Build a command based on stream type, plugging in config values for buffering
+        let network_caching = cfg.vlc_network_caching_ms;
+        let live_caching = cfg.vlc_live_caching_ms;
+        let prefetch_bytes = cfg.vlc_prefetch_buffer_bytes;
+        match stream_type {
+            "live" | "channel" => format!(
+                "vlc --fullscreen --no-video-title-show --network-caching={} --live-caching={} --file-caching=8000 --audio-resampler=soxr --audio-time-stretch --force-dolby-surround=0 --aout=pulse,alsa,oss --audio-desync=0 --clock-master=audio --clock-jitter=2000 --network-synchronisation --avcodec-skiploopfilter=4 --avcodec-skip-frame=0 --avcodec-skip-idct=0 --avcodec-error-resilience=1 --avcodec-workaround-bugs=1 --sout-x264-preset=ultrafast --drop-late-frames --skip-frames --intf=dummy --no-video-title --no-snapshot-preview --no-stats --no-osd --rtsp-tcp --http-reconnect --adaptive-logic=rate --hls-segment-threads=8 --prefetch-buffer-size={} --demux-filter=record --ts-es-id-pid --ts-seek-percent --pts-offset=0 --input-repeat=999 --start-time=0 --sout-mux-caching=5000 --sout-udp-caching=5000 {{URL}}",
+                network_caching, live_caching, prefetch_bytes
+            ),
+            "vod" | "movie" => format!(
+                "vlc --fullscreen --no-video-title-show --network-caching={} --file-caching=5000 --audio-resampler=soxr --audio-time-stretch --force-dolby-surround=0 --aout=pulse,alsa,oss --audio-desync=0 --clock-master=audio --sout-mux-caching=3000 --sout-udp-caching=3000 --cr-average=2000 --avcodec-skiploopfilter=0 --avcodec-skip-frame=0 --avcodec-skip-idct=0 --intf=dummy --no-video-title --no-snapshot-preview --no-stats --rtsp-tcp --http-reconnect --adaptive-logic=rate --hls-segment-threads=4 --prefetch-buffer-size={} --pts-offset=0 {{URL}}",
+                network_caching, prefetch_bytes
+            ),
+            "series" => format!(
+                "vlc --fullscreen --no-video-title-show --network-caching={} --file-caching=4000 --audio-resampler=soxr --audio-time-stretch --force-dolby-surround=0 --aout=pulse,alsa,oss --audio-desync=0 --clock-master=audio --sout-mux-caching=2500 --cr-average=1500 --avcodec-skiploopfilter=2 --avcodec-skip-frame=0 --avcodec-skip-idct=0 --intf=dummy --no-video-title --no-snapshot-preview --no-stats --rtsp-tcp --http-reconnect --adaptive-logic=rate --hls-segment-threads=4 --prefetch-buffer-size={} --pts-offset=0 {{URL}}",
+                network_caching, prefetch_bytes
+            ),
+            _ => format!(
+                "vlc --fullscreen --no-video-title-show --network-caching={} --live-caching=3000 --audio-resampler=soxr --audio-time-stretch --force-dolby-surround=0 --aout=pulse,alsa,oss --audio-desync=0 --clock-master=audio --clock-jitter=0 --network-synchronisation --sout-mux-caching=2000 --file-caching=2000 --sout-udp-caching=2000 --cr-average=1000 --avcodec-skiploopfilter=4 --avcodec-skip-frame=0 --avcodec-skip-idct=0 --sout-x264-preset=ultrafast --drop-late-frames --skip-frames --intf=dummy --no-video-title --no-snapshot-preview --no-stats --no-osd --rtsp-tcp --http-reconnect --adaptive-logic=rate --hls-segment-threads=4 --prefetch-buffer-size={} --demux-filter=record --ts-es-id-pid --ts-seek-percent --pts-offset=0 {{URL}}",
+                network_caching, prefetch_bytes
+            ),
+        }
+    };
     let mut parts: Vec<String> = cmd.split_whitespace().map(|s| s.to_string()).collect();
     let mut replaced = false;
     for p in &mut parts {
@@ -138,12 +165,49 @@ pub fn start_player(cfg: &Config, stream_url: &str) -> io::Result<()> {
     #[cfg(target_os = "macos")]
     {
         if using_vlc && cfg.reuse_vlc && is_vlc_running() {
-            log_line("Reusing running VLC via 'open -a VLC <URL>' (non-blocking)");
+            log_line("Reusing running VLC via 'open -a VLC' with VLC parameters");
             log_line(&format!("URL={}", stream_url));
-            if let Ok(child) = Command::new("open").arg("-a").arg("VLC").arg(stream_url).spawn() {
-                log_line(&format!("Spawned 'open' pid={}", child.id()));
+            log_line(&format!("VLC args: {:?}", parts));
+            
+            // Use 'open' with --args to pass VLC parameters to the running instance
+            let mut open_cmd = Command::new("open");
+            open_cmd.arg("-a").arg("VLC");
+            if !parts.is_empty() {
+                open_cmd.arg("--args").args(&parts);
+            } else {
+                open_cmd.arg(stream_url);
+            }
+            
+            if let Ok(child) = open_cmd.spawn() {
+                log_line(&format!("Spawned 'open' with args pid={}", child.id()));
             }
             return Ok(());
+        }
+        
+        // If reuse is disabled or no VLC running, we may still want to use 'open' for better macOS integration
+        if using_vlc {
+            log_line("Starting new VLC instance via 'open -a VLC' with full parameters");
+            let mut open_cmd = Command::new("open");
+            if !cfg.reuse_vlc {
+                open_cmd.arg("-n"); // force new instance if reuse is disabled
+            }
+            open_cmd.arg("-a").arg("VLC");
+            if !parts.is_empty() {
+                open_cmd.arg("--args").args(&parts);
+            } else {
+                open_cmd.arg(stream_url);
+            }
+            
+            match open_cmd.spawn() {
+                Ok(child) => {
+                    log_line(&format!("Spawned new VLC via 'open' pid={}", child.id()));
+                    return Ok(());
+                }
+                Err(e) => {
+                    log_line(&format!("Failed to spawn VLC via 'open': {}, falling back to direct spawn", e));
+                    // Fall through to direct spawn method below
+                }
+            }
         }
     }
 
@@ -155,27 +219,6 @@ pub fn start_player(cfg: &Config, stream_url: &str) -> io::Result<()> {
         }
         Err(e) => {
             log_error("Failed to spawn player", &e);
-            // macOS fallback: try `open -a VLC` if VLC was intended
-            #[cfg(target_os = "macos")]
-            {
-                if using_vlc {
-                    let mut cmd = Command::new("open");
-                    if !cfg.reuse_vlc {
-                        cmd.arg("-n"); // force new instance if reuse is disabled
-                    }
-                    cmd.arg("-a").arg("VLC");
-                    if !parts.is_empty() {
-                        cmd.arg("--args").args(&parts);
-                    }
-                    log_line("FALLBACK: open -a VLC (from failed spawn, non-blocking)");
-                    if let Ok(child) = cmd.spawn() {
-                        log_line(&format!("Fallback spawned pid={}", child.id()));
-                        return Ok(());
-                    } else {
-                        log_line("FALLBACK failed: could not run 'open -a VLC'");
-                    }
-                }
-            }
             return Err(e);
         }
     }
@@ -220,9 +263,9 @@ mod tests {
             assert!(cmd.contains("--adaptive-logic=rate"));
         }
         
-        // Live streams should have minimal caching
-        assert!(live_cmd.contains("--network-caching=4000"));
-        assert!(live_cmd.contains("--live-caching=2000"));
+    // Live streams should have increased caching for stability on flaky networks
+    assert!(live_cmd.contains("--network-caching=20000"));
+    assert!(live_cmd.contains("--live-caching=10000"));
         
         // VOD should have larger buffer
         assert!(vod_cmd.contains("--network-caching=8000"));

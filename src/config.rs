@@ -17,6 +17,10 @@ pub fn read_config() -> Result<Config, io::Error> {
     };
     let mut cfg = Config::default();
     cfg.reuse_vlc = true; // default
+    // Enhanced defaults for VLC buffering - optimized for live TV stability (10+ seconds total buffering)
+    cfg.vlc_network_caching_ms = 10000;  // 10 seconds network buffering for live TV
+    cfg.vlc_live_caching_ms = 5000;      // Additional 5 seconds live-specific caching
+    cfg.vlc_prefetch_buffer_bytes = 16 * 1024 * 1024; // 16 MiB prefetch buffer for stability
     for line in content.lines() {
         if let Some((k, v)) = line.split_once('=') {
             match k.trim() {
@@ -35,6 +39,9 @@ pub fn read_config() -> Result<Config, io::Error> {
                 "texture_cache_limit" => cfg.texture_cache_limit = v.trim().parse::<u32>().unwrap_or(512),
                 "category_parallel" => cfg.category_parallel = v.trim().parse::<u32>().unwrap_or(6),
                 "cover_height" => cfg.cover_height = v.trim().parse::<f32>().unwrap_or(60.0),
+                "vlc_network_caching_ms" => cfg.vlc_network_caching_ms = v.trim().parse::<u32>().unwrap_or(10000),
+                "vlc_live_caching_ms" => cfg.vlc_live_caching_ms = v.trim().parse::<u32>().unwrap_or(5000),
+                "vlc_prefetch_buffer_bytes" => cfg.vlc_prefetch_buffer_bytes = v.trim().parse::<u64>().unwrap_or(16 * 1024 * 1024),
                 "enable_downloads" => cfg.enable_downloads = v.trim().parse::<u8>().map(|n| n != 0).unwrap_or(false),
                 "max_parallel_downloads" => cfg.max_parallel_downloads = v.trim().parse::<u32>().unwrap_or(1),
                 _ => {}
@@ -63,6 +70,10 @@ pub fn save_config(cfg: &Config) -> Result<(), io::Error> {
     if cfg.font_scale != 0.0 { writeln!(f, "font_scale={:.2}", cfg.font_scale)?; }
     if !cfg.download_dir.is_empty() { writeln!(f, "download_dir={}", cfg.download_dir)?; }
     writeln!(f, "reuse_vlc={}", if cfg.reuse_vlc { 1 } else { 0 })?;
+    // Persist VLC buffer options
+    writeln!(f, "vlc_network_caching_ms={}", cfg.vlc_network_caching_ms)?;
+    writeln!(f, "vlc_live_caching_ms={}", cfg.vlc_live_caching_ms)?;
+    writeln!(f, "vlc_prefetch_buffer_bytes={}", cfg.vlc_prefetch_buffer_bytes)?;
     if cfg.cover_uploads_per_frame != 0 { writeln!(f, "cover_uploads_per_frame={}", cfg.cover_uploads_per_frame)?; }
     if cfg.cover_decode_parallel != 0 { writeln!(f, "cover_decode_parallel={}", cfg.cover_decode_parallel)?; }
     if cfg.texture_cache_limit != 0 { writeln!(f, "texture_cache_limit={}", cfg.texture_cache_limit)?; }
