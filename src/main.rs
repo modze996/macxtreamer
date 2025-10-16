@@ -24,14 +24,14 @@ mod search;
 mod storage;
 mod ui_helpers;
 
-use api::{fetch_categories, fetch_items, fetch_series_episodes};
+use api::{fetch_categories, fetch_items, fetch_series_episodes, fetch_wisdom_gate_recommendations};
 use app_state::{Msg, SortKey, ViewState};
 use cache::{clear_all_caches, file_age_secs, image_cache_path};
 use config::{read_config, save_config};
 use downloads::{BulkOptions, sanitize_filename};
 use images::image_meta_path;
 use logger::log_line;
-use models::{Category, Config, FavItem, Item, JustWatchRecommendation, RecentItem, Row};
+use models::{Category, Config, FavItem, Item, JustWatchRecommendation, RecentItem, Row, WisdomGateRecommendation};
 use ui_helpers::{colored_text_by_type, render_loading_spinner, format_file_size, file_path_to_uri};
 use player::{build_url_by_type, start_player};
 use reqwest::header::{ETAG, IF_MODIFIED_SINCE, IF_NONE_MATCH, LAST_MODIFIED};
@@ -139,6 +139,9 @@ struct MacXtreamer {
     view_stack: Vec<ViewState>,
     // JustWatch recommendation info popup
     show_recommendation_info: Option<JustWatchRecommendation>,
+    // Wisdom-Gate AI recommendations
+    wisdom_gate_recommendations: Option<String>,
+    wisdom_gate_last_fetch: Option<std::time::Instant>,
 }
 
 #[derive(Debug, Clone)]
@@ -327,6 +330,8 @@ impl MacXtreamer {
             current_view: None,
             view_stack: Vec::new(),
             show_recommendation_info: None,
+            wisdom_gate_recommendations: None,
+            wisdom_gate_last_fetch: None,
         };
         // Determine initial config readiness
         if !had_file || !app.config_is_complete() {
@@ -1303,18 +1308,27 @@ impl eframe::App for MacXtreamer {
             || !self.pending_decode_urls.is_empty()
             || self.indexing;
         
+        // CPU FIX: Dramatically reduce automatic repaint frequency
         if has_critical_bg_work {
-            // Für kritische Tasks häufiger repainten (aber nicht so oft wie vorher)
-            ctx.request_repaint_after(Duration::from_millis(200));
+            // Even critical tasks don't need frequent repaints
+            ctx.request_repaint_after(Duration::from_millis(2000)); // 2 seconds instead of 200ms
         } else if has_minor_bg_work {
-            // Für weniger kritische Tasks seltener repainten
-            ctx.request_repaint_after(Duration::from_millis(500));
+            // Minor tasks get very infrequent repaints
+            ctx.request_repaint_after(Duration::from_millis(5000)); // 5 seconds instead of 500ms
         }
+        // If no background work, NO automatic repaints at all!
 
-        // Drain messages
+        // CRITICAL CPU FIX: Limit message processing to prevent endless loops
         let mut got_msg = false;
         let mut covers_to_prefetch: Vec<String> = Vec::new();
-        for msg in self.rx.try_iter() {
+        let mut message_count = 0;
+        const MAX_MESSAGES_PER_FRAME: usize = 3; // Very strict limit!
+        
+        while let Ok(msg) = self.rx.try_recv() {
+            message_count += 1;
+            if message_count > MAX_MESSAGES_PER_FRAME {
+                break; // Prevent infinite message processing
+            }
             got_msg = true;
             match msg {
                 Msg::LiveCategories(res) => {
@@ -1877,6 +1891,10 @@ impl eframe::App for MacXtreamer {
                         }
                     }
                 }
+                Msg::WisdomGateRecommendations(content) => {
+                    self.wisdom_gate_recommendations = Some(content);
+                    self.wisdom_gate_last_fetch = Some(std::time::Instant::now());
+                }
             }
         }
 
@@ -1892,14 +1910,14 @@ impl eframe::App for MacXtreamer {
             self.start_search();
         }
 
-        // Intelligenteres Repaint-Verhalten: nur bei wichtigen State-Änderungen
-        // Vermeidet unnötige Repaints bei unwichtigen Messages
+        // CRITICAL CPU FIX: Massively reduce repaint frequency to prevent CPU overload
+        // 50ms was causing 400% CPU usage!
         if got_msg {
-            // Nur bei signifikanten Messages sofort repainten
-            // Für kleinere Updates verwenden wir die bestehende Hintergrund-Logik
-            if self.is_loading || !self.content_rows.is_empty() {
-                ctx.request_repaint_after(Duration::from_millis(50));
+            // Only repaint for critical loading states, and much less frequently
+            if self.is_loading {
+                ctx.request_repaint_after(Duration::from_millis(1000)); // 1 second instead of 50ms!
             }
+            // No automatic repaints for content updates - let user interaction drive them
         }
 
         // Verarbeite pro Frame nur ein kleines Budget an Texture-Uploads,
@@ -1928,10 +1946,10 @@ impl eframe::App for MacXtreamer {
                 done += 1;
             }
             if !self.pending_texture_uploads.is_empty() {
-                // Noch Arbeit übrig – nur repainten wenn größere Mengen ausstehen
-                // Vermeidet ständiges Flimmern bei einzelnen Cover-Uploads
-                if self.pending_texture_uploads.len() > 3 {
-                    ctx.request_repaint_after(Duration::from_millis(150));
+                // CPU FIX: Much less frequent texture upload repaints
+                // Only repaint if many textures are pending
+                if self.pending_texture_uploads.len() > 10 {
+                    ctx.request_repaint_after(Duration::from_millis(2000)); // 2s instead of 150ms
                 }
             }
             // Grobe LRU-Begrenzung für Texturen
@@ -2311,7 +2329,7 @@ impl eframe::App for MacXtreamer {
             .width_range(250.0..=400.0)
             .resizable(true)
             .show(ctx, |ui| {
-                self.render_justwatch_panel(ui);
+                self.render_wisdom_gate_panel(ui);
             });
 
         egui::CentralPanel::default().show(ctx, |ui| {
@@ -4267,38 +4285,70 @@ async fn fetch_demo_justwatch_data() -> Result<Vec<models::JustWatchRecommendati
 }
 
 impl MacXtreamer {
-    /// Render JustWatch recommendations panel
-    fn render_justwatch_panel(&mut self, ui: &mut egui::Ui) {
-        ui.heading("🏆 Top Empfehlungen");
+    /// Render Wisdom-Gate AI recommendations panel
+    fn render_wisdom_gate_panel(&mut self, ui: &mut egui::Ui) {
+        ui.heading("🤖 AI Streaming-Empfehlungen");
         ui.separator();
         
-
-        
-        // Check if we need to refresh recommendations (refresh every hour)
-        let needs_refresh = self.justwatch_last_fetch
-            .map(|last| last.elapsed() > Duration::from_secs(3600))
-            .unwrap_or(true);
-        
-        // Only load if we have no data or if it's time to refresh
-        if self.justwatch_recommendations.is_empty() && needs_refresh {
-            // Load recommendations if none are available and we need refresh
-            let tx = self.tx.clone();
-            let max_movies = self.justwatch_max_movies;
-            let max_series = self.justwatch_max_series;
-            tokio::spawn(async move {
-                let r = fetch_justwatch_recommendations_with_config(max_movies, max_series).await;
-                let _ = tx.send(Msg::JustWatchRecommendations(r.map_err(|e| e.to_string())));
-            });
-        }
-        
-        if self.justwatch_recommendations.is_empty() {
-            ui.spinner();
-            ui.label("Lade Empfehlungen...");
+        // Check if API key is configured
+        if self.config.wisdom_gate_api_key.trim().is_empty() {
+            ui.colored_label(egui::Color32::YELLOW, "⚠️ Wisdom-Gate API Key nicht konfiguriert");
+            ui.label("Bitte API Key in den Einstellungen hinzufügen.");
             return;
         }
         
-        // Controls row
+        // Check if we need to refresh recommendations (refresh every 30 minutes)
+        let needs_refresh = self.wisdom_gate_last_fetch
+            .map(|last| last.elapsed() > Duration::from_secs(1800)) // 30 minutes
+            .unwrap_or(true);
+        
+        // Refresh button and status
         ui.horizontal(|ui| {
+            if ui.button("🔄 Aktualisieren").clicked() {
+                self.wisdom_gate_last_fetch = Some(std::time::Instant::now());
+                let tx = self.tx.clone();
+                let api_key = self.config.wisdom_gate_api_key.clone();
+                let prompt = self.config.wisdom_gate_prompt.clone();
+                let model = self.config.wisdom_gate_model.clone();
+                tokio::spawn(async move {
+                    match fetch_wisdom_gate_recommendations(&api_key, &prompt, &model).await {
+                        Ok(content) => {
+                            let _ = tx.send(Msg::WisdomGateRecommendations(content));
+                        }
+                        Err(e) => {
+                            log_line(&format!("Failed to fetch Wisdom-Gate recommendations: {}", e));
+                        }
+                    }
+                });
+            }
+            
+            if let Some(last_fetch) = self.wisdom_gate_last_fetch {
+                let elapsed = last_fetch.elapsed();
+                if elapsed.as_secs() < 60 {
+                    ui.label(format!("Zuletzt aktualisiert: vor {} Sekunden", elapsed.as_secs()));
+                } else {
+                    ui.label(format!("Zuletzt aktualisiert: vor {} Minuten", elapsed.as_secs() / 60));
+                }
+            }
+        });
+        
+        ui.separator();
+        
+        // Display recommendations
+        if let Some(content) = &self.wisdom_gate_recommendations {
+            egui::ScrollArea::vertical()
+                .max_height(400.0)
+                .show(ui, |ui| {
+                    ui.label(content);
+                });
+        } else {
+            ui.horizontal(|ui| {
+                ui.spinner();
+                ui.label("Lade AI-Empfehlungen...");
+            });
+        }
+        
+    }
             if ui.button("🔄 Aktualisieren").clicked() {
                 let tx = self.tx.clone();
                 let max_movies = self.justwatch_max_movies;

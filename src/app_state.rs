@@ -98,6 +98,7 @@ pub enum Msg {
         results: Vec<Item>,
     },
     JustWatchRecommendations(Result<Vec<crate::models::JustWatchRecommendation>, String>),
+    WisdomGateRecommendations(String), // AI recommendations content
 }
 
 #[derive(Debug, Clone)]

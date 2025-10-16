@@ -39,6 +39,12 @@ pub struct Config {
     pub enable_downloads: bool,       // default false
     #[serde(default)]
     pub max_parallel_downloads: u32,  // default 1
+    #[serde(default)]
+    pub wisdom_gate_api_key: String,  // API key for Wisdom-Gate
+    #[serde(default)]
+    pub wisdom_gate_prompt: String,   // Custom prompt for AI recommendations
+    #[serde(default)]
+    pub wisdom_gate_model: String,    // Model selection for Wisdom-Gate
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -179,4 +185,22 @@ impl Default for JustWatchRecommendation {
             trailer_url: None,
         }
     }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct WisdomGateRecommendation {
+    pub content: String,  // Raw AI response content
+}
+
+impl Default for WisdomGateRecommendation {
+    fn default() -> Self {
+        Self {
+            content: String::new(),
+        }
+    }
+}
+
+// Default Wisdom-Gate prompt for streaming recommendations
+pub fn default_wisdom_gate_prompt() -> String {
+    "Was sind die besten Streaming-Empfehlungen für heute in Deutschland? Bitte nenne aktuelle Filme und Serien auf Netflix, Amazon Prime, Disney+, etc. mit kurzer Beschreibung.".to_string()
 }

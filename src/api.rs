@@ -114,5 +114,46 @@ pub async fn fetch_series_episodes(cfg: &Config, series_id: &str) -> Result<Vec<
         }
         Ok::<Vec<Episode>, reqwest::Error>(out)
     }.await;
-    match net { Ok(eps) => { save_cache(&key, &eps); Ok(eps) } Err(e) => { if let Some(stale) = load_stale_cache::<Vec<Episode>>(&key) { Ok(stale) } else { Err(e) } } }
+    match net { Ok(eps) => { save_cache(&key, &eps); Ok(eps) } Err(e) => { if let Some(stale) = load_stale_cache::<Vec<Episode>>(&key) { Ok(stale) } else { Err(e) } } } }
+
+// Wisdom-Gate AI API integration for streaming recommendations
+pub async fn fetch_wisdom_gate_recommendations(api_key: &str, prompt: &str, model: &str) -> Result<String, reqwest::Error> {
+    let client = reqwest::Client::new();
+    
+    let request_body = serde_json::json!({
+        "model": model,
+        "messages": [
+            {
+                "role": "user",
+                "content": prompt
+            }
+        ],
+        "max_tokens": 1500,
+        "temperature": 0.7
+    });
+    
+    let response = client
+        .post("https://api.wisdom-gate.ai/v1/chat/completions")
+        .header("Authorization", format!("Bearer {}", api_key))
+        .header("Content-Type", "application/json")
+        .json(&request_body)
+        .send()
+        .await?;
+    
+    if !response.status().is_success() {
+        return Err(reqwest::Error::from(response.error_for_status().unwrap_err()));
+    }
+    
+    let json: serde_json::Value = response.json().await?;
+    
+    let content = json
+        .get("choices")
+        .and_then(|choices| choices.get(0))
+        .and_then(|choice| choice.get("message"))
+        .and_then(|message| message.get("content"))
+        .and_then(|content| content.as_str())
+        .unwrap_or("Keine Empfehlungen verfügbar.")
+        .to_string();
+    
+    Ok(content)
 }

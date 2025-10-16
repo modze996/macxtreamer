@@ -44,6 +44,9 @@ pub fn read_config() -> Result<Config, io::Error> {
                 "vlc_prefetch_buffer_bytes" => cfg.vlc_prefetch_buffer_bytes = v.trim().parse::<u64>().unwrap_or(16 * 1024 * 1024),
                 "enable_downloads" => cfg.enable_downloads = v.trim().parse::<u8>().map(|n| n != 0).unwrap_or(false),
                 "max_parallel_downloads" => cfg.max_parallel_downloads = v.trim().parse::<u32>().unwrap_or(1),
+                "wisdom_gate_api_key" => cfg.wisdom_gate_api_key = v.trim().to_string(),
+                "wisdom_gate_prompt" => cfg.wisdom_gate_prompt = v.trim().to_string(),
+                "wisdom_gate_model" => cfg.wisdom_gate_model = v.trim().to_string(),
                 _ => {}
             }
         }
@@ -53,6 +56,15 @@ pub fn read_config() -> Result<Config, io::Error> {
             cfg.download_dir = format!("{}/Downloads/macxtreamer", home);
         }
     }
+    
+    // Set default Wisdom-Gate values if empty
+    if cfg.wisdom_gate_prompt.trim().is_empty() {
+        cfg.wisdom_gate_prompt = crate::models::default_wisdom_gate_prompt();
+    }
+    if cfg.wisdom_gate_model.trim().is_empty() {
+        cfg.wisdom_gate_model = "gpt-4".to_string(); // Default model
+    }
+    
     Ok(cfg)
 }
 
@@ -81,5 +93,11 @@ pub fn save_config(cfg: &Config) -> Result<(), io::Error> {
     if cfg.cover_height != 0.0 { writeln!(f, "cover_height={:.1}", cfg.cover_height)?; }
     writeln!(f, "enable_downloads={}", if cfg.enable_downloads { 1 } else { 0 })?;
     if cfg.max_parallel_downloads != 0 { writeln!(f, "max_parallel_downloads={}", cfg.max_parallel_downloads)?; }
+    
+    // Save Wisdom-Gate configuration
+    if !cfg.wisdom_gate_api_key.is_empty() { writeln!(f, "wisdom_gate_api_key={}", cfg.wisdom_gate_api_key)?; }
+    if !cfg.wisdom_gate_prompt.is_empty() { writeln!(f, "wisdom_gate_prompt={}", cfg.wisdom_gate_prompt)?; }
+    if !cfg.wisdom_gate_model.is_empty() { writeln!(f, "wisdom_gate_model={}", cfg.wisdom_gate_model)?; }
+    
     Ok(())
 }
