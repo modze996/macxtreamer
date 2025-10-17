@@ -45,6 +45,50 @@ pub struct Config {
     pub wisdom_gate_prompt: String,   // Custom prompt for AI recommendations
     #[serde(default)]
     pub wisdom_gate_model: String,    // Model selection for Wisdom-Gate
+    #[serde(default)]
+    pub wisdom_gate_cache_content: String,  // Cached recommendations content
+    #[serde(default)]
+    pub wisdom_gate_cache_timestamp: u64,   // Timestamp when cache was created (Unix timestamp)
+}
+
+impl Config {
+    /// Check if the cache is still valid (less than 24 hours old)
+    pub fn is_wisdom_gate_cache_valid(&self) -> bool {
+        if self.wisdom_gate_cache_content.is_empty() || self.wisdom_gate_cache_timestamp == 0 {
+            return false;
+        }
+        
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+        
+        let cache_age_hours = (now - self.wisdom_gate_cache_timestamp) / 3600;
+        cache_age_hours < 24  // Cache is valid for 24 hours
+    }
+    
+    /// Update the cache with new content
+    pub fn update_wisdom_gate_cache(&mut self, content: String) {
+        self.wisdom_gate_cache_content = content;
+        self.wisdom_gate_cache_timestamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+    }
+    
+    /// Get cache age in hours for display
+    pub fn get_wisdom_gate_cache_age_hours(&self) -> u64 {
+        if self.wisdom_gate_cache_timestamp == 0 {
+            return 0;
+        }
+        
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+        
+        (now - self.wisdom_gate_cache_timestamp) / 3600
+    }
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -139,53 +183,7 @@ pub struct SearchItem {
     pub genre: Option<String>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct JustWatchRecommendation {
-    pub title: String,
-    pub year: Option<String>,
-    pub genre: Option<String>,
-    pub provider: Option<String>,
-    pub content_type: String, // "movie" or "series"
-    pub url: Option<String>,
-    pub cover_url: Option<String>,
-    pub rating: Option<f32>,
-    #[serde(default)]
-    pub description: Option<String>,
-    #[serde(default)]
-    pub director: Option<String>,
-    #[serde(default)]
-    pub cast: Option<Vec<String>>,
-    #[serde(default)]
-    pub runtime: Option<String>,
-    #[serde(default)]
-    pub age_rating: Option<String>,
-    #[serde(default)]
-    pub imdb_rating: Option<f32>,
-    #[serde(default)]
-    pub trailer_url: Option<String>,
-}
 
-impl Default for JustWatchRecommendation {
-    fn default() -> Self {
-        Self {
-            title: String::new(),
-            year: None,
-            genre: None,
-            provider: None,
-            content_type: "movie".to_string(),
-            url: None,
-            cover_url: None,
-            rating: None,
-            description: None,
-            director: None,
-            cast: None,
-            runtime: None,
-            age_rating: None,
-            imdb_rating: None,
-            trailer_url: None,
-        }
-    }
-}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct WisdomGateRecommendation {

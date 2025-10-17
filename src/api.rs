@@ -117,43 +117,122 @@ pub async fn fetch_series_episodes(cfg: &Config, series_id: &str) -> Result<Vec<
     match net { Ok(eps) => { save_cache(&key, &eps); Ok(eps) } Err(e) => { if let Some(stale) = load_stale_cache::<Vec<Episode>>(&key) { Ok(stale) } else { Err(e) } } } }
 
 // Wisdom-Gate AI API integration for streaming recommendations
-pub async fn fetch_wisdom_gate_recommendations(api_key: &str, prompt: &str, model: &str) -> Result<String, reqwest::Error> {
+// Demo fallback function for testing
+fn get_demo_recommendations() -> String {
+    "🎬 **Heutige Top Streaming-Empfehlungen (16. Oktober 2025)**\n\n\
+    **Netflix:**\n\
+    • The Crown (Staffel 6) - Das finale Kapitel der Royal-Saga\n\
+    • Wednesday (Staffel 2) - Addams Family Mystery geht weiter\n\
+    • Stranger Things: The Final Season - Hawkins' letzter Kampf\n\n\
+    **Amazon Prime:**\n\
+    • The Boys (Staffel 4) - Superhelden-Satire auf dem Höhepunkt\n\
+    • Lord of the Rings: The Rings of Power (Staffel 2)\n\
+    • The Marvelous Mrs. Maisel - Finale der Comedy-Serie\n\n\
+    **Disney+:**\n\
+    • The Mandalorian (Staffel 4) - Neue Abenteuer in der Galaxie\n\
+    • Loki (Staffel 3) - Multiversum-Chaos geht weiter\n\
+    • What If...? (Staffel 3) - Alternative Marvel-Realitäten\n\n\
+    **Apple TV+:**\n\
+    • Ted Lasso (Special Episodes) - Rückkehr des beliebten Trainers\n\
+    • Severance (Staffel 2) - Psycho-Thriller der Extraklasse\n\n\
+    Viel Spaß beim Streamen! 🍿".to_string()
+}
+
+pub async fn fetch_wisdom_gate_recommendations(api_key: &str, prompt: &str, model: &str) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
     let client = reqwest::Client::new();
     
+    // Try different API key formats and models
+    let headers = match api_key.starts_with("Bearer ") {
+        true => format!("{}", api_key),  // Already has Bearer prefix
+        false => format!("Bearer {}", api_key),  // Add Bearer prefix
+    };
+    
+    let url = "https://wisdom-gate.juheapi.com/v1/chat/completions";
+    println!("🔗 Connecting to: {}", url);
+    println!("🤖 Model: {}", model);
+    
+    // Simplified request body - exactly matching the JavaScript example
     let request_body = serde_json::json!({
-        "model": model,
         "messages": [
             {
                 "role": "user",
                 "content": prompt
             }
         ],
-        "max_tokens": 1500,
-        "temperature": 0.7
+        "model": model,
+        "max_tokens": 2000,  // Adding back in case it helps
+        "temperature": 0.7   // Adding back in case it helps
     });
     
+    println!("📋 Request body: {}", serde_json::to_string_pretty(&request_body)?);
+    println!("🔑 Auth header: {}", headers);
+    
     let response = client
-        .post("https://api.wisdom-gate.ai/v1/chat/completions")
-        .header("Authorization", format!("Bearer {}", api_key))
+        .post(url)
         .header("Content-Type", "application/json")
+        .header("Authorization", &headers)
         .json(&request_body)
         .send()
         .await?;
+        
+    let status = response.status();
+    let response_text = response.text().await?;
     
-    if !response.status().is_success() {
-        return Err(reqwest::Error::from(response.error_for_status().unwrap_err()));
+    println!("📊 Response status: {}", status);
+    println!("📄 Response body: {}", response_text);
+    
+    if !status.is_success() {
+        println!("❌ API Error: Status {}", status);
+        println!("❌ Error details: {}", response_text);
+        return Ok(format!("API Fehler ({}): {}", status, response_text));
     }
     
-    let json: serde_json::Value = response.json().await?;
+    // Parse response
+    let response_json: serde_json::Value = serde_json::from_str(&response_text)?;
     
-    let content = json
-        .get("choices")
-        .and_then(|choices| choices.get(0))
-        .and_then(|choice| choice.get("message"))
-        .and_then(|message| message.get("content"))
-        .and_then(|content| content.as_str())
-        .unwrap_or("Keine Empfehlungen verfügbar.")
-        .to_string();
+    if let Some(choices) = response_json["choices"].as_array() {
+        if let Some(first_choice) = choices.first() {
+            if let Some(message) = first_choice["message"].as_object() {
+                if let Some(content) = message["content"].as_str() {
+                    return Ok(content.to_string());
+                }
+            }
+        }
+    }
     
-    Ok(content)
+    Ok(format!("Modell {} lieferte keine verwertbare Antwort: {}", model, response_text))
+}
+
+// Wrapper function that handles network errors gracefully and tries fallback models
+pub async fn fetch_wisdom_gate_recommendations_safe(api_key: &str, prompt: &str, model: &str) -> String {
+    // List of actually available models to try in order
+    let models_to_try = vec![
+        model,  // Try user-selected model first
+        "wisdom-ai-dsv3",
+        "deepseek-v3",
+        "gemini-2.5-flash",
+        "wisdom-ai-gemini-2.5-flash"
+    ];
+    
+    for try_model in models_to_try {
+        println!("🔄 Versuche Modell: {}", try_model);
+        match fetch_wisdom_gate_recommendations(api_key, prompt, try_model).await {
+            Ok(content) => {
+                if !content.starts_with("Modell") && !content.starts_with("API Fehler") {
+                    if try_model != model {
+                        println!("✅ Fallback erfolgreich: {} funktioniert!", try_model);
+                    }
+                    return content;
+                }
+                println!("⚠️ Modell {} nicht verfügbar, versuche nächstes...", try_model);
+            }
+            Err(e) => {
+                println!("❌ Fehler mit Modell {}: {}", try_model, e);
+            }
+        }
+    }
+    
+    // If all models fail, return demo
+    println!("🌐 Alle Modelle fehlgeschlagen - Verwende Demo-Empfehlungen");
+    format!("🌐 **Offline-Modus** (Alle verfügbaren Modelle getestet)\n\n{}", get_demo_recommendations())
 }
