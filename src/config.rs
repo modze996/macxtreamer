@@ -18,10 +18,23 @@ pub fn read_config() -> Result<Config, io::Error> {
     };
     let mut cfg = Config::default();
     cfg.reuse_vlc = true; // default
-    // Enhanced defaults for VLC buffering - optimized for live TV stability (10+ seconds total buffering)
-    cfg.vlc_network_caching_ms = 10000;  // 10 seconds network buffering for live TV
-    cfg.vlc_live_caching_ms = 5000;      // Additional 5 seconds live-specific caching
-    cfg.vlc_prefetch_buffer_bytes = 16 * 1024 * 1024; // 16 MiB prefetch buffer for stability
+    // Enhanced defaults for VLC buffering - optimized for live TV stability with stuttering fix
+    cfg.vlc_network_caching_ms = 25000;  // 25 seconds network buffering for stutter-free live TV
+    cfg.vlc_live_caching_ms = 15000;     // 15 seconds additional live-specific caching
+    cfg.vlc_prefetch_buffer_bytes = 64 * 1024 * 1024; // 64 MiB prefetch buffer for maximum stability
+    cfg.vlc_file_caching_ms = 3000; // default moderate VOD file caching
+    cfg.vlc_mux_caching_ms = 1500; // default small mux caching
+    cfg.vlc_http_reconnect = true; // attempt reconnects by default
+    cfg.vlc_timeout_ms = 15000; // 15s HTTP timeout
+    cfg.vlc_extra_args = String::new(); // empty by default
+    cfg.vlc_profile_bias = 50; // middle ground default
+    cfg.vlc_verbose = false;
+    cfg.vlc_diagnose_on_start = false;
+    cfg.vlc_continuous_diagnostics = false;
+    cfg.use_mpv = false; // default to VLC unless user opts in
+    cfg.mpv_extra_args = String::new();
+    cfg.mpv_cache_secs_override = 0;
+    cfg.mpv_readahead_secs_override = 0;
     for line in content.lines() {
         if let Some((k, v)) = line.split_once('=') {
             match k.trim() {
@@ -40,9 +53,22 @@ pub fn read_config() -> Result<Config, io::Error> {
                 "texture_cache_limit" => cfg.texture_cache_limit = v.trim().parse::<u32>().unwrap_or(512),
                 "category_parallel" => cfg.category_parallel = v.trim().parse::<u32>().unwrap_or(6),
                 "cover_height" => cfg.cover_height = v.trim().parse::<f32>().unwrap_or(60.0),
-                "vlc_network_caching_ms" => cfg.vlc_network_caching_ms = v.trim().parse::<u32>().unwrap_or(10000),
-                "vlc_live_caching_ms" => cfg.vlc_live_caching_ms = v.trim().parse::<u32>().unwrap_or(5000),
-                "vlc_prefetch_buffer_bytes" => cfg.vlc_prefetch_buffer_bytes = v.trim().parse::<u64>().unwrap_or(16 * 1024 * 1024),
+                "vlc_network_caching_ms" => cfg.vlc_network_caching_ms = v.trim().parse::<u32>().unwrap_or(25000),
+                "vlc_live_caching_ms" => cfg.vlc_live_caching_ms = v.trim().parse::<u32>().unwrap_or(15000),
+                "vlc_prefetch_buffer_bytes" => cfg.vlc_prefetch_buffer_bytes = v.trim().parse::<u64>().unwrap_or(64 * 1024 * 1024),
+                "vlc_file_caching_ms" => cfg.vlc_file_caching_ms = v.trim().parse::<u32>().unwrap_or(3000),
+                "vlc_mux_caching_ms" => cfg.vlc_mux_caching_ms = v.trim().parse::<u32>().unwrap_or(1500),
+                "vlc_http_reconnect" => cfg.vlc_http_reconnect = v.trim().parse::<u8>().map(|n| n != 0).unwrap_or(true),
+                "vlc_timeout_ms" => cfg.vlc_timeout_ms = v.trim().parse::<u32>().unwrap_or(15000),
+                "vlc_extra_args" => cfg.vlc_extra_args = v.trim().to_string(),
+                "vlc_profile_bias" => cfg.vlc_profile_bias = v.trim().parse::<u32>().unwrap_or(50).min(100),
+                "vlc_verbose" => cfg.vlc_verbose = v.trim().parse::<u8>().map(|n| n!=0).unwrap_or(false),
+                "vlc_diagnose_on_start" => cfg.vlc_diagnose_on_start = v.trim().parse::<u8>().map(|n| n!=0).unwrap_or(false),
+                "vlc_continuous_diagnostics" => cfg.vlc_continuous_diagnostics = v.trim().parse::<u8>().map(|n| n!=0).unwrap_or(false),
+                "use_mpv" => cfg.use_mpv = v.trim().parse::<u8>().map(|n| n!=0).unwrap_or(false),
+                "mpv_extra_args" => cfg.mpv_extra_args = v.trim().to_string(),
+                "mpv_cache_secs_override" => cfg.mpv_cache_secs_override = v.trim().parse::<u32>().unwrap_or(0),
+                "mpv_readahead_secs_override" => cfg.mpv_readahead_secs_override = v.trim().parse::<u32>().unwrap_or(0),
                 "enable_downloads" => cfg.enable_downloads = v.trim().parse::<u8>().map(|n| n != 0).unwrap_or(false),
                 "max_parallel_downloads" => cfg.max_parallel_downloads = v.trim().parse::<u32>().unwrap_or(1),
                 "wisdom_gate_api_key" => cfg.wisdom_gate_api_key = v.trim().to_string(),
@@ -61,6 +87,8 @@ pub fn read_config() -> Result<Config, io::Error> {
                     }
                 },
                 "wisdom_gate_cache_timestamp" => cfg.wisdom_gate_cache_timestamp = v.trim().parse::<u64>().unwrap_or(0),
+                "vlc_diag_history" => cfg.vlc_diag_history = v.trim().to_string(),
+                "low_cpu_mode" => cfg.low_cpu_mode = v.trim().parse::<u8>().map(|n| n!=0).unwrap_or(false),
                 _ => {}
             }
         }
@@ -100,6 +128,23 @@ pub fn save_config(cfg: &Config) -> Result<(), io::Error> {
     writeln!(f, "vlc_network_caching_ms={}", cfg.vlc_network_caching_ms)?;
     writeln!(f, "vlc_live_caching_ms={}", cfg.vlc_live_caching_ms)?;
     writeln!(f, "vlc_prefetch_buffer_bytes={}", cfg.vlc_prefetch_buffer_bytes)?;
+    writeln!(f, "vlc_file_caching_ms={}", cfg.vlc_file_caching_ms)?;
+    writeln!(f, "vlc_mux_caching_ms={}", cfg.vlc_mux_caching_ms)?;
+    writeln!(f, "vlc_http_reconnect={}", if cfg.vlc_http_reconnect { 1 } else { 0 })?;
+    writeln!(f, "vlc_timeout_ms={}", cfg.vlc_timeout_ms)?;
+    if !cfg.vlc_extra_args.trim().is_empty() { writeln!(f, "vlc_extra_args={}", cfg.vlc_extra_args)?; }
+    writeln!(f, "vlc_profile_bias={}", cfg.vlc_profile_bias)?;
+    writeln!(f, "vlc_verbose={}", if cfg.vlc_verbose {1} else {0})?;
+    writeln!(f, "vlc_diagnose_on_start={}", if cfg.vlc_diagnose_on_start {1} else {0})?;
+    writeln!(f, "vlc_continuous_diagnostics={}", if cfg.vlc_continuous_diagnostics {1} else {0})?;
+    writeln!(f, "use_mpv={}", if cfg.use_mpv {1} else {0})?;
+    if !cfg.mpv_extra_args.trim().is_empty() { writeln!(f, "mpv_extra_args={}", cfg.mpv_extra_args)?; }
+    if cfg.mpv_cache_secs_override != 0 { writeln!(f, "mpv_cache_secs_override={}", cfg.mpv_cache_secs_override)?; }
+    if cfg.mpv_readahead_secs_override != 0 { writeln!(f, "mpv_readahead_secs_override={}", cfg.mpv_readahead_secs_override)?; }
+    writeln!(f, "use_mpv={}", if cfg.use_mpv {1} else {0})?;
+    if !cfg.mpv_extra_args.trim().is_empty() { writeln!(f, "mpv_extra_args={}", cfg.mpv_extra_args)?; }
+    if cfg.mpv_cache_secs_override != 0 { writeln!(f, "mpv_cache_secs_override={}", cfg.mpv_cache_secs_override)?; }
+    if cfg.mpv_readahead_secs_override != 0 { writeln!(f, "mpv_readahead_secs_override={}", cfg.mpv_readahead_secs_override)?; }
     if cfg.cover_uploads_per_frame != 0 { writeln!(f, "cover_uploads_per_frame={}", cfg.cover_uploads_per_frame)?; }
     if cfg.cover_decode_parallel != 0 { writeln!(f, "cover_decode_parallel={}", cfg.cover_decode_parallel)?; }
     if cfg.texture_cache_limit != 0 { writeln!(f, "texture_cache_limit={}", cfg.texture_cache_limit)?; }
@@ -118,6 +163,8 @@ pub fn save_config(cfg: &Config) -> Result<(), io::Error> {
         writeln!(f, "wisdom_gate_cache_content={}", encoded)?; 
     }
     if cfg.wisdom_gate_cache_timestamp > 0 { writeln!(f, "wisdom_gate_cache_timestamp={}", cfg.wisdom_gate_cache_timestamp)?; }
+    if !cfg.vlc_diag_history.trim().is_empty() { writeln!(f, "vlc_diag_history={}", cfg.vlc_diag_history)?; }
+    writeln!(f, "low_cpu_mode={}", if cfg.low_cpu_mode {1} else {0})?;
     
     Ok(())
 }
@@ -157,6 +204,16 @@ fn write_config_to_file(path: &PathBuf, cfg: &Config) -> Result<(), io::Error> {
     writeln!(f, "vlc_network_caching_ms={}", cfg.vlc_network_caching_ms)?;
     writeln!(f, "vlc_live_caching_ms={}", cfg.vlc_live_caching_ms)?;
     writeln!(f, "vlc_prefetch_buffer_bytes={}", cfg.vlc_prefetch_buffer_bytes)?;
+    writeln!(f, "vlc_file_caching_ms={}", cfg.vlc_file_caching_ms)?;
+    writeln!(f, "vlc_mux_caching_ms={}", cfg.vlc_mux_caching_ms)?;
+    writeln!(f, "vlc_http_reconnect={}", if cfg.vlc_http_reconnect { 1 } else { 0 })?;
+    writeln!(f, "vlc_timeout_ms={}", cfg.vlc_timeout_ms)?;
+    if !cfg.vlc_extra_args.trim().is_empty() { writeln!(f, "vlc_extra_args={}", cfg.vlc_extra_args)?; }
+    writeln!(f, "vlc_profile_bias={}", cfg.vlc_profile_bias)?;
+    writeln!(f, "vlc_verbose={}", if cfg.vlc_verbose {1} else {0})?;
+    writeln!(f, "vlc_diagnose_on_start={}", if cfg.vlc_diagnose_on_start {1} else {0})?;
+    writeln!(f, "vlc_continuous_diagnostics={}", if cfg.vlc_continuous_diagnostics {1} else {0})?;
+    writeln!(f, "use_mpv={}", if cfg.use_mpv {1} else {0})?;
     if cfg.cover_uploads_per_frame != 0 { writeln!(f, "cover_uploads_per_frame={}", cfg.cover_uploads_per_frame)?; }
     if cfg.cover_decode_parallel != 0 { writeln!(f, "cover_decode_parallel={}", cfg.cover_decode_parallel)?; }
     if cfg.texture_cache_limit != 0 { writeln!(f, "texture_cache_limit={}", cfg.texture_cache_limit)?; }
@@ -175,6 +232,8 @@ fn write_config_to_file(path: &PathBuf, cfg: &Config) -> Result<(), io::Error> {
         writeln!(f, "wisdom_gate_cache_content={}", encoded)?; 
     }
     if cfg.wisdom_gate_cache_timestamp > 0 { writeln!(f, "wisdom_gate_cache_timestamp={}", cfg.wisdom_gate_cache_timestamp)?; }
+    if !cfg.vlc_diag_history.trim().is_empty() { writeln!(f, "vlc_diag_history={}", cfg.vlc_diag_history)?; }
+    writeln!(f, "low_cpu_mode={}", if cfg.low_cpu_mode {1} else {0})?;
     
     Ok(())
 }

@@ -24,6 +24,32 @@ pub struct Config {
     #[serde(default)]
     pub vlc_prefetch_buffer_bytes: u64, // prefetch buffer size in bytes
     #[serde(default)]
+    pub vlc_file_caching_ms: u32,    // file/on-demand caching in ms (VOD)
+    #[serde(default)]
+    pub vlc_mux_caching_ms: u32,     // demux/mux layer caching in ms (advanced)
+    #[serde(default)]
+    pub vlc_http_reconnect: bool,    // attempt HTTP reconnect on drop
+    #[serde(default)]
+    pub vlc_timeout_ms: u32,         // HTTP timeout ms
+    #[serde(default)]
+    pub vlc_extra_args: String,      // additional raw VLC args appended before URL
+    #[serde(default)]
+    pub vlc_profile_bias: u32,       // 0..100 (0 = minimale Latenz, 100 = maximale Stabilität)
+    #[serde(default)]
+    pub vlc_verbose: bool,           // enable -vvv when diagnosing
+    #[serde(default)]
+    pub vlc_diagnose_on_start: bool, // capture VLC output once per start
+    #[serde(default)]
+    pub vlc_continuous_diagnostics: bool, // keep a background verbose VLC to adapt caching
+    #[serde(default)]
+    pub use_mpv: bool, // prefer mpv over VLC when launching player
+    #[serde(default)]
+    pub mpv_extra_args: String, // additional raw mpv args
+    #[serde(default)]
+    pub mpv_cache_secs_override: u32, // 0 = auto derive from bias
+    #[serde(default)]
+    pub mpv_readahead_secs_override: u32, // 0 = auto
+    #[serde(default)]
     pub download_dir: String,     // default ~/Downloads/macxtreamer
     #[serde(default)]
     pub cover_uploads_per_frame: u32, // default 3
@@ -49,6 +75,10 @@ pub struct Config {
     pub wisdom_gate_cache_content: String,  // Cached recommendations content
     #[serde(default)]
     pub wisdom_gate_cache_timestamp: u64,   // Timestamp when cache was created (Unix timestamp)
+    #[serde(default)]
+    pub vlc_diag_history: String, // Semikolon-separierte Liste angewandter Vorschläge: ts:net:live:file;...
+    #[serde(default)]
+    pub low_cpu_mode: bool, // Aktiviert zusätzliche Drosselung (Repaint & Diagnose-Sleep)
 }
 
 impl Config {

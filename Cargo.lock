@@ -2071,6 +2071,7 @@ dependencies = [
  "egui_extras",
  "futures-util",
  "image",
+ "once_cell",
  "reqwest",
  "serde",
  "serde_json",

@@ -34,6 +34,8 @@ use logger::log_line;
 use models::{Category, Config, FavItem, Item, RecentItem, Row};
 use ui_helpers::{colored_text_by_type, render_loading_spinner, format_file_size, file_path_to_uri};
 use player::{build_url_by_type, start_player};
+use once_cell::sync::OnceCell;
+static GLOBAL_TX: OnceCell<Sender<Msg>> = OnceCell::new();
 use reqwest::header::{ETAG, IF_MODIFIED_SINCE, IF_NONE_MATCH, LAST_MODIFIED};
 use search::search_items;
 use storage::{add_to_recently, load_favorites, load_recently_played, toggle_favorite};
@@ -136,6 +138,22 @@ struct MacXtreamer {
     // Wisdom-Gate AI recommendations
     wisdom_gate_recommendations: Option<String>,
     wisdom_gate_last_fetch: Option<std::time::Instant>,
+    // VLC continuous diagnostics
+    vlc_diag_lines: VecDeque<String>,
+    vlc_diag_suggestion: Option<(u32,u32,u32)>,
+    has_vlc: bool,
+    has_mpv: bool,
+    vlc_version: Option<String>,
+    mpv_version: Option<String>,
+    detected_vlc_path: Option<String>,
+    detected_mpv_path: Option<String>,
+    vlc_fail_count: u32,
+    mpv_fail_count: u32,
+    last_spawn_durations: std::collections::VecDeque<(String,u128)>,
+    active_diag_stop: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
+    command_preview: String,
+    last_frame_time: std::time::Instant,
+    avg_frame_ms: f32,
 }
 
 #[derive(Debug, Clone)]
@@ -253,7 +271,8 @@ impl MacXtreamer {
         };
         
         let (tx, rx) = mpsc::channel();
-        let mut app = Self {
+    let _ = GLOBAL_TX.set(tx.clone());
+    let mut app = Self {
             config,
             config_draft: None,
             playlists: vec![],
@@ -332,6 +351,21 @@ impl MacXtreamer {
 
             wisdom_gate_recommendations: cached_recommendations,
             wisdom_gate_last_fetch: None,
+            vlc_diag_lines: VecDeque::with_capacity(128),
+            vlc_diag_suggestion: None,
+            has_vlc: false,
+            has_mpv: false,
+            vlc_version: None,
+            mpv_version: None,
+            detected_vlc_path: None,
+            detected_mpv_path: None,
+            vlc_fail_count: 0,
+            mpv_fail_count: 0,
+            last_spawn_durations: std::collections::VecDeque::with_capacity(8),
+            active_diag_stop: None,
+            command_preview: String::new(),
+            last_frame_time: std::time::Instant::now(),
+            avg_frame_ms: 0.0,
         };
         // Determine initial config readiness
         if !had_file || !app.config_is_complete() {
@@ -376,6 +410,58 @@ impl MacXtreamer {
         if app.config_is_complete() {
             app.reload_categories();
             app.spawn_preload_all();
+        }
+        // Player detection (mpv / vlc) – run in background
+        {
+            let tx_detect = app.tx.clone();
+            std::thread::spawn(move || {
+                fn detect(cmd: &str) -> Option<String> {
+                    std::process::Command::new(cmd)
+                        .arg("--version")
+                        .stdout(std::process::Stdio::piped())
+                        .stderr(std::process::Stdio::null())
+                        .output()
+                        .ok()
+                        .and_then(|o| if o.status.success() { Some(String::from_utf8_lossy(&o.stdout).lines().next().unwrap_or("?").to_string()) } else { None })
+                }
+                use std::path::Path;
+                let mut vlc_v = detect("vlc");
+                let mut vlc_path: Option<String> = None;
+                let vlc_candidates = [
+                    "vlc",
+                    "/Applications/VLC.app/Contents/MacOS/VLC",
+                    "/Applications/VLC.app/Contents/MacOS/VLC-bin",
+                    "/usr/local/bin/vlc",
+                    "/opt/homebrew/bin/vlc",
+                ];
+                for c in vlc_candidates.iter() {
+                    if Path::new(c).exists() {
+                        if vlc_v.is_none() {
+                            vlc_v = detect(c);
+                        }
+                        vlc_path = Some(c.to_string());
+                        break;
+                    }
+                }
+                let mut mpv_v = detect("mpv");
+                let mut mpv_path: Option<String> = None;
+                let mpv_candidates = [
+                    "mpv",
+                    "/Applications/mpv.app/Contents/MacOS/mpv",
+                    "/usr/local/bin/mpv",
+                    "/opt/homebrew/bin/mpv",
+                ];
+                for c in mpv_candidates.iter() {
+                    if Path::new(c).exists() {
+                        if mpv_v.is_none() {
+                            mpv_v = detect(c);
+                        }
+                        mpv_path = Some(c.to_string());
+                        break;
+                    }
+                }
+                let _ = tx_detect.send(Msg::PlayerDetection { has_vlc: vlc_path.is_some(), has_mpv: mpv_path.is_some(), vlc_version: vlc_v, mpv_version: mpv_v, vlc_path, mpv_path });
+            });
         }
         app
     }
@@ -1382,6 +1468,12 @@ impl MacXtreamer {
 
 impl eframe::App for MacXtreamer {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        // Frame Timing erfassen für adaptive Repaint-Steuerung
+        let now = std::time::Instant::now();
+        let dt = now.duration_since(self.last_frame_time).as_millis() as f32;
+        self.last_frame_time = now;
+        // Exponentielles Glätten
+        if self.avg_frame_ms == 0.0 { self.avg_frame_ms = dt; } else { self.avg_frame_ms = self.avg_frame_ms * 0.9 + dt * 0.1; }
         // Theme anwenden (einmalig oder bei Wechsel)
         if !self.theme_applied {
             match self.current_theme.as_str() {
@@ -1411,17 +1503,27 @@ impl eframe::App for MacXtreamer {
             || self.active_downloads() > 0
             || (!self.pending_texture_uploads.is_empty() && self.pending_texture_uploads.len() > 5); // Nur bei größeren Warteschlangen
         
-        let has_minor_bg_work = !self.pending_covers.is_empty()
-            || !self.pending_decode_urls.is_empty()
+        let has_minor_bg_work = (!self.pending_covers.is_empty() && self.pending_covers.len() > 10)
+            || (!self.pending_decode_urls.is_empty() && self.pending_decode_urls.len() > 10)
             || self.indexing;
         
         // CPU FIX: Dramatically reduce automatic repaint frequency
-        if has_critical_bg_work {
-            // Even critical tasks don't need frequent repaints
-            ctx.request_repaint_after(Duration::from_millis(2000)); // 2 seconds instead of 200ms
-        } else if has_minor_bg_work {
-            // Minor tasks get very infrequent repaints
-            ctx.request_repaint_after(Duration::from_millis(5000)); // 5 seconds instead of 500ms
+        if self.config.low_cpu_mode {
+            // Low CPU Mode: adaptive Thresholds basierend auf durchschnittlicher Frame-Zeit
+            let base_critical = 2500u64; // länger
+            let base_minor = 5000u64;
+            if has_critical_bg_work {
+                let delay = if self.avg_frame_ms < 25.0 { base_critical } else { base_critical / 2 }; // Wenn ohnehin langsam -> etwas schneller erlauben
+                ctx.request_repaint_after(Duration::from_millis(delay));
+            } else if has_minor_bg_work {
+                ctx.request_repaint_after(Duration::from_millis(base_minor));
+            }
+        } else {
+            if has_critical_bg_work {
+                ctx.request_repaint_after(Duration::from_millis(2000));
+            } else if has_minor_bg_work {
+                ctx.request_repaint_after(Duration::from_millis(4000));
+            }
         }
         // If no background work, NO automatic repaints at all!
 
@@ -1570,6 +1672,39 @@ impl eframe::App for MacXtreamer {
                     if self.loading_done >= self.loading_total {
                         self.is_loading = false;
                     }
+                }
+                Msg::VlcDiagnostics(output) => {
+                    self.last_error = Some(format!("VLC Diagnose: {}", output));
+                }
+                Msg::VlcDiagUpdate { lines, suggestion } => {
+                    for l in lines {
+                        if self.vlc_diag_lines.len() >= 128 { self.vlc_diag_lines.pop_front(); }
+                        self.vlc_diag_lines.push_back(l);
+                    }
+                    self.vlc_diag_suggestion = suggestion;
+                }
+                Msg::PlayerDetection { has_vlc, has_mpv, vlc_version, mpv_version, vlc_path, mpv_path } => {
+                    self.has_vlc = has_vlc; self.has_mpv = has_mpv; self.vlc_version = vlc_version; self.mpv_version = mpv_version;
+                    self.detected_vlc_path = vlc_path;
+                    self.detected_mpv_path = mpv_path;
+                    // Policy: if user wanted mpv but not present -> disable
+                    if self.config.use_mpv && !self.has_mpv { self.config.use_mpv = false; self.last_error = Some("mpv nicht gefunden – zurück zu VLC".into()); self.pending_save_config = true; }
+                    // If mpv only available -> auto enable
+                    if !self.config.use_mpv && self.has_mpv && !self.has_vlc { self.config.use_mpv = true; self.pending_save_config = true; }
+                }
+                Msg::PlayerSpawnFailed { player, error } => {
+                    if player.contains("mpv") { self.mpv_fail_count = self.mpv_fail_count.saturating_add(1); }
+                    if player.to_lowercase().contains("vlc") { self.vlc_fail_count = self.vlc_fail_count.saturating_add(1); }
+                    self.last_error = Some(format!("{} Startfehler: {}", player, error));
+                    if self.config.use_mpv && self.mpv_fail_count >= 3 && self.has_vlc { self.config.use_mpv = false; self.pending_save_config = true; self.last_error = Some("mpv wiederholt fehlgeschlagen – Wechsel auf VLC".into()); }
+                    if !self.config.use_mpv && self.vlc_fail_count >= 3 && self.has_mpv { self.config.use_mpv = true; self.pending_save_config = true; self.last_error = Some("VLC wiederholt fehlgeschlagen – Wechsel auf mpv".into()); }
+                }
+                Msg::DiagnosticsStopped => {
+                    self.last_error = Some("VLC Diagnose gestoppt".into());
+                    if let Some(flag) = &self.active_diag_stop { flag.store(true, std::sync::atomic::Ordering::Relaxed); }
+                }
+                Msg::StopDiagnostics => {
+                    if let Some(flag) = &self.active_diag_stop { flag.store(true, std::sync::atomic::Ordering::Relaxed); }
                 }
                 Msg::ItemsLoaded { kind, items } => {
                     match items {
@@ -2081,6 +2216,9 @@ impl eframe::App for MacXtreamer {
                 // Kopfzeile mit Aktionen und Suche
                 ui.horizontal(|ui| {
                     ui.heading("MacXtreamer");
+                    if self.config.low_cpu_mode {
+                        ui.label(egui::RichText::new("Low-CPU Mode").small().color(egui::Color32::from_rgb(150,255,150))).on_hover_text(format!("Ø Frame {:.1}ms", self.avg_frame_ms));
+                    }
                     if !self.view_stack.is_empty() {
                         if ui
                             .button("Back")
@@ -2136,6 +2274,37 @@ impl eframe::App for MacXtreamer {
                     {
                         self.config.reuse_vlc = reuse;
                     }
+                    let mut use_mpv = self.config.use_mpv;
+                    ui.add_enabled_ui(self.has_mpv, |ui| {
+                        if ui.checkbox(&mut use_mpv, "Use MPV").on_hover_text(if self.has_mpv { "Statt VLC den mpv Player verwenden" } else { "mpv nicht gefunden (brew install mpv)" }).changed() {
+                            self.config.use_mpv = use_mpv;
+                            if use_mpv { self.config.reuse_vlc = false; }
+                            self.pending_save_config = true;
+                        }
+                    });
+                    // Effektive Parameter-Vorschau (gekürzt) für beide Player
+                    let vlc_preview = crate::player::get_vlc_command_for_stream_type(crate::player::StreamType::Default, &self.config)
+                        .replace("{URL}", "<URL>");
+                    // mpv Preview (nur falls installiert) – parallele Logik zu player::start_player
+                    let mpv_preview = if self.has_mpv {
+                        let (net_ms, live_ms, file_ms) = crate::player::apply_bias(&self.config);
+                        let to_secs = |ms: u32| (ms / 1000).max(1);
+                        let cache_secs = if self.config.mpv_cache_secs_override != 0 { self.config.mpv_cache_secs_override } else { to_secs(net_ms) };
+                        let read_secs = if self.config.mpv_readahead_secs_override != 0 { self.config.mpv_readahead_secs_override } else { to_secs(file_ms.max(live_ms)) };
+                        let mut parts = vec!["mpv".to_string(), "--force-window=no".into(), "--fullscreen".into(), format!("--cache-secs={}", cache_secs), format!("--demuxer-readahead-secs={}", read_secs)];
+                        if !self.config.mpv_extra_args.trim().is_empty() { parts.extend(self.config.mpv_extra_args.split_whitespace().map(|s| s.to_string())); }
+                        parts.push("<URL>".into());
+                        parts.join(" ")
+                    } else { "mpv: not found".into() };
+                    let shorten = |s: &str| { if s.len() > 120 { format!("{}…", &s[..120]) } else { s.to_string() } };
+                    ui.vertical(|ui| {
+                        let (n,l,f) = crate::player::apply_bias(&self.config);
+                        ui.label(egui::RichText::new(format!("VLC: {}", shorten(&vlc_preview))).small()).on_hover_text(format!("Bias -> network={}ms live={}ms file={}ms", n,l,f));
+                        ui.label(egui::RichText::new(format!("MPV: {}", shorten(&mpv_preview))).small()).on_hover_text(if self.has_mpv { format!("MPV Cache Mapping: cache-secs={} readahead basiert auf Bias/Overrides", if self.config.mpv_cache_secs_override!=0 { self.config.mpv_cache_secs_override.to_string() } else { ((n/1000).max(1)).to_string() }) } else { "mpv nicht verfügbar".into() });
+                        if self.config.low_cpu_mode {
+                            ui.label(egui::RichText::new(format!("Pending tex:{} covers:{} decodes:{} dl:{}", self.pending_texture_uploads.len(), self.pending_covers.len(), self.pending_decode_urls.len(), self.active_downloads())).small()).on_hover_text("Debug Statistiken im Low-CPU Mode");
+                        }
+                    });
                     if ui.button("Settings").clicked() {
                         self.config_draft = Some(self.config.clone());
                         self.show_config = true;
@@ -2892,71 +3061,233 @@ impl eframe::App for MacXtreamer {
         if self.show_config {
             let mut open = self.show_config;
             let mut cancel_clicked = false;
-            egui::Window::new("Configuration")
+            egui::Window::new("🔧 Configuration")
                 .collapsible(false)
-                .default_width(420.0)
-                .default_height(260.0)
+                .resizable(true)
+                .default_width(600.0)
+                .default_height(650.0)
                 .anchor(egui::Align2::CENTER_CENTER, egui::vec2(0.0, 0.0))
                 .open(&mut open)
                 .show(ctx, |ui| {
-                    let draft = self.config_draft.get_or_insert_with(|| self.config.clone());
-                    ui.label("URL");
-                    ui.text_edit_singleline(&mut draft.address);
-                    ui.label("Username");
-                    ui.text_edit_singleline(&mut draft.username);
-                    ui.label("Password");
-                    ui.add(egui::TextEdit::singleline(&mut draft.password).password(true));
-                    ui.label("Player command");
-                    ui.text_edit_singleline(&mut draft.player_command);
-                    ui.small("Tip: Use the placeholder URL at the position where the stream URL should be inserted.\nExample: vlc --fullscreen --no-video-title-show --network-caching=2000 URL");
-                    ui.horizontal(|ui| {
-                        let mut reuse = draft.reuse_vlc;
-                        if ui
-                            .checkbox(&mut reuse, "Reuse VLC")
-                            .on_hover_text("Open links in a running VLC instance (macOS)")
-                            .changed()
-                        {
-                            draft.reuse_vlc = reuse;
-                        }
-                        ui.separator();
-                        ui.label("Download directory");
-                        ui.text_edit_singleline(&mut draft.download_dir);
-                    });
-                    if draft.download_dir.trim().is_empty() {
-                        ui.weak("Will default to ~/Downloads/macxtreamer");
-                    }
-                    ui.horizontal(|ui| {
+                    egui::ScrollArea::vertical()
+                        .auto_shrink([false; 2])
+                        .show(ui, |ui| {
+                            let draft = self.config_draft.get_or_insert_with(|| self.config.clone());
+                            
+                            ui.heading("📡 Server Settings");
+                            ui.separator();
+                            
+                            ui.label("URL");
+                            ui.add(
+                                egui::TextEdit::multiline(&mut draft.address)
+                                    .desired_rows(1)
+                                    .desired_width(f32::INFINITY)
+                            );
+                            
+                            ui.label("Username");
+                            ui.add(
+                                egui::TextEdit::multiline(&mut draft.username)
+                                    .desired_rows(1)
+                                    .desired_width(f32::INFINITY)
+                            );
+                            
+                            ui.label("Password");
+                            ui.add(
+                                egui::TextEdit::multiline(&mut draft.password)
+                                    .password(true)
+                                    .desired_rows(1)
+                                    .desired_width(f32::INFINITY)
+                            );
+                            
+                            ui.add_space(8.0);
+                            ui.heading("🎬 Player Settings");
+                            ui.separator();
+                            
+                            ui.label("Player command");
+                            ui.add(
+                                egui::TextEdit::multiline(&mut draft.player_command)
+                                    .desired_rows(3)
+                                    .desired_width(f32::INFINITY)
+                            );
+                            ui.small("Tip: Use the placeholder URL at the position where the stream URL should be inserted.\nExample: vlc --fullscreen --no-video-title-show --network-caching=2000 URL");
+                            
+                            ui.horizontal(|ui| {
+                                let mut reuse = draft.reuse_vlc;
+                                if ui
+                                    .checkbox(&mut reuse, "Reuse VLC")
+                                    .on_hover_text("Open links in a running VLC instance (macOS)")
+                                    .changed()
+                                {
+                                    draft.reuse_vlc = reuse;
+                                }
+                            });
+                            
+                            ui.label("Download directory");
+                            ui.add(
+                                egui::TextEdit::multiline(&mut draft.download_dir)
+                                    .desired_rows(1)
+                                    .desired_width(f32::INFINITY)
+                            );
+                            if draft.download_dir.trim().is_empty() {
+                                ui.weak("Will default to ~/Downloads/macxtreamer");
+                            }
+                            
+                            ui.add_space(8.0);
+                            ui.heading("🎬 Player Einstellungen");
+                            ui.separator();
+                            // Kommando-Vorschau aktualisieren (Draft Config)
+                            let preview = if draft.use_mpv {
+                                let mut args = vec!["mpv".to_string(), "--force-window=no".into(), "--fullscreen".into()];
+                                let cache = if draft.mpv_cache_secs_override!=0 { draft.mpv_cache_secs_override } else { (draft.vlc_network_caching_ms/1000).max(1) }; 
+                                args.push(format!("--cache-secs={}", cache));
+                                let readahead = if draft.mpv_readahead_secs_override!=0 { draft.mpv_readahead_secs_override } else { (draft.vlc_file_caching_ms/1000).max(1) }; 
+                                args.push(format!("--demuxer-readahead-secs={}", readahead));
+                                if !draft.mpv_extra_args.trim().is_empty() { args.extend(draft.mpv_extra_args.split_whitespace().map(|s| s.to_string())); }
+                                args.push("<URL>".into());
+                                args.join(" ")
+                            } else {
+                                crate::player::get_vlc_command_for_stream_type(crate::player::StreamType::Default, &draft)
+                            };
+                            // Nur aktualisieren wenn sich der Wert wirklich geändert hat, um unnötige Repaints zu vermeiden
+                            if self.command_preview != preview {
+                                self.command_preview = preview;
+                            }
+                            ui.horizontal(|ui| {
+                                let mut use_mpv = draft.use_mpv;
+                                if ui.checkbox(&mut use_mpv, "MPV statt VLC verwenden").on_hover_text(if self.has_mpv { "mpv aktivieren" } else { "mpv nicht gefunden" }).changed() { draft.use_mpv = use_mpv; if use_mpv { draft.reuse_vlc = false; } }
+                                if self.has_mpv { if let Some(v)=&self.mpv_version { ui.label(egui::RichText::new(format!("mpv: {}", v)).small()); }} else { ui.label(egui::RichText::new("mpv: not found").small()); }
+                                if self.has_vlc { if let Some(v)=&self.vlc_version { ui.label(egui::RichText::new(format!("vlc: {}", v)).small()); }} else { ui.label(egui::RichText::new("vlc: not found").small()); }
+                                let mut low = draft.low_cpu_mode;
+                                if ui.checkbox(&mut low, "Low CPU Mode").on_hover_text("Reduziert Repaints & drosselt Diagnose-Thread").changed() { draft.low_cpu_mode = low; }
+                            });
+
+                            // MPV Abschnitt
+                            ui.collapsing("MPV Optionen", |ui| {
+                                if !self.has_mpv { ui.colored_label(egui::Color32::RED, "mpv nicht installiert – brew install mpv"); }
+                                let mut extra = draft.mpv_extra_args.clone();
+                                let te = egui::TextEdit::singleline(&mut extra).hint_text("Zusätzliche mpv Argumente");
+                                if ui.add(te).changed() { draft.mpv_extra_args = extra; }
+                                ui.horizontal(|ui| {
+                                    let mut cache_override = draft.mpv_cache_secs_override.to_string();
+                                    let ro_cache = egui::TextEdit::singleline(&mut cache_override).hint_text("cache-secs override (0 auto)");
+                                    if ui.add(ro_cache).changed() { draft.mpv_cache_secs_override = cache_override.parse().unwrap_or(0); }
+                                    let mut ra_override = draft.mpv_readahead_secs_override.to_string();
+                                    let ro_ra = egui::TextEdit::singleline(&mut ra_override).hint_text("readahead override (0 auto)");
+                                    if ui.add(ro_ra).changed() { draft.mpv_readahead_secs_override = ra_override.parse().unwrap_or(0); }
+                                });
+                                ui.horizontal(|ui| {
+                                    if ui.button("Low-Latency Preset").clicked() {
+                                        draft.mpv_extra_args = "--profile=low-latency --video-sync=display-resample --interpolation --no-cache".into();
+                                    }
+                                    if ui.button("Reset").clicked() { draft.mpv_extra_args.clear(); }
+                                });
+                                ui.label("Hinweis: network/live/file caching Bias wird auf mpv cache-secs / demuxer-readahead gemappt.");
+                            });
+                            ui.collapsing("Kommando Vorschau", |ui| {
+                                let (n,l,f) = crate::player::apply_bias(&draft);
+                                ui.code(&self.command_preview).on_hover_text(format!("Bias angewandt -> network={}ms live={}ms file={}ms", n,l,f));
+                                if let Some(p)=&self.detected_vlc_path { ui.label(egui::RichText::new(format!("VLC Pfad: {}", p)).small()); }
+                                if let Some(p)=&self.detected_mpv_path { ui.label(egui::RichText::new(format!("mpv Pfad: {}", p)).small()); }
+                                if !self.last_spawn_durations.is_empty() {
+                                    ui.separator();
+                                    ui.label("Letzte Spawns:");
+                                    for (p,d) in self.last_spawn_durations.iter().rev().take(5) { ui.label(format!("{}: {} ms", p,d)); }
+                                }
+                            });
+
+                            // VLC Abschnitt ausgegraut wenn MPV aktiv
+                            ui.add_enabled_ui(!draft.use_mpv, |ui| {
+                                ui.collapsing("VLC Optimierung & Diagnose", |ui| {
+                                    ui.horizontal(|ui| {
+                                        let mut verbose = draft.vlc_verbose;
+                                        if ui.checkbox(&mut verbose, "Verbose (-vvv)").changed() { draft.vlc_verbose = verbose; }
+                                        let mut diag_once = draft.vlc_diagnose_on_start;
+                                        if ui.checkbox(&mut diag_once, "Diagnose einmalig").changed() { draft.vlc_diagnose_on_start = diag_once; }
+                                        let mut cont_diag = draft.vlc_continuous_diagnostics;
+                                        if ui.checkbox(&mut cont_diag, "Kontinuierliche Diagnose").changed() { draft.vlc_continuous_diagnostics = cont_diag; }
+                                        if draft.vlc_continuous_diagnostics {
+                                            if ui.button("Stop Diagnose").on_hover_text("Beendet die laufende kontinuierliche VLC Diagnose").clicked() {
+                                                let _ = self.tx.send(Msg::StopDiagnostics);
+                                            }
+                                        }
+                                    });
+                                    if let Some(suggestion) = self.vlc_diag_suggestion {
+                                        ui.horizontal(|ui| {
+                                            ui.label(format!("Suggestion: net={} live={} file={}", suggestion.0, suggestion.1, suggestion.2));
+                                            if ui.button("Anwenden").on_hover_text("Übernimmt Werte und speichert sie im Verlauf (max 10)").clicked() {
+                                                draft.vlc_network_caching_ms = suggestion.0;
+                                                draft.vlc_live_caching_ms = suggestion.1;
+                                                draft.vlc_file_caching_ms = suggestion.2;
+                                                draft.player_command = crate::player::get_vlc_command_for_stream_type(crate::player::StreamType::Default, &draft);
+                                                let ts = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_secs();
+                                                let entry = format!("{}:{}:{}:{}", ts, suggestion.0, suggestion.1, suggestion.2);
+                                                let mut parts: Vec<String> = draft.vlc_diag_history.split(';').filter(|s| !s.is_empty()).map(|s| s.to_string()).collect();
+                                                parts.push(entry);
+                                                if parts.len() > 10 { let overflow = parts.len() - 10; parts.drain(0..overflow); }
+                                                draft.vlc_diag_history = parts.join(";");
+                                            }
+                                        });
+                                    }
+                                    if !draft.vlc_diag_history.trim().is_empty() {
+                                        ui.collapsing("Verlauf Vorschläge", |ui| {
+                                            for seg in draft.vlc_diag_history.split(';').filter(|s| !s.is_empty()).rev() {
+                                                let cols: Vec<&str> = seg.split(':').collect();
+                                                if cols.len()==4 {
+                                                    ui.label(format!("ts={} net={} live={} file={}", cols[0], cols[1], cols[2], cols[3]));
+                                                }
+                                            }
+                                        });
+                                    }
+                                    ui.collapsing("VLC Diagnose Logs", |ui| {
+                                        let text = self.vlc_diag_lines.iter().rev().take(40).cloned().collect::<Vec<_>>().join("\n");
+                                        ui.add(egui::TextEdit::multiline(&mut text.clone()).desired_rows(8));
+                                    });
+                                });
+                            });
+                            ui.horizontal(|ui| {
+                                ui.label("Latency/Stability Bias");
+                                let mut bias = draft.vlc_profile_bias.min(100) as i32;
+                                if ui.add(egui::Slider::new(&mut bias, 0..=100).show_value(true)).changed() {
+                                    draft.vlc_profile_bias = bias as u32;
+                                }
+                                ui.weak("0 = minimale Latenz, 100 = maximale Stabilität");
+                            });
+                            if ui.button("Apply Bias to Command").on_hover_text("Regeneriert VLC Kommando mit aktuellem Bias").clicked() {
+                                draft.player_command = crate::player::get_vlc_command_for_stream_type(crate::player::StreamType::Default, &draft);
+                            }
+                            
+                            ui.horizontal_wrapped(|ui| {
                         if ui
                             .button("IPTV Optimized")
                             .on_hover_text("Apply VLC parameters optimized for IPTV/Xtream Codes streaming")
                             .clicked()
                         {
-                            draft.player_command = crate::player::get_optimized_vlc_command("default").to_string();
+                            draft.player_command = crate::player::get_vlc_command_for_stream_type(crate::player::StreamType::Default, &draft);
                         }
                         if ui
                             .button("Live TV")
                             .on_hover_text("Minimal buffering for live TV channels")
                             .clicked()
                         {
-                            draft.player_command = crate::player::get_optimized_vlc_command("live").to_string();
+                            draft.player_command = crate::player::get_vlc_command_for_stream_type(crate::player::StreamType::Live, &draft);
                         }
                         if ui
                             .button("VOD/Movies")
                             .on_hover_text("Larger buffer for better quality VOD playback")
                             .clicked()
                         {
-                            draft.player_command = crate::player::get_optimized_vlc_command("vod").to_string();
+                            draft.player_command = crate::player::get_vlc_command_for_stream_type(crate::player::StreamType::Vod, &draft);
                         }
                         if ui
-                            .button("Error Fix")
-                            .on_hover_text("Maximum compatibility for problematic streams")
+                            .button("Minimal")
+                            .on_hover_text("Minimal VLC parameters for maximum compatibility")
                             .clicked()
                         {
-                            draft.player_command = crate::player::get_optimized_vlc_command("errorfix").to_string();
+                            draft.player_command = "vlc --fullscreen {URL}".to_string();
                         }
                         // Show the currently effective command (with placeholder visible)
                         let preview = if draft.player_command.trim().is_empty() {
-                            crate::player::get_optimized_vlc_command("default").to_string()
+                            crate::player::get_vlc_command_for_stream_type(crate::player::StreamType::Default, &draft)
                         } else {
                             draft.player_command.clone()
                         };
@@ -3178,13 +3509,14 @@ impl eframe::App for MacXtreamer {
                             };
                             self.pending_save_config = true;
                         }
-                        if ui.button("Cancel").clicked() {
+                        if ui.button("❌ Cancel").clicked() {
                             cancel_clicked = true;
                         }
                     });
+                        });
                 });
 
-            // (Bottom-Panel wird immer außerhalb des Config-Fensters gerendert)
+            // Handle window close  
             if cancel_clicked || !open {
                 self.config_draft = None;
                 self.show_config = false;

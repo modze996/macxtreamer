@@ -160,7 +160,7 @@ pub async fn fetch_wisdom_gate_recommendations(api_key: &str, prompt: &str, mode
             }
         ],
         "model": model,
-        "max_tokens": 2000,  // Adding back in case it helps
+        "max_tokens": 6000,  // Increased to get complete recommendations
         "temperature": 0.7   // Adding back in case it helps
     });
     

@@ -99,6 +99,12 @@ pub enum Msg {
     },
 
     WisdomGateRecommendations(String), // AI recommendations content
+    VlcDiagnostics(String), // Captured VLC diagnostic output (truncated)
+    VlcDiagUpdate { lines: Vec<String>, suggestion: Option<(u32,u32,u32)> },
+    PlayerDetection { has_vlc: bool, has_mpv: bool, vlc_version: Option<String>, mpv_version: Option<String>, vlc_path: Option<String>, mpv_path: Option<String> },
+    PlayerSpawnFailed { player: String, error: String },
+    StopDiagnostics,
+    DiagnosticsStopped,
 }
 
 #[derive(Debug, Clone)]
@@ -164,6 +170,8 @@ pub struct AppState {
     
     // Background tasks
     pub stop_loading: Arc<AtomicBool>,
+    pub vlc_diag_lines: VecDeque<String>,
+    pub vlc_diag_suggestion: Option<(u32,u32,u32)>,
 }
 
 impl Default for AppState {
@@ -204,6 +212,8 @@ impl Default for AppState {
             show_downloads: false,
             image_manager: ImageManager::default(),
             stop_loading: Arc::new(AtomicBool::new(false)),
+            vlc_diag_lines: VecDeque::with_capacity(128),
+            vlc_diag_suggestion: None,
         }
     }
 }
