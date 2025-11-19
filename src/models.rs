@@ -50,6 +50,16 @@ pub struct Config {
     #[serde(default)]
     pub mpv_readahead_secs_override: u32, // 0 = auto
     #[serde(default)]
+    pub mpv_keep_open: bool, // hält Fenster nach EOF offen (Live Stabilität)
+    #[serde(default)]
+    pub mpv_live_auto_retry: bool, // bei frühem EOF bei Live automatisch neu starten
+    #[serde(default)]
+    pub mpv_live_retry_max: u32, // max Versuche
+    #[serde(default)]
+    pub mpv_live_retry_delay_ms: u32, // Pause zwischen Versuchen
+    #[serde(default)]
+    pub mpv_verbose: bool, // ausführliche stderr Ausgabe von mpv erfassen
+    #[serde(default)]
     pub download_dir: String,     // default ~/Downloads/macxtreamer
     #[serde(default)]
     pub cover_uploads_per_frame: u32, // default 3
@@ -79,6 +89,16 @@ pub struct Config {
     pub vlc_diag_history: String, // Semikolon-separierte Liste angewandter Vorschläge: ts:net:live:file;...
     #[serde(default)]
     pub low_cpu_mode: bool, // Aktiviert zusätzliche Drosselung (Repaint & Diagnose-Sleep)
+    #[serde(default)]
+    pub ultra_low_flicker_mode: bool, // Noch aggressiveres Repaint-Gating (optional)
+    #[serde(default)]
+    pub bottom_panel_height: f32, // persistierte Höhe des Bottom Panels
+    #[serde(default)]
+    pub left_panel_width: f32, // persistierte Breite der linken AI Seitenleiste
+    #[serde(default)]
+    pub download_retry_max: u32, // maximale Versuche für einen Download (Resume)
+    #[serde(default)]
+    pub download_retry_delay_ms: u32, // Wartezeit zwischen Versuchen
 }
 
 impl Config {

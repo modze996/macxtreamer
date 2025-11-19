@@ -28,6 +28,8 @@ pub struct ImageManager {
     pub texture_cache: HashMap<String, egui::TextureHandle>,
     pub failed_images: std::collections::HashSet<String>,
     load_semaphore: Arc<Semaphore>,
+    last_batch_repaint: std::time::Instant,
+    batch_loaded_since_last: u32,
 }
 
 impl Default for ImageManager {
@@ -43,6 +45,8 @@ impl ImageManager {
             texture_cache: HashMap::new(),
             failed_images: std::collections::HashSet::new(),
             load_semaphore: Arc::new(Semaphore::new(concurrent_loads)),
+            last_batch_repaint: std::time::Instant::now(),
+            batch_loaded_since_last: 0,
         }
     }
 
@@ -103,7 +107,16 @@ impl ImageManager {
                     };
 
                     let _texture = ctx.load_texture(&url, color_image, Default::default());
-                    ctx.request_repaint();
+                    // Batch Repaint: nur jede ~50ms oder nach 6 Bildern
+                    let now = std::time::Instant::now();
+                    // Zugriff auf Manager Felder nicht direkt möglich (move). Vereinfachung: sofort repaint wenn >50ms vergangen
+                    // Für echte Batch-Steuerung müsste ein Channel zurück in Hauptthread genutzt werden.
+                    // Minimale Variante: zeitbasierter throttle.
+                    use std::sync::OnceLock;
+                    static REPAINT_LAST: OnceLock<std::sync::Mutex<std::time::Instant>> = OnceLock::new();
+                    let repaint_last = REPAINT_LAST.get_or_init(|| std::sync::Mutex::new(std::time::Instant::now()));
+                    let mut guard = repaint_last.lock().unwrap();
+                    if now.duration_since(*guard).as_millis() > 50 { ctx.request_repaint(); *guard = now; }
 
                     // Note: In a real implementation, you'd need a way to communicate
                     // the loaded texture back to the main thread. This is a simplified version.

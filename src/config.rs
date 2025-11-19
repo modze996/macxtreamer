@@ -35,6 +35,11 @@ pub fn read_config() -> Result<Config, io::Error> {
     cfg.mpv_extra_args = String::new();
     cfg.mpv_cache_secs_override = 0;
     cfg.mpv_readahead_secs_override = 0;
+    cfg.mpv_keep_open = true; // sinnvoll für Live
+    cfg.mpv_live_auto_retry = true;
+    cfg.mpv_live_retry_max = 5;
+    cfg.mpv_live_retry_delay_ms = 4000;
+    cfg.mpv_verbose = false;
     for line in content.lines() {
         if let Some((k, v)) = line.split_once('=') {
             match k.trim() {
@@ -69,6 +74,11 @@ pub fn read_config() -> Result<Config, io::Error> {
                 "mpv_extra_args" => cfg.mpv_extra_args = v.trim().to_string(),
                 "mpv_cache_secs_override" => cfg.mpv_cache_secs_override = v.trim().parse::<u32>().unwrap_or(0),
                 "mpv_readahead_secs_override" => cfg.mpv_readahead_secs_override = v.trim().parse::<u32>().unwrap_or(0),
+                "mpv_keep_open" => cfg.mpv_keep_open = v.trim().parse::<u8>().map(|n| n!=0).unwrap_or(true),
+                "mpv_live_auto_retry" => cfg.mpv_live_auto_retry = v.trim().parse::<u8>().map(|n| n!=0).unwrap_or(true),
+                "mpv_live_retry_max" => cfg.mpv_live_retry_max = v.trim().parse::<u32>().unwrap_or(5),
+                "mpv_live_retry_delay_ms" => cfg.mpv_live_retry_delay_ms = v.trim().parse::<u32>().unwrap_or(4000),
+                "mpv_verbose" => cfg.mpv_verbose = v.trim().parse::<u8>().map(|n| n!=0).unwrap_or(false),
                 "enable_downloads" => cfg.enable_downloads = v.trim().parse::<u8>().map(|n| n != 0).unwrap_or(false),
                 "max_parallel_downloads" => cfg.max_parallel_downloads = v.trim().parse::<u32>().unwrap_or(1),
                 "wisdom_gate_api_key" => cfg.wisdom_gate_api_key = v.trim().to_string(),
@@ -89,6 +99,9 @@ pub fn read_config() -> Result<Config, io::Error> {
                 "wisdom_gate_cache_timestamp" => cfg.wisdom_gate_cache_timestamp = v.trim().parse::<u64>().unwrap_or(0),
                 "vlc_diag_history" => cfg.vlc_diag_history = v.trim().to_string(),
                 "low_cpu_mode" => cfg.low_cpu_mode = v.trim().parse::<u8>().map(|n| n!=0).unwrap_or(false),
+                "ultra_low_flicker_mode" => cfg.ultra_low_flicker_mode = v.trim().parse::<u8>().map(|n| n!=0).unwrap_or(false),
+                "bottom_panel_height" => cfg.bottom_panel_height = v.trim().parse::<f32>().unwrap_or(0.0),
+                "left_panel_width" => cfg.left_panel_width = v.trim().parse::<f32>().unwrap_or(0.0),
                 _ => {}
             }
         }
@@ -137,14 +150,16 @@ pub fn save_config(cfg: &Config) -> Result<(), io::Error> {
     writeln!(f, "vlc_verbose={}", if cfg.vlc_verbose {1} else {0})?;
     writeln!(f, "vlc_diagnose_on_start={}", if cfg.vlc_diagnose_on_start {1} else {0})?;
     writeln!(f, "vlc_continuous_diagnostics={}", if cfg.vlc_continuous_diagnostics {1} else {0})?;
+    // mpv Parameter (einmalig, Duplikate entfernt)
     writeln!(f, "use_mpv={}", if cfg.use_mpv {1} else {0})?;
     if !cfg.mpv_extra_args.trim().is_empty() { writeln!(f, "mpv_extra_args={}", cfg.mpv_extra_args)?; }
     if cfg.mpv_cache_secs_override != 0 { writeln!(f, "mpv_cache_secs_override={}", cfg.mpv_cache_secs_override)?; }
     if cfg.mpv_readahead_secs_override != 0 { writeln!(f, "mpv_readahead_secs_override={}", cfg.mpv_readahead_secs_override)?; }
-    writeln!(f, "use_mpv={}", if cfg.use_mpv {1} else {0})?;
-    if !cfg.mpv_extra_args.trim().is_empty() { writeln!(f, "mpv_extra_args={}", cfg.mpv_extra_args)?; }
-    if cfg.mpv_cache_secs_override != 0 { writeln!(f, "mpv_cache_secs_override={}", cfg.mpv_cache_secs_override)?; }
-    if cfg.mpv_readahead_secs_override != 0 { writeln!(f, "mpv_readahead_secs_override={}", cfg.mpv_readahead_secs_override)?; }
+    writeln!(f, "mpv_keep_open={}", if cfg.mpv_keep_open {1} else {0})?;
+    writeln!(f, "mpv_live_auto_retry={}", if cfg.mpv_live_auto_retry {1} else {0})?;
+    writeln!(f, "mpv_live_retry_max={}", cfg.mpv_live_retry_max)?;
+    writeln!(f, "mpv_live_retry_delay_ms={}", cfg.mpv_live_retry_delay_ms)?;
+    writeln!(f, "mpv_verbose={}", if cfg.mpv_verbose {1} else {0})?;
     if cfg.cover_uploads_per_frame != 0 { writeln!(f, "cover_uploads_per_frame={}", cfg.cover_uploads_per_frame)?; }
     if cfg.cover_decode_parallel != 0 { writeln!(f, "cover_decode_parallel={}", cfg.cover_decode_parallel)?; }
     if cfg.texture_cache_limit != 0 { writeln!(f, "texture_cache_limit={}", cfg.texture_cache_limit)?; }
@@ -165,6 +180,9 @@ pub fn save_config(cfg: &Config) -> Result<(), io::Error> {
     if cfg.wisdom_gate_cache_timestamp > 0 { writeln!(f, "wisdom_gate_cache_timestamp={}", cfg.wisdom_gate_cache_timestamp)?; }
     if !cfg.vlc_diag_history.trim().is_empty() { writeln!(f, "vlc_diag_history={}", cfg.vlc_diag_history)?; }
     writeln!(f, "low_cpu_mode={}", if cfg.low_cpu_mode {1} else {0})?;
+    writeln!(f, "ultra_low_flicker_mode={}", if cfg.ultra_low_flicker_mode {1} else {0})?; // Duplikat entfernt
+    if cfg.bottom_panel_height > 0.0 { writeln!(f, "bottom_panel_height={:.1}", cfg.bottom_panel_height)?; }
+    if cfg.left_panel_width > 0.0 { writeln!(f, "left_panel_width={:.1}", cfg.left_panel_width)?; }
     
     Ok(())
 }
@@ -234,6 +252,8 @@ fn write_config_to_file(path: &PathBuf, cfg: &Config) -> Result<(), io::Error> {
     if cfg.wisdom_gate_cache_timestamp > 0 { writeln!(f, "wisdom_gate_cache_timestamp={}", cfg.wisdom_gate_cache_timestamp)?; }
     if !cfg.vlc_diag_history.trim().is_empty() { writeln!(f, "vlc_diag_history={}", cfg.vlc_diag_history)?; }
     writeln!(f, "low_cpu_mode={}", if cfg.low_cpu_mode {1} else {0})?;
+    if cfg.bottom_panel_height > 0.0 { writeln!(f, "bottom_panel_height={:.1}", cfg.bottom_panel_height)?; }
+    if cfg.left_panel_width > 0.0 { writeln!(f, "left_panel_width={:.1}", cfg.left_panel_width)?; }
     
     Ok(())
 }

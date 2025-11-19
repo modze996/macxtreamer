@@ -6,7 +6,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Receiver, Sender};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use tokio::io::AsyncReadExt;
 use tokio::sync::Semaphore;
 
@@ -29,6 +29,63 @@ use app_state::{Msg, SortKey, ViewState};
 use cache::{clear_all_caches, file_age_secs, image_cache_path};
 use config::{read_config, save_config};
 use downloads::{BulkOptions, sanitize_filename};
+
+// Local download tracking structs (specialized for UI & retry logic)
+#[derive(Debug, Clone)]
+struct DownloadMeta {
+    id: String,
+    name: String,
+    info: String,
+    container_extension: Option<String>,
+    size: Option<u64>,
+    modified: Option<std::time::SystemTime>,
+}
+
+#[derive(Debug, Clone)]
+struct DownloadState {
+    waiting: bool,
+    finished: bool,
+    error: Option<String>,
+    path: Option<String>,
+    received: u64,
+    total: Option<u64>,
+    cancel_flag: Option<Arc<AtomicBool>>,
+    started_at: Option<std::time::Instant>,
+    last_update_at: Option<std::time::Instant>,
+    prev_received: u64,
+    current_speed_bps: f64,
+    avg_speed_bps: f64,
+}
+
+impl Default for DownloadState {
+    fn default() -> Self {
+        Self {
+            waiting: false,
+            finished: false,
+            error: None,
+            path: None,
+            received: 0,
+            total: None,
+            cancel_flag: None,
+            started_at: None,
+            last_update_at: None,
+            prev_received: 0,
+            current_speed_bps: 0.0,
+            avg_speed_bps: 0.0,
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+struct ScannedDownload {
+    id: String,
+    name: String,
+    info: String,
+    container_extension: Option<String>,
+    path: String,
+    size: u64,
+    modified: std::time::SystemTime,
+}
 use images::image_meta_path;
 use logger::log_line;
 use models::{Category, Config, FavItem, Item, RecentItem, Row};
@@ -117,28 +174,18 @@ struct MacXtreamer {
     show_downloads: bool,
     // Map item-id -> category path for displaying in search results
     index_paths: HashMap<String, String>,
-    // UI: confirm bulk series download (series_id, series_name)
     confirm_bulk: Option<(String, String)>,
     bulk_opts_draft: BulkOptions,
     bulk_options_by_series: HashMap<String, BulkOptions>,
-    // Defer actual enqueuing of downloads to avoid borrow conflicts inside message loop
     pending_bulk_downloads: Vec<(String, String, String, Option<String>)>,
-    // Shared HTTP client for connection reuse
     http_client: reqwest::Client,
-    // Zeitpunkt letzter Verzeichnis-Scan (optional Throttling)
     last_download_scan: Option<std::time::Instant>,
-    // Flag to check for next downloads after message processing
     should_check_downloads: bool,
-    // Flag to start search after index is ready
     should_start_search: bool,
-    // Navigation
     current_view: Option<ViewState>,
     view_stack: Vec<ViewState>,
-
-    // Wisdom-Gate AI recommendations
     wisdom_gate_recommendations: Option<String>,
     wisdom_gate_last_fetch: Option<std::time::Instant>,
-    // VLC continuous diagnostics
     vlc_diag_lines: VecDeque<String>,
     vlc_diag_suggestion: Option<(u32,u32,u32)>,
     has_vlc: bool,
@@ -149,110 +196,15 @@ struct MacXtreamer {
     detected_mpv_path: Option<String>,
     vlc_fail_count: u32,
     mpv_fail_count: u32,
-    last_spawn_durations: std::collections::VecDeque<(String,u128)>,
-    active_diag_stop: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
+    active_diag_stop: Option<Arc<AtomicBool>>,
     command_preview: String,
     last_frame_time: std::time::Instant,
     avg_frame_ms: f32,
-}
-
-#[derive(Debug, Clone)]
-struct DownloadMeta {
-    id: String,
-    name: String,
-    info: String,
-    container_extension: Option<String>,
-    size: Option<u64>,
-    modified: Option<std::time::SystemTime>,
-}
-
-#[derive(Debug, Clone)]
-struct DownloadState {
-    received: u64,
-    total: Option<u64>,
-    finished: bool,
-    error: Option<String>,
-    path: Option<String>,
-    cancel_flag: Option<Arc<AtomicBool>>,
-    waiting: bool,
-}
-
-impl Default for DownloadState {
-    fn default() -> Self {
-        Self {
-            received: 0,
-            total: None,
-            finished: false,
-            error: None,
-            path: None,
-            cancel_flag: None,
-            waiting: false,
-        }
-    }
-}
-
-#[derive(Debug, Clone)]
-pub struct ScannedDownload {
-    id: String,
-    name: String,
-    info: String,
-    container_extension: Option<String>,
-    path: String,
-    size: u64,
-    modified: std::time::SystemTime,
+    last_forced_repaint: std::time::Instant,
+    pending_repaint_due_to_msg: bool,
 }
 
 impl MacXtreamer {
-    fn config_is_complete(&self) -> bool {
-        !(self.config.address.trim().is_empty()
-            || self.config.username.trim().is_empty()
-            || self.config.password.trim().is_empty())
-    }
-    fn create_and_play_m3u(&self, entries: &[(String, String)]) -> Result<(), String> {
-        if entries.is_empty() {
-            return Err("No episodes to play".into());
-        }
-        let mut path = std::env::temp_dir();
-        let ts = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_secs())
-            .unwrap_or(0);
-        path.push(format!("macxtreamer_binge_{}.m3u", ts));
-        let mut buf = String::from("#EXTM3U\n");
-        for (title, url) in entries {
-            buf.push_str(&format!("#EXTINF:-1,{}\n{}\n", title, url));
-        }
-        std::fs::write(&path, buf).map_err(|e| format!("Failed to write playlist: {}", e))?;
-        if let Some(p) = path.to_str() {
-            let _ = start_player(&self.config, p);
-            Ok(())
-        } else {
-            Err("Invalid playlist path".into())
-        }
-    }
-    fn clear_caches_and_reload(&mut self) {
-        // Clear on-disk caches (JSON + images)
-        clear_all_caches();
-        // Clear in-memory caches
-        self.textures.clear();
-        self.pending_covers.clear();
-        self.pending_texture_uploads.clear();
-        self.pending_texture_urls.clear();
-        self.pending_decode_urls.clear();
-        self.all_movies.clear();
-        self.all_series.clear();
-        self.content_rows.clear();
-        self.index_paths.clear();
-        // Reset loading state and kick off a fresh load
-        self.is_loading = true;
-        self.loading_done = 0;
-        self.loading_total = 3;
-        self.last_error = None;
-        // Reload categories; when they arrive, items will be fetched from network
-        self.reload_categories();
-        // Optionally prime caches again in background
-        self.spawn_preload_all();
-    }
     fn new() -> Self {
         let read_result = read_config();
         let (config, had_file) = match read_result {
@@ -309,7 +261,7 @@ impl MacXtreamer {
             current_theme: "".into(),
             theme_applied: false,
             font_scale_applied: false,
-            current_font_scale: 1.15, // Will be set from config below
+            current_font_scale: 1.15,
             indexing: false,
             sort_key: None,
             sort_asc: true,
@@ -324,23 +276,18 @@ impl MacXtreamer {
             show_downloads: false,
             index_paths: HashMap::new(),
             confirm_bulk: None,
-            bulk_opts_draft: BulkOptions {
-                only_not_downloaded: true,
-                season: None,
-                max_count: 0,
-            },
+            bulk_opts_draft: BulkOptions { only_not_downloaded: true, season: None, max_count: 0 },
             bulk_options_by_series: HashMap::new(),
             pending_bulk_downloads: Vec::new(),
             http_client: reqwest::Client::builder()
-                .pool_idle_timeout(Duration::from_secs(300)) // Länger idle timeout
-                .pool_max_idle_per_host(2) // Weniger Verbindungen pro Host
+                .pool_idle_timeout(Duration::from_secs(300))
+                .pool_max_idle_per_host(2)
                 .tcp_nodelay(true)
-                .tcp_keepalive(Some(Duration::from_secs(60))) // Längeres keepalive
-                // Sehr lange Timeouts für große Downloads
-                .timeout(Duration::from_secs(7200)) // 2 Stunden für sehr große Dateien
-                .connect_timeout(Duration::from_secs(30)) // Längeres Connect-Timeout
-                .user_agent("MacXtreamer/1.0") // User-Agent hinzufügen
-                .danger_accept_invalid_certs(true) // Akzeptiere ungültige Zertifikate
+                .tcp_keepalive(Some(Duration::from_secs(60)))
+                .timeout(Duration::from_secs(7200))
+                .connect_timeout(Duration::from_secs(30))
+                .user_agent("MacXtreamer/1.0")
+                .danger_accept_invalid_certs(true)
                 .build()
                 .unwrap_or_else(|_| reqwest::Client::new()),
             last_download_scan: None,
@@ -348,7 +295,6 @@ impl MacXtreamer {
             should_start_search: false,
             current_view: None,
             view_stack: Vec::new(),
-
             wisdom_gate_recommendations: cached_recommendations,
             wisdom_gate_last_fetch: None,
             vlc_diag_lines: VecDeque::with_capacity(128),
@@ -361,108 +307,59 @@ impl MacXtreamer {
             detected_mpv_path: None,
             vlc_fail_count: 0,
             mpv_fail_count: 0,
-            last_spawn_durations: std::collections::VecDeque::with_capacity(8),
             active_diag_stop: None,
             command_preview: String::new(),
             last_frame_time: std::time::Instant::now(),
             avg_frame_ms: 0.0,
+            last_forced_repaint: std::time::Instant::now(),
+            pending_repaint_due_to_msg: false,
         };
-        // Determine initial config readiness
-        if !had_file || !app.config_is_complete() {
-            app.show_config = true;
+
+        // Konfig prüfen – falls unvollständig, Config Dialog anzeigen
+        if !app.config_is_complete() {
             app.initial_config_pending = true;
-        }
-        app.current_theme = if app.config.theme.is_empty() {
-            "dark".into()
+            if !had_file {
+                app.show_config = true;
+            }
         } else {
-            app.config.theme.clone()
-        };
-        if app.config.cover_ttl_days == 0 {
-            app.config.cover_ttl_days = 7;
-        }
-        if app.config.cover_parallel == 0 {
-            app.config.cover_parallel = 6;
-        }
-        if app.config.cover_uploads_per_frame == 0 {
-            app.config.cover_uploads_per_frame = 3;
-        }
-        if app.config.cover_decode_parallel == 0 {
-            app.config.cover_decode_parallel = 2;
-        }
-        if app.config.texture_cache_limit == 0 {
-            app.config.texture_cache_limit = 512;
-        }
-        if app.config.font_scale == 0.0 {
-            app.config.font_scale = 1.15;
-        }
-        app.current_font_scale = app.config.font_scale; // Initialize tracking variable
-        if app.config.cover_height == 0.0 {
-            app.config.cover_height = 60.0;
-        }
-        app.cover_height = app.config.cover_height;
-        // enable_downloads defaults to false via #[serde(default)] - no initialization needed
-        if app.config.max_parallel_downloads == 0 {
-            app.config.max_parallel_downloads = 1;
-        }
-        app.cover_sem = Arc::new(Semaphore::new(app.config.cover_parallel as usize));
-        app.decode_sem = Arc::new(Semaphore::new(app.config.cover_decode_parallel as usize));
-        // Only preload/load categories if config is complete
-        if app.config_is_complete() {
+            // Direkt Kategorien laden wenn Konfig vollständig
             app.reload_categories();
-            app.spawn_preload_all();
+            // Resume eventuell vorhandene unvollständige Downloads (.part Dateien)
+            app.resume_incomplete_downloads();
         }
-        // Player detection (mpv / vlc) – run in background
+
+        // Player Erkennung in Hintergrund-Thread starten
         {
             let tx_detect = app.tx.clone();
             std::thread::spawn(move || {
-                fn detect(cmd: &str) -> Option<String> {
-                    std::process::Command::new(cmd)
-                        .arg("--version")
-                        .stdout(std::process::Stdio::piped())
-                        .stderr(std::process::Stdio::null())
-                        .output()
-                        .ok()
-                        .and_then(|o| if o.status.success() { Some(String::from_utf8_lossy(&o.stdout).lines().next().unwrap_or("?").to_string()) } else { None })
-                }
-                use std::path::Path;
-                let mut vlc_v = detect("vlc");
-                let mut vlc_path: Option<String> = None;
-                let vlc_candidates = [
-                    "vlc",
-                    "/Applications/VLC.app/Contents/MacOS/VLC",
-                    "/Applications/VLC.app/Contents/MacOS/VLC-bin",
-                    "/usr/local/bin/vlc",
-                    "/opt/homebrew/bin/vlc",
-                ];
-                for c in vlc_candidates.iter() {
-                    if Path::new(c).exists() {
-                        if vlc_v.is_none() {
-                            vlc_v = detect(c);
-                        }
-                        vlc_path = Some(c.to_string());
-                        break;
+                use std::process::Command;
+                use std::process::Stdio;
+                // VLC Detection
+                let (has_vlc, vlc_version, vlc_path) = match Command::new("vlc").arg("--version").stdout(Stdio::piped()).stderr(Stdio::null()).output() {
+                    Ok(out) => {
+                        let ver = String::from_utf8(out.stdout).ok().and_then(|s| s.lines().next().map(|l| l.to_string()));
+                        let path = Command::new("which").arg("vlc").output().ok()
+                            .and_then(|o| String::from_utf8(o.stdout).ok())
+                            .map(|s| s.trim().to_string());
+                        (true, ver, path)
                     }
-                }
-                let mut mpv_v = detect("mpv");
-                let mut mpv_path: Option<String> = None;
-                let mpv_candidates = [
-                    "mpv",
-                    "/Applications/mpv.app/Contents/MacOS/mpv",
-                    "/usr/local/bin/mpv",
-                    "/opt/homebrew/bin/mpv",
-                ];
-                for c in mpv_candidates.iter() {
-                    if Path::new(c).exists() {
-                        if mpv_v.is_none() {
-                            mpv_v = detect(c);
-                        }
-                        mpv_path = Some(c.to_string());
-                        break;
+                    Err(_) => (false, None, None),
+                };
+                // mpv Detection
+                let (has_mpv, mpv_version, mpv_path) = match Command::new("mpv").arg("--version").stdout(Stdio::piped()).stderr(Stdio::null()).output() {
+                    Ok(out) => {
+                        let ver = String::from_utf8(out.stdout).ok().and_then(|s| s.lines().next().map(|l| l.to_string()));
+                        let path = Command::new("which").arg("mpv").output().ok()
+                            .and_then(|o| String::from_utf8(o.stdout).ok())
+                            .map(|s| s.trim().to_string());
+                        (true, ver, path)
                     }
-                }
-                let _ = tx_detect.send(Msg::PlayerDetection { has_vlc: vlc_path.is_some(), has_mpv: mpv_path.is_some(), vlc_version: vlc_v, mpv_version: mpv_v, vlc_path, mpv_path });
+                    Err(_) => (false, None, None),
+                };
+                let _ = tx_detect.send(Msg::PlayerDetection { has_vlc, has_mpv, vlc_version, mpv_version, vlc_path, mpv_path });
             });
         }
+
         app
     }
 
@@ -495,6 +392,81 @@ impl MacXtreamer {
         });
         
 
+    }
+
+    fn config_is_complete(&self) -> bool {
+        !self.config.address.trim().is_empty()
+            && !self.config.username.trim().is_empty()
+            && !self.config.password.trim().is_empty()
+    }
+
+    fn effective_config(&self) -> &Config {
+        if let Some(d) = self.config_draft.as_ref() { d } else { &self.config }
+    }
+
+    fn clear_caches_and_reload(&mut self) {
+        // In-Memory Texturen und Cover Warteschlangen leeren
+        self.textures.clear();
+        self.pending_covers.clear();
+        // Dateisystem Cache leeren (Images, ggf. andere)
+        clear_all_caches();
+        // Kategorien neu laden falls Konfig vollständig
+        if self.config_is_complete() { self.reload_categories(); }
+    }
+
+    fn create_and_play_m3u(&mut self, entries: &[(String,String)]) -> Result<(), String> {
+        use std::io::Write;
+        let ts = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_else(|_| std::time::Duration::from_secs(0)).as_secs();
+        let path = std::env::temp_dir().join(format!("macxtreamer_playlist_{}.m3u", ts));
+        let mut file = std::fs::File::create(&path).map_err(|e| e.to_string())?;
+        writeln!(file, "#EXTM3U").ok();
+        for (title, url) in entries { 
+            writeln!(file, "#EXTINF:-1,{}", title).ok();
+            writeln!(file, "{}", url).map_err(|e| e.to_string())?; 
+        }
+        let path_str = path.to_string_lossy().to_string();
+        start_player(self.effective_config(), &path_str).map_err(|e| e)
+    }
+
+    fn resume_incomplete_downloads(&mut self) {
+        if !self.config.enable_downloads { return; }
+        let dir = self.expand_download_dir();
+        let Ok(entries) = std::fs::read_dir(&dir) else { return; };
+        for ent in entries.flatten() {
+            let path = ent.path();
+            if path.extension().and_then(|e| e.to_str()) != Some("part") { continue; }
+            // Ableiten ursprünglicher Erweiterung (dateiname.mp4.part -> file_stem = dateiname.mp4)
+            let stem = path.file_stem().and_then(|s| s.to_str()).unwrap_or_default().to_string();
+            let (base_name, orig_ext) = match stem.rsplit_once('.') { Some((b,e)) => (b.to_string(), e.to_string()), None => (stem.clone(), "mp4".to_string()) };
+            let sidecar = path.with_file_name(format!("{}.{}.json", base_name, orig_ext));
+            if !sidecar.exists() { 
+                // Ohne Sidecar keine Resume-Metadaten -> überspringen
+                continue; 
+            }
+            let meta_json = match std::fs::read(&sidecar) { Ok(d)=>d, Err(_)=>continue }; 
+            let mut id = String::new();
+            let mut name = base_name.clone();
+            let mut info = "Movie".to_string();
+            let mut container_extension = Some(orig_ext.clone());
+            if let Ok(js) = serde_json::from_slice::<serde_json::Value>(&meta_json) {
+                if let Some(v)=js.get("id").and_then(|v| v.as_str()) { id = v.to_string(); }
+                if let Some(v)=js.get("name").and_then(|v| v.as_str()) { name = v.to_string(); }
+                if let Some(v)=js.get("info").and_then(|v| v.as_str()) { info = v.to_string(); }
+                if let Some(v)=js.get("ext").and_then(|v| v.as_str()) { container_extension = Some(v.to_string()); }
+            }
+            if id.is_empty() { continue; }
+            if self.downloads.contains_key(&id) { continue; }
+            // Prüfen ob finale Datei bereits existiert -> dann part löschen
+            let final_path = self.local_file_path(&id, &name, container_extension.as_deref());
+            if final_path.exists() { let _ = std::fs::remove_file(&path); continue; }
+            // DownloadState / Meta anlegen und direkt starten
+            let meta = DownloadMeta { id: id.clone(), name: name.clone(), info: info.clone(), container_extension: container_extension.clone(), size: None, modified: None };
+            self.download_meta.insert(id.clone(), meta);
+            self.download_order.push(id.clone());
+            self.downloads.insert(id.clone(), DownloadState { waiting: true, path: Some(final_path.to_string_lossy().into()), ..Default::default() });
+        }
+        // Versuche ausstehende (wartende) Downloads zu starten
+        self.maybe_start_next_download();
     }
 
     fn spawn_load_items(&self, kind: &str, category_id: String) {
@@ -701,19 +673,21 @@ impl MacXtreamer {
                     all_series.extend(items.into_iter().map(|it| (it, path.clone())));
                 }
             }
-            // Dedup by id
+            // Dedup by id (first movies then series)
             let mut seen = std::collections::HashSet::new();
             all_movies.retain(|(i, _)| seen.insert(i.id.clone()));
             seen.clear();
             all_series.retain(|(i, _)| seen.insert(i.id.clone()));
-            // Persist into cache files already handled by fetch_items; send data back
-            let _ = tx.send(Msg::IndexBuilt {
-                movies: all_movies.len(),
-                series: all_series.len(),
-            });
+            // Wichtig: Erst IndexData senden (füllt Caches), dann IndexBuilt (setzt indexing=false und triggert Suche)
+            let movies_len = all_movies.len();
+            let series_len = all_series.len();
             let _ = tx.send(Msg::IndexData {
                 movies: all_movies,
                 series: all_series,
+            });
+            let _ = tx.send(Msg::IndexBuilt {
+                movies: movies_len,
+                series: series_len,
             });
         });
     }
@@ -953,7 +927,7 @@ impl MacXtreamer {
             self.local_file_exists(&id, &row.name, row.container_extension.as_deref())
         {
             let uri = file_path_to_uri(&path);
-            let _ = start_player(&self.config, &uri);
+            let _ = start_player(self.effective_config(), &uri);
             return;
         }
         // If currently downloading just ignore
@@ -1097,156 +1071,91 @@ impl MacXtreamer {
             .unwrap_or_else(|| Arc::new(AtomicBool::new(false)));
         let tx = self.tx.clone();
         let id = next_id.clone();
+        let cfg_clone = self.config.clone();
         tokio::spawn(async move {
-            // Erstelle einen frischen HTTP-Client für jeden Download um Pool-Probleme zu vermeiden
+            let attempts_max = cfg_clone.download_retry_max.max(1) as usize;
+            let delay_ms = if cfg_clone.download_retry_delay_ms == 0 { 1000 } else { cfg_clone.download_retry_delay_ms } as u64;
             let client = reqwest::Client::builder()
                 .tcp_nodelay(true)
-                .tcp_keepalive(Some(Duration::from_secs(60))) 
-                .timeout(Duration::from_secs(7200)) // 2 Stunden
-                .connect_timeout(Duration::from_secs(30)) 
-                .user_agent("MacXtreamer/1.0") 
+                .tcp_keepalive(Some(Duration::from_secs(60)))
+                .timeout(Duration::from_secs(7200))
+                .connect_timeout(Duration::from_secs(30))
+                .user_agent("MacXtreamer/1.0")
                 .danger_accept_invalid_certs(true)
                 .build()
                 .unwrap();
-            
-            if let Some(parent) = target_path.parent() {
-                let _ = tokio::fs::create_dir_all(parent).await;
-            }
-            println!("Starting download: id={}, url={}", id, url);
-            let mut resp = match client.get(&url).send().await {
-                Ok(r) => r,
-                Err(e) => {
-                    let error_msg = format!("Network error: {} (URL: {})", e, url);
-                    println!("Download failed - {}", error_msg);
-                    log_line(&format!("Download failed - {}", error_msg));
-                    let _ = tx.send(Msg::DownloadError {
-                        id: id.clone(),
-                        error: error_msg,
-                    });
-                    return;
+            if let Some(parent) = target_path.parent() { let _ = tokio::fs::create_dir_all(parent).await; }
+            // Sidecar schreiben (für Resume) falls noch nicht vorhanden
+            if let Some(ext) = target_path.extension().and_then(|e| e.to_str()) {
+                let sidecar = target_path.with_extension(format!("{}.json", ext));
+                if !sidecar.exists() {
+                    let js = serde_json::json!({"id": meta.id, "name": meta.name, "info": meta.info, "ext": meta.container_extension.as_deref().unwrap_or("mp4")});
+                    if let Ok(data) = serde_json::to_vec(&js) { let _ = tokio::fs::write(&sidecar, &data).await; }
                 }
-            };
-            if !resp.status().is_success() {
-                let error_msg = format!("HTTP {} - {} (URL: {})", resp.status().as_u16(), resp.status().canonical_reason().unwrap_or("Unknown"), url);
-                println!("Download failed - {}", error_msg);
-                log_line(&format!("Download failed - {}", error_msg));
-                let _ = tx.send(Msg::DownloadError {
-                    id: id.clone(),
-                    error: error_msg,
-                });
-                return;
             }
-            let total = resp.content_length();
-            let _ = tx.send(Msg::DownloadStarted {
-                id: id.clone(),
-                path: target_path.to_string_lossy().into(),
-            });
-            let mut received: u64 = 0;
-            let mut file = match tokio::fs::File::create(&tmp_path).await {
-                Ok(f) => f,
-                Err(e) => {
-                    let _ = tx.send(Msg::DownloadError {
-                        id: id.clone(),
-                        error: e.to_string(),
-                    });
-                    return;
-                }
-            };
-            println!("Download started: id={}, size={} bytes", id, total.map_or("unknown".to_string(), |t| t.to_string()));
-            let mut last_sent = std::time::Instant::now();
-            let mut _chunk_count = 0u64;
-            
+            let mut attempt = 0usize;
+            let mut final_total: Option<u64> = None;
             loop {
-                match resp.chunk().await {
-                    Ok(Some(c)) => {
-                        _chunk_count += 1;
-                        if cancel_flag.load(Ordering::Relaxed) {
-                            let _ = tokio::fs::remove_file(&tmp_path).await;
-                            let _ = tx.send(Msg::DownloadCancelled { id: id.clone() });
-                            return;
-                        }
-                        if let Err(e) = tokio::io::AsyncWriteExt::write_all(&mut file, &c).await {
-                            let error_msg = format!("Write error: {}", e);
-                            println!("Download failed - {}", error_msg);
-                            log_line(&format!("Download failed - {}", error_msg));
-                            let _ = tx.send(Msg::DownloadError {
-                                id: id.clone(),
-                                error: error_msg,
-                            });
-                            return;
-                        }
-                        received += c.len() as u64;
-                        if last_sent.elapsed() > std::time::Duration::from_millis(250) {
-                            last_sent = std::time::Instant::now();
-                            let _ = tx.send(Msg::DownloadProgress {
-                                id: id.clone(),
-                                received,
-                                total,
-                            });
-                        }
-                    }
-                    Ok(None) => {
-                        // End of stream
-                        break;
-                    }
-                    Err(e) => {
-                        let error_msg = format!("Stream error: {}", e);
-                        println!("Download failed - {}", error_msg);
-                        log_line(&format!("Download failed - {}", error_msg));
-                        let _ = tx.send(Msg::DownloadError {
-                            id: id.clone(),
-                            error: error_msg,
-                        });
-                        return;
-                    }
+                if cancel_flag.load(Ordering::Relaxed) { let _ = tx.send(Msg::DownloadCancelled { id: id.clone() }); return; }
+                // Aktuelle Teilgröße bestimmen (Resume)
+                let existing_len = match tokio::fs::metadata(&tmp_path).await { Ok(m)=>m.len(), Err(_)=>0 };
+                // Datei öffnen (append oder create)
+                let mut file = if existing_len > 0 { tokio::fs::OpenOptions::new().append(true).open(&tmp_path).await.unwrap() } else { tokio::fs::File::create(&tmp_path).await.unwrap() };
+                println!("Download attempt {}/{} id={} resume_from={}", attempt+1, attempts_max, id, existing_len);
+                log_line(&format!("Download attempt {}/{} id={} resume_from={} bytes", attempt+1, attempts_max, id, existing_len));
+                if attempt == 0 && existing_len > 0 {
+                    // Sofort Fortschritt melden vor neuem Request
+                    let _ = tx.send(Msg::DownloadProgress { id: id.clone(), received: existing_len, total: None });
                 }
-            }
-            // Check if we received all expected bytes
-            if let Some(expected) = total {
-                if received < expected {
-                    println!("Download incomplete: id={}, received={}, expected={}", id, received, expected);
-                    let _ = tx.send(Msg::DownloadError {
-                        id: id.clone(),
-                        error: format!("Incomplete download: received {} bytes, expected {} bytes", received, expected),
-                    });
+                let mut req = client.get(&url);
+                if existing_len > 0 { req = req.header(reqwest::header::RANGE, format!("bytes={}-", existing_len)); }
+                let resp = match req.send().await { Ok(r)=>r, Err(e)=>{ let err = format!("Network error: {}", e); println!("{}", err); log_line(&err); attempt+=1; if attempt>=attempts_max { let _=tx.send(Msg::DownloadError { id: id.clone(), error: err }); return; } else { tokio::time::sleep(Duration::from_millis(delay_ms)).await; continue; } } };
+                if resp.status() == reqwest::StatusCode::RANGE_NOT_SATISFIABLE {
+                    // Möglicherweise schon komplett -> rename falls final nicht existiert
+                    if !target_path.exists() { let _ = tokio::fs::rename(&tmp_path, &target_path).await; }
+                    let _ = tx.send(Msg::DownloadFinished { id: id.clone(), path: target_path.to_string_lossy().into() });
                     return;
-                } else {
-                    println!("Download complete: id={}, received={} bytes", id, received);
                 }
-            } else {
-                println!("Download finished: id={}, received={} bytes (unknown size)", id, received);
-            }
-            
-            let _ = tx.send(Msg::DownloadProgress {
-                id: id.clone(),
-                received,
-                total,
-            });
-            
-            // Ensure all data is written to disk before renaming
-            if let Err(e) = tokio::io::AsyncWriteExt::flush(&mut file).await {
-                let _ = tx.send(Msg::DownloadError {
-                    id: id.clone(),
-                    error: format!("Failed to flush file: {}", e),
-                });
+                if !resp.status().is_success() {
+                    let err = format!("HTTP {}", resp.status()); println!("{}", err); log_line(&err);
+                    attempt+=1; if attempt>=attempts_max { let _=tx.send(Msg::DownloadError { id: id.clone(), error: err }); return; } else { tokio::time::sleep(Duration::from_millis(delay_ms)).await; continue; }
+                }
+                // Total Größe bestimmen
+                let total_opt = if resp.status()==reqwest::StatusCode::PARTIAL_CONTENT {
+                    if let Some(cr) = resp.headers().get(reqwest::header::CONTENT_RANGE).and_then(|v| v.to_str().ok()) {
+                        // Format bytes start-end/total
+                        if let Some((_,rest)) = cr.split_once(' ') { if let Some((_range,tot)) = rest.split_once('/') { tot.parse::<u64>().ok() } else { None } } else { None }
+                    } else { None }
+                } else { resp.content_length() };
+                if final_total.is_none() { final_total = total_opt; }
+                if attempt == 0 { let _ = tx.send(Msg::DownloadStarted { id: id.clone(), path: target_path.to_string_lossy().into() }); }
+                if existing_len > 0 && final_total.is_some() {
+                    let _ = tx.send(Msg::DownloadProgress { id: id.clone(), received: existing_len, total: final_total });
+                }
+                let mut received = existing_len;
+                let mut last_sent = std::time::Instant::now();
+                let mut stream = resp.bytes_stream();
+                use futures_util::StreamExt;
+                while let Some(chunk_res) = stream.next().await {
+                    match chunk_res {
+                        Ok(c) => {
+                            if cancel_flag.load(Ordering::Relaxed) { let _=tx.send(Msg::DownloadCancelled { id: id.clone() }); return; }
+                            if let Err(e)=tokio::io::AsyncWriteExt::write_all(&mut file, &c).await { let err = format!("Write error: {}", e); let _=tx.send(Msg::DownloadError { id: id.clone(), error: err }); return; }
+                            received += c.len() as u64;
+                            if last_sent.elapsed() > std::time::Duration::from_millis(250) { last_sent=std::time::Instant::now(); let _=tx.send(Msg::DownloadProgress { id: id.clone(), received, total: final_total }); }
+                        }
+                        Err(e) => { let err = format!("Stream error: {}", e); println!("{}", err); log_line(&err); break; }
+                    }
+                }
+                // Flush
+                let _ = tokio::io::AsyncWriteExt::flush(&mut file).await;
+                drop(file);
+                if let Some(total)=final_total { if received < total { let msg = format!("Early EOF detected id={} received={} total={}", id, received, total); println!("{}", msg); log_line(&msg); attempt+=1; if attempt<attempts_max { continue; } else { let _=tx.send(Msg::DownloadError { id: id.clone(), error: format!("Incomplete after {} attempts", attempts_max) }); return; } } }
+                // Erfolgreich
+                if let Err(e)=tokio::fs::rename(&tmp_path, &target_path).await { let _=tx.send(Msg::DownloadError { id: id.clone(), error: format!("Rename failed: {}", e) }); return; }
+                let _=tx.send(Msg::DownloadFinished { id: id.clone(), path: target_path.to_string_lossy().into() });
                 return;
             }
-            
-            // Close the file handle before renaming
-            drop(file);
-            
-            if let Err(e) = tokio::fs::rename(&tmp_path, &target_path).await {
-                let _ = tx.send(Msg::DownloadError {
-                    id: id.clone(),
-                    error: format!("Failed to rename file: {}", e),
-                });
-                return;
-            }
-            let _ = tx.send(Msg::DownloadFinished {
-                id: id.clone(),
-                path: target_path.to_string_lossy().into(),
-            });
-            // log_line(&format!("Download finished id={} bytes={} path={}", id, received, target_path.display()));
         });
         if self.active_downloads() < max_parallel {
             self.maybe_start_next_download();
@@ -1539,6 +1448,7 @@ impl eframe::App for MacXtreamer {
                 break; // Prevent infinite message processing
             }
             got_msg = true;
+            self.pending_repaint_due_to_msg = true; // Mark that a repaint is needed for visual update
             match msg {
                 Msg::LiveCategories(res) => {
                     match res {
@@ -2012,6 +1922,25 @@ impl eframe::App for MacXtreamer {
                     total,
                 } => {
                     let st = self.downloads.entry(id).or_default();
+                    let now = Instant::now();
+                    if st.started_at.is_none() { st.started_at = Some(now); st.prev_received = st.received; }
+                    // Berechnung aktuelle Geschwindigkeit
+                    if let Some(last) = st.last_update_at {
+                        let dt = now.duration_since(last).as_secs_f64();
+                        if dt > 0.15 {
+                            let delta_bytes = received.saturating_sub(st.prev_received) as f64;
+                            st.current_speed_bps = if delta_bytes > 0.0 { delta_bytes / dt } else { 0.0 };
+                            st.prev_received = received;
+                            st.last_update_at = Some(now);
+                        }
+                    } else {
+                        st.last_update_at = Some(now);
+                    }
+                    // Durchschnittliche Geschwindigkeit
+                    if let Some(start) = st.started_at {
+                        let elapsed = now.duration_since(start).as_secs_f64();
+                        if elapsed >= 1.0 { st.avg_speed_bps = received as f64 / elapsed; }
+                    }
                     st.received = received;
                     st.total = total;
                 }
@@ -2138,6 +2067,21 @@ impl eframe::App for MacXtreamer {
                     self.wisdom_gate_recommendations = Some(content);
                     self.wisdom_gate_last_fetch = Some(std::time::Instant::now());
                 }
+            }
+        }
+        // Decide if we trigger a repaint now (mouse move shouldn't force full re-render if nothing changed)
+    let time_since_forced = now.duration_since(self.last_forced_repaint).as_millis() as u64;
+    // Ultra Flicker Guard erhöht Intervall und erzwingt ausschließlich Event-basierte Repaints
+    let repaint_interval = if self.config.ultra_low_flicker_mode { 900 } else if self.config.low_cpu_mode { 500 } else { 120 }; // base cadence
+        if self.pending_repaint_due_to_msg || got_msg {
+            ctx.request_repaint();
+            self.last_forced_repaint = now;
+            self.pending_repaint_due_to_msg = false;
+        } else if time_since_forced >= repaint_interval {
+            // periodic heartbeat only if background work exists
+            if !self.config.ultra_low_flicker_mode && (has_critical_bg_work || has_minor_bg_work) {
+                ctx.request_repaint();
+                self.last_forced_repaint = now;
             }
         }
 
@@ -2515,16 +2459,33 @@ impl eframe::App for MacXtreamer {
                 ui.painter().rect_filled(grip_rect, 0.0, grip_color);
             });
 
-        // Bottom panel (recently & favorites) MUST be declared before CentralPanel so CentralPanel height excludes it.
-        egui::TopBottomPanel::bottom("bottom")
-            .resizable(true)
-            .show_separator_line(true)
-            .default_height(320.0)
-            .min_height(120.0)
-            .show(ctx, |ui| {
-                // Keep a slim spacer; rely on egui's built-in resize handle instead of custom grip overlay
-                ui.add_space(4.0);
-                ui.columns(2, |cols| {
+        // Bottom panel logic: Wenn Höhe==0 keinerlei Panel einfügen; stattdessen ein kleines Floating-Expand-Icon am unteren Rand.
+        let win_h = ctx.available_rect().height();
+        let max_bottom = (win_h * 0.45).max(120.0);
+        if self.config.bottom_panel_height <= 0.0 {
+            // Floating expand button – beeinflusst Layout nicht
+            egui::Area::new("bottom_expand_btn")
+                .anchor(egui::Align2::LEFT_BOTTOM, [8.0, -6.0])
+                .order(egui::Order::Foreground)
+                .show(ctx, |ui| {
+                    if ui.small_button("▲ Panel").on_hover_text("Zeige Recently / Favorites / Downloads").clicked() {
+                        self.config.bottom_panel_height = (win_h * 0.30).clamp(80.0, max_bottom);
+                        let _ = crate::config::write_config(&self.config);
+                        ctx.request_repaint();
+                    }
+                });
+        } else {
+            let desired_h = self.config.bottom_panel_height.min(max_bottom);
+            egui::TopBottomPanel::bottom("bottom")
+                .resizable(true)
+                .show_separator_line(true)
+                .min_height(0.0)
+                .max_height(max_bottom)
+                .default_height(desired_h)
+                .show(ctx, |ui| {
+                    ui.add_space(4.0);
+                    // Recently / Favorites / Downloads
+                    ui.columns(3, |cols| {
                     // Left column: Recently
                     cols[0].vertical(|ui| {
                         ui.label(RichText::new("Recently played").strong());
@@ -2546,7 +2507,9 @@ impl eframe::App for MacXtreamer {
                                                 &it.info,
                                                 it.container_extension.as_deref(),
                                             );
-                                            let _ = start_player(&self.config, &url);
+                                            // Prefer lokale Datei falls vorhanden (MPV soll nicht erneut Stream öffnen)
+                                            let play_target = if let Some(p)=self.local_file_exists(&it.id, &it.name, it.container_extension.as_deref()) { file_path_to_uri(&p) } else { url.clone() };
+                                            let _ = start_player(self.effective_config(), &play_target);
                                         }
                                     }
                                 }
@@ -2586,7 +2549,8 @@ impl eframe::App for MacXtreamer {
                                                         )
                                                     });
                                                 if ui.small_button("Play").clicked() {
-                                                    let _ = start_player(&self.config, &url);
+                                                    let play_target = if let Some(p)=self.local_file_exists(&it.id, &it.name, it.container_extension.as_deref()) { file_path_to_uri(&p) } else { url.clone() };
+                                                    let _ = start_player(self.effective_config(), &play_target);
                                                 }
                                                 if ui.small_button("Copy").clicked() {
                                                     ui.output_mut(|o| o.copied_text = url.clone());
@@ -2597,16 +2561,125 @@ impl eframe::App for MacXtreamer {
                                 }
                             });
                     });
+                    // Right column: Downloads (inline statt separates Fenster)
+                    cols[2].vertical(|ui| {
+                        ui.label(RichText::new("Downloads").strong());
+                        // Trigger Scan (intern auf 5s gedrosselt)
+                        if self.config.enable_downloads { self.scan_download_directory(); } else { ui.weak("Downloads disabled in settings"); }
+                        let h = ui.available_height();
+                        egui::ScrollArea::vertical()
+                            .id_source("downloads_list")
+                            .auto_shrink([false,false])
+                            .max_height(h)
+                            .show(ui, |ui| {
+                                if self.download_order.is_empty() {
+                                    ui.weak("No downloads yet.");
+                                } else {
+                                    let order_snapshot: Vec<String> = self.download_order.clone();
+                                    for id in order_snapshot {
+                                        if let (Some(meta), Some(st)) = (self.download_meta.get(&id), self.downloads.get(&id)) {
+                                            // Kopiere benötigte Felder in lokale Variablen um Borrow-Konflikte zu vermeiden
+                                            let name = meta.name.clone();
+                                            let size_opt = meta.size;
+                                            let waiting = st.waiting;
+                                            let finished = st.finished;
+                                            let error_opt = st.error.clone();
+                                            let total_opt = st.total;
+                                            let received = st.received;
+                                            let path_opt = st.path.clone();
+                                            let cancel_flag = st.cancel_flag.clone();
+                                            let is_done_ok = finished && error_opt.is_none();
+                                            let modified_opt = meta.modified;
+                                            let cur_speed_bps = st.current_speed_bps;
+                                            let avg_speed_bps = st.avg_speed_bps;
+                                            ui.horizontal(|ui| {
+                                                ui.label(name);
+                                                if let Some(sz)=size_opt { ui.weak(format_file_size(Some(sz))); }
+                                                if waiting { ui.weak("waiting"); }
+                                                else if finished {
+                                                    if let Some(err)=error_opt.as_ref(){ ui.label(colored_text_by_type(&format!("error: {}",err),"error")); }
+                                                    else { ui.label(colored_text_by_type("done","success")); }
+                                                } else {
+                                                    let frac = total_opt.map(|t| (received as f32 / t as f32).min(1.0)).unwrap_or(0.0);
+                                                    let pct_text = if total_opt.is_some(){ format!("{:.0}%", frac*100.0) } else { format!("{} KB", received/1024) };
+                                                    // Geschwindigkeiten (aktuell & Durchschnitt)
+                                                    let cur_speed = if cur_speed_bps > 0.0 { crate::downloads::format_speed(cur_speed_bps) } else { "-".into() };
+                                                    let avg_speed = if avg_speed_bps > 0.0 { crate::downloads::format_speed(avg_speed_bps) } else { "-".into() };
+                                                    let bar_text = format!("{} | {} / avg {}", pct_text, cur_speed, avg_speed);
+                                                    ui.add(egui::ProgressBar::new(frac).desired_width(160.0).text(bar_text));
+                                                    if let Some(flag)=&cancel_flag { if ui.small_button("Cancel").clicked(){ flag.store(true, std::sync::atomic::Ordering::Relaxed); } }
+                                                }
+                                                if is_done_ok {
+                                                    if let Some(p)=path_opt {
+                                                        if ui.small_button("Play").clicked(){
+                                                            let uri = file_path_to_uri(Path::new(&p));
+                                                            let _= start_player(self.effective_config(), &uri);
+                                                        }
+                                                        if ui.small_button("Del").on_hover_text("Delete file").clicked(){
+                                                            // Versuche Datei zu löschen
+                                                            match std::fs::remove_file(&p) {
+                                                                Err(e) => {
+                                                                    self.last_error = Some(format!("Delete failed: {}", e));
+                                                                }
+                                                                Ok(_) => {
+                                                                    // Sofortiges Entfernen aus internen Strukturen
+                                                                    self.downloads.remove(&id);
+                                                                    self.download_meta.remove(&id);
+                                                                    self.download_order.retain(|x| x != &id);
+                                                                    // Kein sofortiger Re-Scan nötig; falls dennoch gewünscht: self.scan_download_directory();
+                                                                    ctx.request_repaint();
+                                                                }
+                                                            }
+                                                        }
+                                                    } else {
+                                                        // Falls kein Pfad vorhanden aber Eintrag fertig -> Button zum Entfernen anbieten
+                                                        if ui.small_button("Remove").on_hover_text("Remove entry").clicked() {
+                                                            self.downloads.remove(&id);
+                                                            self.download_meta.remove(&id);
+                                                            self.download_order.retain(|x| x != &id);
+                                                            ctx.request_repaint();
+                                                        }
+                                                    }
+                                                    if let Some(mt)=modified_opt {
+                                                        if let Ok(delta)=mt.elapsed(){
+                                                            let mins = delta.as_secs()/60; ui.weak(format!("{}m ago", mins));
+                                                        }
+                                                    }
+                                                }
+                                            });
+                                        }
+                                    }
+                                }
+                            });
+                        if ui.button("Clear finished errors").on_hover_text("Remove finished error entries").clicked(){
+                            self.downloads.retain(|_,s| !s.finished || s.error.is_none());
+                            self.download_order.retain(|id| self.downloads.contains_key(id));
+                        }
+                    }); // Ende Downloads Spalte
+                }); // Ende columns(3,...)
+                    // Panelhöhe nach Rendering messen über ui.max_rect()
+                    let current_h = ui.max_rect().height();
+                    if current_h < 24.0 { // sehr klein => einklappen
+                        if self.config.bottom_panel_height != 0.0 {
+                            self.config.bottom_panel_height = 0.0;
+                            let _ = crate::config::write_config(&self.config);
+                        }
+                    } else if (current_h - self.config.bottom_panel_height).abs() > 4.0 {
+                        self.config.bottom_panel_height = current_h.min(max_bottom);
+                        let _ = crate::config::write_config(&self.config);
+                    }
                 });
-            });
+        }
 
         // Wisdom-Gate AI Empfehlungen in linker Seitenleiste
         egui::SidePanel::left("wisdom_gate_recommendations")
-            .default_width(300.0)
-            .width_range(250.0..=400.0)
+            .default_width(if self.config.left_panel_width>250.0 { self.config.left_panel_width } else { 300.0 })
+            .width_range(250.0..=500.0)
             .resizable(true)
             .show(ctx, |ui| {
                 self.render_wisdom_gate_panel(ui);
+                let w = ui.max_rect().width();
+                if (w - self.config.left_panel_width).abs() > 4.0 { self.config.left_panel_width = w; let _ = crate::config::write_config(&self.config); }
             });
 
         egui::CentralPanel::default().show(ctx, |ui| {
@@ -2899,7 +2972,7 @@ impl eframe::App for MacXtreamer {
                                             );
                                         } else {
                                             let play_url = self.resolve_play_url(r);
-                                            let _ = start_player(&self.config, &play_url);
+                                            let _ = start_player(self.effective_config(), &play_url);
                                         }
                                         let rec = RecentItem {
                                             id: r.id.clone(),
@@ -3074,63 +3147,75 @@ impl eframe::App for MacXtreamer {
                         .show(ui, |ui| {
                             let draft = self.config_draft.get_or_insert_with(|| self.config.clone());
                             
-                            ui.heading("📡 Server Settings");
-                            ui.separator();
-                            
-                            ui.label("URL");
-                            ui.add(
-                                egui::TextEdit::multiline(&mut draft.address)
-                                    .desired_rows(1)
-                                    .desired_width(f32::INFINITY)
-                            );
-                            
-                            ui.label("Username");
-                            ui.add(
-                                egui::TextEdit::multiline(&mut draft.username)
-                                    .desired_rows(1)
-                                    .desired_width(f32::INFINITY)
-                            );
-                            
-                            ui.label("Password");
-                            ui.add(
-                                egui::TextEdit::multiline(&mut draft.password)
-                                    .password(true)
-                                    .desired_rows(1)
-                                    .desired_width(f32::INFINITY)
-                            );
-                            
-                            ui.add_space(8.0);
-                            ui.heading("🎬 Player Settings");
-                            ui.separator();
-                            
-                            ui.label("Player command");
-                            ui.add(
-                                egui::TextEdit::multiline(&mut draft.player_command)
-                                    .desired_rows(3)
-                                    .desired_width(f32::INFINITY)
-                            );
-                            ui.small("Tip: Use the placeholder URL at the position where the stream URL should be inserted.\nExample: vlc --fullscreen --no-video-title-show --network-caching=2000 URL");
-                            
-                            ui.horizontal(|ui| {
-                                let mut reuse = draft.reuse_vlc;
-                                if ui
-                                    .checkbox(&mut reuse, "Reuse VLC")
-                                    .on_hover_text("Open links in a running VLC instance (macOS)")
-                                    .changed()
-                                {
-                                    draft.reuse_vlc = reuse;
-                                }
+                            ui.collapsing("📡 Server", |ui| {
+                                ui.label("URL");
+                                ui.add(egui::TextEdit::singleline(&mut draft.address).desired_width(f32::INFINITY));
+                                ui.label("Username");
+                                ui.add(egui::TextEdit::singleline(&mut draft.username).desired_width(f32::INFINITY));
+                                ui.label("Password");
+                                ui.add(egui::TextEdit::singleline(&mut draft.password).password(true).desired_width(f32::INFINITY));
+                            });
+
+                            ui.collapsing("🎬 Player", |ui| {
+                                ui.label("Custom Player Command (optional)");
+                                ui.add(egui::TextEdit::multiline(&mut draft.player_command).desired_rows(2).desired_width(f32::INFINITY));
+                                ui.small("Use {URL} placeholder where the stream URL goes");
+                                ui.horizontal(|ui| {
+                                    let mut reuse = draft.reuse_vlc; if ui.checkbox(&mut reuse, "Reuse VLC").on_hover_text("Open links in running VLC instance (macOS)").changed() { draft.reuse_vlc = reuse; }
+                                    let mut use_mpv = draft.use_mpv; if ui.checkbox(&mut use_mpv, "Use MPV").on_hover_text(if self.has_mpv {"mpv aktivieren"} else {"mpv nicht gefunden"}).changed() { draft.use_mpv = use_mpv; if use_mpv { draft.reuse_vlc = false; } }
+                                    if self.has_vlc { if let Some(v)=&self.vlc_version { ui.label(egui::RichText::new(format!("vlc {}", v)).small()); }}
+                                    if self.has_mpv { if let Some(v)=&self.mpv_version { ui.label(egui::RichText::new(format!("mpv {}", v)).small()); }}
+                                });
+                                ui.horizontal(|ui| {
+                                    let mut low = draft.low_cpu_mode; if ui.checkbox(&mut low, "Low CPU").on_hover_text("Reduziert Repaints & Diagnose-Frequenz").changed() { draft.low_cpu_mode = low; }
+                                    let mut ultra = draft.ultra_low_flicker_mode; if ui.checkbox(&mut ultra, "Ultra Flicker").on_hover_text("Event-basierte Repaints – evtl. träge").changed() { draft.ultra_low_flicker_mode = ultra; }
+                                });
+                                // Bias Slider
+                                ui.horizontal(|ui| {
+                                    ui.label("Latency/Stability Bias");
+                                    let mut bias = draft.vlc_profile_bias.min(100) as i32;
+                                    if ui.add(egui::Slider::new(&mut bias, 0..=100)).changed() { draft.vlc_profile_bias = bias as u32; }
+                                    ui.weak("0=low latency 100=stable");
+                                });
+                                if ui.button("Apply Bias").on_hover_text("Rebuild VLC command using current bias").clicked() { draft.player_command = crate::player::get_vlc_command_for_stream_type(crate::player::StreamType::Default, &draft); }
+
+                                // Command Preview (from earlier stabilized box)
+                                let preview = if draft.use_mpv { let mut args = vec!["mpv".to_string(), "--force-window=no".into(), "--fullscreen".into()]; let cache = if draft.mpv_cache_secs_override!=0 { draft.mpv_cache_secs_override } else { (draft.vlc_network_caching_ms/1000).max(1) }; args.push(format!("--cache-secs={}", cache)); let readahead = if draft.mpv_readahead_secs_override!=0 { draft.mpv_readahead_secs_override } else { (draft.vlc_file_caching_ms/1000).max(1) }; args.push(format!("--demuxer-readahead-secs={}", readahead)); if !draft.mpv_extra_args.trim().is_empty() { args.extend(draft.mpv_extra_args.split_whitespace().map(|s| s.to_string())); } args.push("<URL>".into()); args.join(" ") } else { crate::player::get_vlc_command_for_stream_type(crate::player::StreamType::Default, &draft) }; if self.command_preview != preview { self.command_preview = preview; }
+                                ui.collapsing("Preview", |ui| {
+                                    let (n,l,f)=crate::player::apply_bias(&draft);
+                                    let (rect,response)=ui.allocate_exact_size(egui::vec2(ui.available_width(),52.0),egui::Sense::hover());
+                                    let painter=ui.painter(); painter.rect_filled(rect,4.0,ui.visuals().extreme_bg_color); painter.text(rect.min+egui::vec2(8.0,8.0),egui::Align2::LEFT_TOP,&self.command_preview,egui::TextStyle::Monospace.resolve(ui.style()),ui.visuals().text_color());
+                                    if response.hovered(){ egui::show_tooltip(ui.ctx(),egui::Id::new("cmd_prev_tip2"),|ui|{ui.label(format!("Bias -> net={} live={} file={}",n,l,f));}); }
+                                });
+                                ui.collapsing("MPV Optionen", |ui| {
+                                    if !self.has_mpv { ui.colored_label(egui::Color32::RED, "mpv nicht installiert"); }
+                                    let mut extra = draft.mpv_extra_args.clone(); if ui.add(egui::TextEdit::singleline(&mut extra).hint_text("extra mpv args")).changed(){ draft.mpv_extra_args=extra; }
+                                    ui.horizontal(|ui| {
+                                        let mut cache_override = draft.mpv_cache_secs_override.to_string(); if ui.add(egui::TextEdit::singleline(&mut cache_override).hint_text("cache-secs (0 auto)")).changed(){ draft.mpv_cache_secs_override=cache_override.parse().unwrap_or(0);} 
+                                        let mut ra_override = draft.mpv_readahead_secs_override.to_string(); if ui.add(egui::TextEdit::singleline(&mut ra_override).hint_text("readahead (0 auto)")).changed(){ draft.mpv_readahead_secs_override=ra_override.parse().unwrap_or(0);} 
+                                    });
+                                });
+                                ui.add_enabled_ui(!draft.use_mpv, |ui| {
+                                    ui.collapsing("VLC Diagnose", |ui| {
+                                        ui.horizontal(|ui| {
+                                            let mut verbose=draft.vlc_verbose; if ui.checkbox(&mut verbose,"Verbose").changed(){draft.vlc_verbose=verbose;}
+                                            let mut diag_once=draft.vlc_diagnose_on_start; if ui.checkbox(&mut diag_once,"Once").changed(){draft.vlc_diagnose_on_start=diag_once;}
+                                            let mut cont=draft.vlc_continuous_diagnostics; if ui.checkbox(&mut cont,"Continuous").changed(){draft.vlc_continuous_diagnostics=cont;}
+                                            if draft.vlc_continuous_diagnostics { if ui.button("Stop").clicked(){ let _=self.tx.send(Msg::StopDiagnostics); } }
+                                        });
+                                        if let Some(suggestion)=self.vlc_diag_suggestion { ui.horizontal(|ui| { ui.label(format!("Suggestion net={} live={} file={}",suggestion.0,suggestion.1,suggestion.2)); if ui.button("Apply").clicked(){ draft.vlc_network_caching_ms=suggestion.0; draft.vlc_live_caching_ms=suggestion.1; draft.vlc_file_caching_ms=suggestion.2; let ts=std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_secs(); let entry=format!("{}:{}:{}:{}",ts,suggestion.0,suggestion.1,suggestion.2); let mut parts:Vec<String>=draft.vlc_diag_history.split(';').filter(|s|!s.is_empty()).map(|s|s.to_string()).collect(); parts.push(entry); if parts.len()>10 { let overflow=parts.len()-10; parts.drain(0..overflow);} draft.vlc_diag_history=parts.join(";"); } }); }
+                                        if !draft.vlc_diag_history.trim().is_empty(){ ui.collapsing("History",|ui|{ for seg in draft.vlc_diag_history.split(';').filter(|s|!s.is_empty()).rev(){ let cols:Vec<&str>=seg.split(':').collect(); if cols.len()==4 { ui.label(format!("ts={} net={} live={} file={}",cols[0],cols[1],cols[2],cols[3])); } } }); }
+                                    });
+                                });
                             });
                             
-                            ui.label("Download directory");
-                            ui.add(
-                                egui::TextEdit::multiline(&mut draft.download_dir)
-                                    .desired_rows(1)
-                                    .desired_width(f32::INFINITY)
-                            );
-                            if draft.download_dir.trim().is_empty() {
-                                ui.weak("Will default to ~/Downloads/macxtreamer");
-                            }
+                            ui.collapsing("💾 Downloads", |ui| {
+                                ui.label("Download directory");
+                                ui.add(egui::TextEdit::singleline(&mut draft.download_dir).desired_width(f32::INFINITY));
+                                if draft.download_dir.trim().is_empty(){ ui.weak("Default: ~/Downloads/macxtreamer"); }
+                                let mut enable = draft.enable_downloads; if ui.checkbox(&mut enable, "Enable Downloads").changed(){ draft.enable_downloads=enable; }
+                                ui.horizontal(|ui| { ui.label("Max parallel:"); let mut mp = if draft.max_parallel_downloads==0 {1}else{draft.max_parallel_downloads} as f32; if ui.add(egui::Slider::new(&mut mp,1.0..=5.0).integer()).changed(){ draft.max_parallel_downloads=mp as u32; }});
+                            });
                             
                             ui.add_space(8.0);
                             ui.heading("🎬 Player Einstellungen");
@@ -3159,41 +3244,13 @@ impl eframe::App for MacXtreamer {
                                 if self.has_vlc { if let Some(v)=&self.vlc_version { ui.label(egui::RichText::new(format!("vlc: {}", v)).small()); }} else { ui.label(egui::RichText::new("vlc: not found").small()); }
                                 let mut low = draft.low_cpu_mode;
                                 if ui.checkbox(&mut low, "Low CPU Mode").on_hover_text("Reduziert Repaints & drosselt Diagnose-Thread").changed() { draft.low_cpu_mode = low; }
+                                let mut ultra = draft.ultra_low_flicker_mode;
+                                if ui.checkbox(&mut ultra, "Ultra Flicker Guard").on_hover_text("Noch weniger Repaints (nur bei Events/Heartbeat) – kann UI-Verzögerung erhöhen").changed() { draft.ultra_low_flicker_mode = ultra; }
                             });
 
                             // MPV Abschnitt
-                            ui.collapsing("MPV Optionen", |ui| {
-                                if !self.has_mpv { ui.colored_label(egui::Color32::RED, "mpv nicht installiert – brew install mpv"); }
-                                let mut extra = draft.mpv_extra_args.clone();
-                                let te = egui::TextEdit::singleline(&mut extra).hint_text("Zusätzliche mpv Argumente");
-                                if ui.add(te).changed() { draft.mpv_extra_args = extra; }
-                                ui.horizontal(|ui| {
-                                    let mut cache_override = draft.mpv_cache_secs_override.to_string();
-                                    let ro_cache = egui::TextEdit::singleline(&mut cache_override).hint_text("cache-secs override (0 auto)");
-                                    if ui.add(ro_cache).changed() { draft.mpv_cache_secs_override = cache_override.parse().unwrap_or(0); }
-                                    let mut ra_override = draft.mpv_readahead_secs_override.to_string();
-                                    let ro_ra = egui::TextEdit::singleline(&mut ra_override).hint_text("readahead override (0 auto)");
-                                    if ui.add(ro_ra).changed() { draft.mpv_readahead_secs_override = ra_override.parse().unwrap_or(0); }
-                                });
-                                ui.horizontal(|ui| {
-                                    if ui.button("Low-Latency Preset").clicked() {
-                                        draft.mpv_extra_args = "--profile=low-latency --video-sync=display-resample --interpolation --no-cache".into();
-                                    }
-                                    if ui.button("Reset").clicked() { draft.mpv_extra_args.clear(); }
-                                });
-                                ui.label("Hinweis: network/live/file caching Bias wird auf mpv cache-secs / demuxer-readahead gemappt.");
-                            });
-                            ui.collapsing("Kommando Vorschau", |ui| {
-                                let (n,l,f) = crate::player::apply_bias(&draft);
-                                ui.code(&self.command_preview).on_hover_text(format!("Bias angewandt -> network={}ms live={}ms file={}ms", n,l,f));
-                                if let Some(p)=&self.detected_vlc_path { ui.label(egui::RichText::new(format!("VLC Pfad: {}", p)).small()); }
-                                if let Some(p)=&self.detected_mpv_path { ui.label(egui::RichText::new(format!("mpv Pfad: {}", p)).small()); }
-                                if !self.last_spawn_durations.is_empty() {
-                                    ui.separator();
-                                    ui.label("Letzte Spawns:");
-                                    for (p,d) in self.last_spawn_durations.iter().rev().take(5) { ui.label(format!("{}: {} ms", p,d)); }
-                                }
-                            });
+                            // (MPV Optionen moved inside Player collapsing)
+                            // (Preview moved inside Player collapsing)
 
                             // VLC Abschnitt ausgegraut wenn MPV aktiv
                             ui.add_enabled_ui(!draft.use_mpv, |ui| {
@@ -3244,17 +3301,7 @@ impl eframe::App for MacXtreamer {
                                     });
                                 });
                             });
-                            ui.horizontal(|ui| {
-                                ui.label("Latency/Stability Bias");
-                                let mut bias = draft.vlc_profile_bias.min(100) as i32;
-                                if ui.add(egui::Slider::new(&mut bias, 0..=100).show_value(true)).changed() {
-                                    draft.vlc_profile_bias = bias as u32;
-                                }
-                                ui.weak("0 = minimale Latenz, 100 = maximale Stabilität");
-                            });
-                            if ui.button("Apply Bias to Command").on_hover_text("Regeneriert VLC Kommando mit aktuellem Bias").clicked() {
-                                draft.player_command = crate::player::get_vlc_command_for_stream_type(crate::player::StreamType::Default, &draft);
-                            }
+                            // (Bias controls moved into Player collapsing)
                             
                             ui.horizontal_wrapped(|ui| {
                         if ui
@@ -3409,8 +3456,8 @@ impl eframe::App for MacXtreamer {
                             draft.font_scale = fs;
                         }
                     });
-                    ui.separator();
-                    ui.label("VLC buffer settings");
+                    ui.collapsing("🧮 Buffering & Caching", |ui| {
+                        ui.label("VLC buffer settings");
                     ui.horizontal(|ui| {
                         ui.label("Network caching (ms)");
                         let mut network = if draft.vlc_network_caching_ms == 0 { 10000 } else { draft.vlc_network_caching_ms } as i32;
@@ -3432,29 +3479,10 @@ impl eframe::App for MacXtreamer {
                             draft.vlc_prefetch_buffer_bytes = prefetch as u64;
                         }
                     });
-                    ui.horizontal(|ui| {
-                        let mut enable_downloads = draft.enable_downloads;
-                        if ui
-                            .checkbox(&mut enable_downloads, "Enable Downloads")
-                            .on_hover_text("Show download buttons and enable downloading functionality")
-                            .changed()
-                        {
-                            draft.enable_downloads = enable_downloads;
-                        }
-                    });
-                    ui.horizontal(|ui| {
-                        ui.label("Max parallel downloads:");
-                        let mut max_downloads = if draft.max_parallel_downloads == 0 { 1 } else { draft.max_parallel_downloads } as f32;
-                        if ui.add(egui::Slider::new(&mut max_downloads, 1.0..=5.0).integer().text("downloads"))
-                            .on_hover_text("Maximum number of simultaneous downloads (1-5)")
-                            .changed()
-                        {
-                            draft.max_parallel_downloads = max_downloads as u32;
-                        }
                     });
                     
-                    ui.separator();
-                    ui.label("🤖 Wisdom-Gate AI Empfehlungen");
+                    ui.collapsing("🧠 AI Empfehlungen", |ui| {
+                    ui.label("🤖 Wisdom-Gate AI");
                     ui.horizontal(|ui| {
                         ui.label("API Key:");
                         ui.add(
@@ -3494,6 +3522,7 @@ impl eframe::App for MacXtreamer {
                             draft.wisdom_gate_prompt = crate::models::default_wisdom_gate_prompt();
                         }
                         ui.weak("Tipp: Frage nach aktuellen Filmen und Serien");
+                    });
                     });
                     
                     ui.horizontal(|ui| {
@@ -3595,136 +3624,8 @@ impl eframe::App for MacXtreamer {
             self.config_draft = None;
         }
 
-        // Downloads window (queue)
-        if self.show_downloads {
-            let mut open = self.show_downloads;
-            // Beim Öffnen einen Scan initiieren (throttled)
-            if open {
-                self.scan_download_directory();
-            }
-            egui::Window::new("Downloads")
-                .default_width(620.0)
-                .default_height(400.0)
-                .open(&mut open)
-                .show(ctx, |ui| {
-                    ui.horizontal(|ui| {
-                        ui.label(format!("Active: {}", self.active_downloads()));
-                        ui.label(format!(
-                            "Waiting: {}",
-                            self.downloads.values().filter(|s| s.waiting).count()
-                        ));
-                        ui.label(format!(
-                            "Finished: {}",
-                            self.downloads
-                                .values()
-                                .filter(|s| s.finished && s.error.is_none())
-                                .count()
-                        ));
-                        if ui.small_button("Clear finished").clicked() {
-                            self.downloads
-                                .retain(|_, s| !s.finished || s.error.is_some());
-                            self.download_order
-                                .retain(|id| self.downloads.contains_key(id));
-                        }
-                    });
-                    ui.separator();
-                    let order_snapshot: Vec<String> = self.download_order.clone();
-                    egui::ScrollArea::vertical().show(ui, |ui| {
-                        for id in order_snapshot {
-                            let (
-                                meta_name,
-                                waiting,
-                                finished,
-                                error_opt,
-                                frac_opt,
-                                received_kb,
-                                total_known,
-                                path_opt,
-                                cancel_flag,
-                                size_opt,
-                                modified_opt,
-                            ) = if let (Some(meta), Some(st)) =
-                                (self.download_meta.get(&id), self.downloads.get(&id))
-                            {
-                                let frac =
-                                    st.total.map(|t| (st.received as f32 / t as f32).min(1.0));
-                                (
-                                    meta.name.clone(),
-                                    st.waiting,
-                                    st.finished,
-                                    st.error.clone(),
-                                    frac,
-                                    st.received / 1024,
-                                    st.total.is_some(),
-                                    st.path.clone(),
-                                    st.cancel_flag.clone(),
-                                    meta.size,
-                                    meta.modified,
-                                )
-                            } else {
-                                continue;
-                            };
-                            let is_done_ok = finished && error_opt.is_none();
-                            ui.horizontal(|ui| {
-                                ui.label(format!("{} ({})", meta_name, id));
-                                if let Some(sz) = size_opt {
-                                    ui.weak(format_file_size(Some(sz)));
-                                }
-                                if waiting {
-                                    ui.weak("waiting");
-                                } else if finished {
-                                    if let Some(err) = error_opt.as_ref() {
-                                        ui.label(colored_text_by_type(&format!("error: {}", err), "error"));
-                                    } else {
-                                        ui.label(colored_text_by_type("done", "success"));
-                                    }
-                                } else {
-                                    let frac = frac_opt.unwrap_or(0.0);
-                                    let pct = if total_known {
-                                        format!("{:.0}%", frac * 100.0)
-                                    } else {
-                                        format!("{} KB", received_kb)
-                                    };
-                                    ui.add(
-                                        egui::ProgressBar::new(frac).desired_width(160.0).text(pct),
-                                    );
-                                    if let Some(flag) = &cancel_flag {
-                                        if ui.small_button("Cancel").clicked() {
-                                            flag.store(true, Ordering::Relaxed);
-                                        }
-                                    }
-                                }
-                                if is_done_ok {
-                                    if let Some(p) = &path_opt {
-                                        if ui.small_button("Play").clicked() {
-                                            let uri = file_path_to_uri(Path::new(p));
-                                            let _ = start_player(&self.config, &uri);
-                                        }
-                                        if ui
-                                            .small_button("Delete")
-                                            .on_hover_text("Remove local file")
-                                            .clicked()
-                                        {
-                                            if let Err(e) = std::fs::remove_file(p) {
-                                                self.last_error =
-                                                    Some(format!("Failed to delete: {}", e));
-                                            } else {
-                                                self.scan_download_directory();
-                                            }
-                                        }
-                                    }
-                                    if let Some(mt) = modified_opt {
-                                        if let Ok(delta) = mt.elapsed() {
-                                            ui.weak(format!("{}m ago", delta.as_secs() / 60));
-                                        }
-                                    }
-                                }
-                            });
-                        }
-                    });
-                });
-            self.show_downloads = open;
-        }
+        // Separate Downloads Fenster entfällt durch Inline-Spalte; Flag wird ignoriert
+        self.show_downloads = false;
 
         // Confirmation window for bulk series download
         if let Some((series_id, series_name)) = self.confirm_bulk.clone() {

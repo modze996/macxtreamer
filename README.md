@@ -9,7 +9,8 @@ A lightweight macOS client (Rust, eframe/egui) for Xtream APIs. It preloads cate
 - Search (Enter to start), background index
 - Startup preload of categories/items/covers
 - Disk cover cache with TTL and parallel downloads
-- Recently played and Favorites persistence
+- Recently played, Favorites and inline Downloads column (bottom panel now 3 Spalten)
+- Automatic local file preference when playing already downloaded items (MPV/VLC nutzen lokale Datei statt Stream)
 - Light/Dark theme, increased default font size
 
 ## Prerequisites
@@ -89,7 +90,8 @@ If `vlc` is not in PATH, use the full path, e.g.:
 ## Usage
 - Top: Categories (Live/VOD/Series). Click to load items.
 - Middle: Table with cover, details and actions. Series open an episode list.
-- Bottom: Recently played and Favorites.
+- Bottom: Three columns: Recently played, Favorites, Downloads (progress, play & delete).
+- Downloads: Enable in Settings; finished files werden bevorzugt lokal abgespielt (kein erneuter Stream-Aufruf).
 - Search: Type text and press Enter (or click “Search”).
 - Preload: On startup, categories/items/covers are prefetched in the background.
 
