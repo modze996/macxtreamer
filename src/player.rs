@@ -1,5 +1,7 @@
 use std::process::Command;
 use std::process::Stdio;
+use std::path::Path;
+use std::sync::OnceLock;
 use crate::models::Config;
 use crate::logger::{log_line, log_command, log_error};
 
@@ -96,7 +98,7 @@ pub fn get_vlc_command_for_stream_type(st: StreamType, cfg:&Config) -> String {
 
 fn probe_vlc_supported_flags() -> Vec<String> {
     let mut base = vec!["--fullscreen".into(), "--network-caching".into(), "--live-caching".into(), "--file-caching".into(), "--http-reconnect".into()];
-    if let Ok(out) = Command::new("vlc").arg("-H").stdout(Stdio::piped()).stderr(Stdio::null()).output() {
+    if let Ok(out) = spawn_player_capture("vlc", &["-H"]) {
         if let Ok(s) = String::from_utf8(out.stdout) {
             for line in s.lines() { let l=line.trim(); if l.starts_with("--") { let flag=l.split_whitespace().next().unwrap_or("").to_string(); if !base.iter().any(|x| x==&flag) { base.push(flag); } } }
         }
@@ -133,8 +135,27 @@ fn build_vlc_args(cfg: &Config, st: StreamType) -> Vec<String> {
 /// Startet einen Player für die gegebene URL. Bevorzugt mpv (falls konfiguriert), sonst VLC.
 /// Bei Live-Streams mit aktiviertem Auto-Retry wird mpv bei frühem EOF erneut gestartet.
 pub fn start_player(cfg: &Config, url: &str) -> Result<(), String> {
+    log_line(&format!("🎬 Starte Player für URL: {} (Stream-Typ: {:?})", url, detect_stream_type(url)));
+    
+    // Prüfe PATH und verfügbare Player
+    let mpv_available = check_player_availability("mpv");
+    let vlc_available = check_player_availability("vlc");
+    log_line(&format!("Player verfügbar: mpv={}, vlc={}", mpv_available, vlc_available));
+    
+    if !mpv_available && !vlc_available {
+        let error_msg = "❌ Kein Player verfügbar! Bitte installiere VLC oder mpv.";
+        log_line(error_msg);
+        if let Some(tx) = crate::GLOBAL_TX.get() {
+            let _ = tx.send(crate::app_state::Msg::PlayerSpawnFailed { 
+                player: "System".into(), 
+                error: error_msg.into() 
+            });
+        }
+        return Err(error_msg.into());
+    }
+    
     let st = detect_stream_type(url);
-    if cfg.use_mpv {
+    if cfg.use_mpv && mpv_available {
         // mpv Argumente vorbereiten und dann in Hintergrund-Thread starten, um UI nicht zu blockieren.
         let (net_ms, live_ms, _file_ms) = apply_bias(cfg);
         let cache_secs = if cfg.mpv_cache_secs_override != 0 { cfg.mpv_cache_secs_override } else { (net_ms / 1000).max(1) };
@@ -163,7 +184,7 @@ pub fn start_player(cfg: &Config, url: &str) -> Result<(), String> {
             // Sicherstellen dass die URL ganz am Ende bleibt (falls Filter Reihenfolge geändert hat)
             // Sicherstellen dass URL letztes Argument ist (ohne Borrow-Konflikte)
             let orig_url_opt = base_args.iter()
-                .find(|s| !s.starts_with("--") && (s.starts_with("http://") || s.starts_with("https://")))
+                .find(|s| !s.starts_with("--") && (s.starts_with("http://") || s.starts_with("https://") || s.starts_with("file://") || Path::new(s).exists()))
                 .cloned();
             if let Some(orig_url) = orig_url_opt {
                 if let Some(last) = base_args.last() {
@@ -175,7 +196,7 @@ pub fn start_player(cfg: &Config, url: &str) -> Result<(), String> {
                     }
                 }
             }
-            if !base_args.iter().any(|s| s.starts_with("http://") || s.starts_with("https://")) {
+            if !base_args.iter().any(|s| s.starts_with("http://") || s.starts_with("https://") || s.starts_with("file://") || Path::new(s).exists()) {
                 log_line("Warnung: mpv Argumentliste enthält keine URL – Abbruch und VLC Fallback");
                 let st_fb = detect_stream_type(&url_string);
                 let args_fb = build_vlc_args(&cfg_clone, st_fb);
@@ -184,7 +205,7 @@ pub fn start_player(cfg: &Config, url: &str) -> Result<(), String> {
                 let mut final_fb = filtered_fb;
                 final_fb.push(url_string.clone());
                 log_command("vlc", &final_fb);
-                let _ = Command::new("vlc").args(&final_fb).stdout(Stdio::null()).stderr(Stdio::null()).spawn();
+                let _ = spawn_player("vlc", &final_fb);
                 return;
             }
             let attempt_live_retry = cfg_clone.mpv_live_auto_retry && matches!(st, StreamType::Live);
@@ -236,7 +257,20 @@ pub fn start_player(cfg: &Config, url: &str) -> Result<(), String> {
                 }
             }
             // Fallback VLC
-            log_line("Fallback zu VLC (mpv fehlgeschlagen oder früh beendet)...");
+            log_line("🔄 Fallback zu VLC (mpv fehlgeschlagen oder früh beendet)...");
+            
+            // Prüfe VLC Verfügbarkeit vor Fallback
+            if !check_player_availability("vlc") {
+                log_line("❌ VLC Fallback nicht möglich - VLC nicht verfügbar");
+                if let Some(tx) = crate::GLOBAL_TX.get() {
+                    let _ = tx.send(crate::app_state::Msg::PlayerSpawnFailed { 
+                        player: "VLC-Fallback".into(), 
+                        error: "VLC für Fallback nicht verfügbar".into() 
+                    });
+                }
+                return;
+            }
+            
             let st_fb = detect_stream_type(&url_string);
             let args_fb = build_vlc_args(&cfg_clone, st_fb);
             let supported_fb = probe_vlc_supported_flags();
@@ -244,17 +278,46 @@ pub fn start_player(cfg: &Config, url: &str) -> Result<(), String> {
             let mut final_fb = filtered_fb;
             final_fb.push(url_string.clone());
             log_command("vlc", &final_fb);
-            let _ = Command::new("vlc").args(&final_fb).stdout(Stdio::null()).stderr(Stdio::null()).spawn();
+            
+            match spawn_player("vlc", &final_fb) {
+                Ok(child) => {
+                    log_line(&format!("✅ VLC Fallback erfolgreich gestartet (PID: {:?})", child.id()));
+                }
+                Err(e) => {
+                    let error_msg = format!("❌ VLC Fallback fehlgeschlagen: {}", e);
+                    log_line(&error_msg);
+                    if let Some(tx) = crate::GLOBAL_TX.get() {
+                        let _ = tx.send(crate::app_state::Msg::PlayerSpawnFailed { 
+                            player: "VLC-Fallback".into(), 
+                            error: error_msg 
+                        });
+                    }
+                }
+            }
         });
         return Ok(()); // Sofort zurück – UI bleibt responsiv
     }
 
     // VLC Pfad
+    log_line(&format!("🎬 Verwende VLC für Stream-Typ: {:?}", st));
     let args = build_vlc_args(cfg, st);
     let supported = probe_vlc_supported_flags();
     let filtered = filter_supported(&args, &supported);
     let mut final_args = filtered;
     final_args.push(url.to_string());
+    
+    if !vlc_available {
+        let error_msg = "❌ VLC nicht verfügbar aber als Fallback angefordert";
+        log_line(error_msg);
+        if let Some(tx) = crate::GLOBAL_TX.get() {
+            let _ = tx.send(crate::app_state::Msg::PlayerSpawnFailed { 
+                player: "VLC".into(), 
+                error: error_msg.into() 
+            });
+        }
+        return Err(error_msg.into());
+    }
+    
     log_command("vlc", &final_args);
 
     #[cfg(target_os = "macos")]
@@ -267,8 +330,9 @@ pub fn start_player(cfg: &Config, url: &str) -> Result<(), String> {
         }
     }
 
-    match Command::new("vlc").args(&final_args).stdout(Stdio::null()).stderr(Stdio::null()).spawn() {
-        Ok(_) => {
+    match spawn_player("vlc", &final_args) {
+        Ok(child) => {
+            log_line(&format!("✅ VLC erfolgreich gestartet (PID: {:?})", child.id()));
             if cfg.vlc_diagnose_on_start { spawn_vlc_diagnostics(url, cfg); }
             // Continuous Diagnostics nur starten wenn explizit aktiviert und Live
             if cfg.vlc_continuous_diagnostics && matches!(st, StreamType::Live) {
@@ -279,17 +343,31 @@ pub fn start_player(cfg: &Config, url: &str) -> Result<(), String> {
             }
             Ok(())
         }
-        Err(e) => Err(format!("VLC konnte nicht gestartet werden: {}", e))
+        Err(e) => {
+            let error_msg = format!("❌ VLC konnte nicht gestartet werden: {} (PATH: {:?})", e, std::env::var("PATH"));
+            log_line(&error_msg);
+            if let Some(tx) = crate::GLOBAL_TX.get() {
+                let _ = tx.send(crate::app_state::Msg::PlayerSpawnFailed { 
+                    player: "VLC".into(), 
+                    error: error_msg.clone() 
+                });
+            }
+            Err(error_msg)
+        }
     }
 }
 
+static MPV_SUPPORTED_OPTIONS: OnceLock<Vec<String>> = OnceLock::new();
+
 fn probe_mpv_supported_options() -> Vec<String> {
-    if let Ok(out) = Command::new("mpv").arg("--list-options").stdout(Stdio::piped()).stderr(Stdio::null()).output() {
+    if let Some(cached) = MPV_SUPPORTED_OPTIONS.get() { return cached.clone(); }
+    let list = if let Ok(out) = spawn_player_capture("mpv", &["--list-options"]) {
         if let Ok(s) = String::from_utf8(out.stdout) {
-            return s.lines().filter_map(|l| l.split_whitespace().next()).map(|w| w.trim().to_string()).filter(|w| w.starts_with("--")).collect();
-        }
-    }
-    Vec::new()
+            s.lines().filter_map(|l| l.split_whitespace().next()).map(|w| w.trim().to_string()).filter(|w| w.starts_with("--")).collect()
+        } else { Vec::new() }
+    } else { Vec::new() };
+    let _ = MPV_SUPPORTED_OPTIONS.set(list.clone());
+    list
 }
 
 fn filter_mpv_supported(args: &[String], supported: &[String]) -> Vec<String> {
@@ -310,7 +388,7 @@ fn filter_mpv_supported(args: &[String], supported: &[String]) -> Vec<String> {
 
 fn spawn_vlc_diagnostics(url: &str, cfg: &Config) {
     let diag_args = ["--fullscreen", url];
-    let mut cmd = Command::new("vlc");
+    let mut cmd = build_player_command("vlc");
     if cfg.vlc_verbose { cmd.arg("-vvv"); }
     for a in &diag_args { cmd.arg(a); }
     match cmd.stdout(Stdio::piped()).stderr(Stdio::piped()).spawn() {
@@ -332,7 +410,7 @@ fn spawn_vlc_diagnostics(url: &str, cfg: &Config) {
 
 fn spawn_vlc_continuous_diagnostics(tx: std::sync::mpsc::Sender<crate::app_state::Msg>, url: String, cfg: Config, stop: std::sync::Arc<std::sync::atomic::AtomicBool>) {
     std::thread::spawn(move || {
-        let mut cmd = Command::new("vlc");
+        let mut cmd = build_player_command("vlc");
         if cfg.vlc_verbose { cmd.arg("-vvv"); }
         cmd.arg("--fullscreen").arg(&url);
         cmd.stdout(Stdio::piped()).stderr(Stdio::piped());
@@ -402,6 +480,115 @@ fn send_url_to_vlc(url: &str) -> bool {
     match Command::new("osascript").arg("-e").arg(script2).status() {
         Ok(s) => s.success(),
         Err(_) => false,
+    }
+}
+
+/// Prüft ob ein Player im System verfügbar ist
+fn check_player_availability(player: &str) -> bool {
+    log_line(&format!("🔍 Prüfe {} Verfügbarkeit...", player));
+    
+    // Erst via which prüfen
+    if let Ok(output) = Command::new("which").arg(player).output() {
+        if output.status.success() {
+            if let Ok(path) = String::from_utf8(output.stdout) {
+                let path = path.trim();
+                log_line(&format!("✅ {} gefunden via 'which': {}", player, path));
+                return true;
+            }
+        }
+    }
+    
+    // Fallback Pfade prüfen
+    let common_paths = match player {
+        "mpv" => vec![
+            "/usr/local/bin/mpv",
+            "/opt/homebrew/bin/mpv",
+            "/usr/bin/mpv",
+            "/Applications/mpv.app/Contents/MacOS/mpv"
+        ],
+        "vlc" => vec![
+            "/usr/local/bin/vlc",
+            "/opt/homebrew/bin/vlc",
+            "/usr/bin/vlc",
+            "/Applications/VLC.app/Contents/MacOS/VLC"
+        ],
+        _ => vec![]
+    };
+    
+    for path in common_paths {
+        if std::path::Path::new(path).exists() {
+            log_line(&format!("✅ {} gefunden unter: {}", player, path));
+            return true;
+        }
+    }
+    
+    // Letzte Prüfung: Versuche direkten Start mit --version
+    if let Ok(output) = spawn_player_capture(player, &["--version"]) {
+        if output.status.success() {
+            log_line(&format!("✅ {} reagiert auf --version", player));
+            return true;
+        }
+    }
+    
+    log_line(&format!("❌ {} nicht verfügbar", player));
+    false
+}
+
+// ——— macOS App-Bundle kompatibler Player-Start ———
+// Nutzt absolute Pfade, wenn vorhanden; sonst "open -a <App> --args ...".
+fn resolve_player_path(player: &str) -> Option<String> {
+    let candidates = match player {
+        "mpv" => vec![
+            "/opt/homebrew/bin/mpv",
+            "/usr/local/bin/mpv",
+            "/usr/bin/mpv",
+            "/Applications/mpv.app/Contents/MacOS/mpv",
+        ],
+        "vlc" => vec![
+            "/opt/homebrew/bin/vlc",
+            "/usr/local/bin/vlc",
+            "/usr/bin/vlc",
+            "/Applications/VLC.app/Contents/MacOS/VLC",
+        ],
+        _ => vec![],
+    };
+    for c in candidates {
+        if Path::new(c).exists() { return Some(c.to_string()); }
+    }
+    None
+}
+
+fn build_player_command(player: &str) -> Command {
+    if let Some(path) = resolve_player_path(player) {
+        Command::new(path)
+    } else {
+        // Fallback: macOS "open -a" mit App-Namen
+        let app_name = if player.eq_ignore_ascii_case("vlc") { "VLC" } else { "mpv" };
+        let mut cmd = Command::new("open");
+        cmd.arg("-a").arg(app_name).arg("--args");
+        cmd
+    }
+}
+
+fn spawn_player(player: &str, args: &[String]) -> std::io::Result<std::process::Child> {
+    if let Some(path) = resolve_player_path(player) {
+        Command::new(path).args(args).stdout(Stdio::null()).stderr(Stdio::null()).spawn()
+    } else {
+        let app_name = if player.eq_ignore_ascii_case("vlc") { "VLC" } else { "mpv" };
+        // open -a App --args <args...>
+        let mut parts: Vec<String> = Vec::new();
+        parts.push("-a".into()); parts.push(app_name.into()); parts.push("--args".into());
+        parts.extend(args.iter().cloned());
+        Command::new("open").args(&parts).stdout(Stdio::null()).stderr(Stdio::null()).spawn()
+    }
+}
+
+fn spawn_player_capture(player: &str, args: &[&str]) -> std::io::Result<std::process::Output> {
+    if let Some(path) = resolve_player_path(player) {
+        Command::new(path).args(args).stdout(Stdio::piped()).stderr(Stdio::null()).output()
+    } else {
+        // Wenn kein Pfad vorhanden ist, liefern wir NotFound.
+        Err(std::io::Error::new(std::io::ErrorKind::NotFound, format!("{} nicht gefunden", player)))
     }
 }
 

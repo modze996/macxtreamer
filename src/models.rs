@@ -1,10 +1,39 @@
 use serde::{Deserialize, Serialize};
 
-#[derive(Default, Debug, Clone, Serialize, Deserialize)]
-pub struct Config {
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ServerProfile {
+    pub name: String,
     pub address: String,
     pub username: String,
     pub password: String,
+}
+
+impl Default for ServerProfile {
+    fn default() -> Self {
+        Self {
+            name: "Default".to_string(),
+            address: String::new(),
+            username: String::new(),
+            password: String::new(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Config {
+    // Legacy fields for backward compatibility (will be migrated to profiles)
+    #[serde(default)]
+    pub address: String,
+    #[serde(default)]
+    pub username: String,
+    #[serde(default)]
+    pub password: String,
+    
+    // New multi-server support
+    #[serde(default)]
+    pub server_profiles: Vec<ServerProfile>,
+    #[serde(default)]
+    pub active_profile_index: usize,
     #[serde(default)]
     pub player_command: String,
     #[serde(default)]
@@ -60,6 +89,8 @@ pub struct Config {
     #[serde(default)]
     pub mpv_verbose: bool, // ausführliche stderr Ausgabe von mpv erfassen
     #[serde(default)]
+    pub mpv_custom_path: String, // manueller Pfad zu mpv falls nicht im PATH/AppBundle
+    #[serde(default)]
     pub download_dir: String,     // default ~/Downloads/macxtreamer
     #[serde(default)]
     pub cover_uploads_per_frame: u32, // default 3
@@ -82,6 +113,8 @@ pub struct Config {
     #[serde(default)]
     pub wisdom_gate_model: String,    // Model selection for Wisdom-Gate
     #[serde(default)]
+    pub wisdom_gate_endpoint: String, // API endpoint for Wisdom-Gate
+    #[serde(default)]
     pub wisdom_gate_cache_content: String,  // Cached recommendations content
     #[serde(default)]
     pub wisdom_gate_cache_timestamp: u64,   // Timestamp when cache was created (Unix timestamp)
@@ -101,7 +134,131 @@ pub struct Config {
     pub download_retry_delay_ms: u32, // Wartezeit zwischen Versuchen
 }
 
+impl Default for Config {
+    fn default() -> Self {
+        Self {
+            address: String::new(),
+            username: String::new(),
+            password: String::new(),
+            server_profiles: Vec::new(),  // Start with empty list - profiles will be loaded from config file
+            active_profile_index: 0,
+            player_command: String::new(),
+            theme: "dark".to_string(),
+            cover_ttl_days: 7,
+            cover_parallel: 6,
+            font_scale: 1.15,
+            reuse_vlc: true,
+            vlc_network_caching_ms: 8000,
+            vlc_live_caching_ms: 6000,
+            vlc_prefetch_buffer_bytes: 1024 * 1024,
+            vlc_file_caching_ms: 5000,
+            vlc_mux_caching_ms: 3000,
+            vlc_http_reconnect: true,
+            vlc_timeout_ms: 10000,
+            vlc_extra_args: String::new(),
+            vlc_profile_bias: 50,
+            vlc_verbose: false,
+            vlc_diagnose_on_start: false,
+            vlc_continuous_diagnostics: false,
+            use_mpv: false,
+            mpv_extra_args: String::new(),
+            mpv_cache_secs_override: 0,
+            mpv_readahead_secs_override: 0,
+            mpv_keep_open: false,
+            mpv_live_auto_retry: false,
+            mpv_live_retry_max: 3,
+            mpv_live_retry_delay_ms: 2000,
+            mpv_verbose: false,
+            mpv_custom_path: String::new(),
+            download_dir: String::new(),
+            cover_uploads_per_frame: 3,
+            cover_decode_parallel: 2,
+            texture_cache_limit: 512,
+            category_parallel: 6,
+            cover_height: 60.0,
+            enable_downloads: false,
+            max_parallel_downloads: 1,
+            wisdom_gate_api_key: String::new(),
+            wisdom_gate_prompt: default_wisdom_gate_prompt(),
+            wisdom_gate_model: "wisdom-ai-dsr1".to_string(), // Default Wisdom Gate Modell
+            wisdom_gate_endpoint: "https://wisdom-gate.juheapi.com/v1/chat/completions".to_string(),
+            wisdom_gate_cache_content: String::new(),
+            wisdom_gate_cache_timestamp: 0,
+            vlc_diag_history: String::new(),
+            low_cpu_mode: false,
+            ultra_low_flicker_mode: false,
+            bottom_panel_height: 200.0,
+            left_panel_width: 300.0,
+            download_retry_max: 3,
+            download_retry_delay_ms: 1000,
+        }
+    }
+}
+
 impl Config {
+    /// Get the currently active server profile
+    pub fn active_profile(&self) -> &ServerProfile {
+        if self.server_profiles.is_empty() {
+            // Should never happen, but provide a safe default
+            static DEFAULT: ServerProfile = ServerProfile {
+                name: String::new(),
+                address: String::new(),
+                username: String::new(),
+                password: String::new(),
+            };
+            return &DEFAULT;
+        }
+        let idx = self.active_profile_index.min(self.server_profiles.len() - 1);
+        &self.server_profiles[idx]
+    }
+    
+    /// Get mutable reference to currently active server profile
+    pub fn active_profile_mut(&mut self) -> &mut ServerProfile {
+        // Don't add a default profile here - it should be added during initialization
+        // If for some reason there are no profiles, return the first one after ensuring index is valid
+        if !self.server_profiles.is_empty() {
+            let idx = self.active_profile_index.min(self.server_profiles.len() - 1);
+            self.active_profile_index = idx; // Ensure index is valid
+            &mut self.server_profiles[idx]
+        } else {
+            // Emergency fallback - should never happen in normal operation
+            eprintln!("⚠️ WARNING: active_profile_mut() called with no profiles - this should not happen!");
+            self.server_profiles.push(ServerProfile::default());
+            self.active_profile_index = 0;
+            &mut self.server_profiles[0]
+        }
+    }
+    
+    /// Migrate legacy single-server config to profiles if needed
+    pub fn migrate_to_profiles(&mut self) {
+        // If we have legacy data but no profiles, migrate
+        if self.server_profiles.is_empty() && (!self.address.is_empty() || !self.username.is_empty()) {
+            self.server_profiles.push(ServerProfile {
+                name: "Imported".to_string(),
+                address: self.address.clone(),
+                username: self.username.clone(),
+                password: self.password.clone(),
+            });
+            self.active_profile_index = 0;
+        }
+        // Ensure at least one profile exists
+        if self.server_profiles.is_empty() {
+            self.server_profiles.push(ServerProfile::default());
+        }
+        // Sync active profile to legacy fields
+        self.sync_active_profile();
+    }
+    
+    /// Sync active profile data to legacy fields for API compatibility
+    pub fn sync_active_profile(&mut self) {
+        let addr = self.active_profile().address.clone();
+        let user = self.active_profile().username.clone();
+        let pass = self.active_profile().password.clone();
+        self.address = addr;
+        self.username = user;
+        self.password = pass;
+    }
+    
     /// Check if the cache is still valid (less than 24 hours old)
     pub fn is_wisdom_gate_cache_valid(&self) -> bool {
         if self.wisdom_gate_cache_content.is_empty() || self.wisdom_gate_cache_timestamp == 0 {

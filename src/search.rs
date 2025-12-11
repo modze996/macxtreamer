@@ -1,71 +1,96 @@
 use crate::models::{Item, SearchItem};
 
-/// Compute a simple Levenshtein distance (case-insensitive already handled outside)
-fn levenshtein(a: &str, b: &str) -> usize {
-    if a.is_empty() { return b.len(); }
-    if b.is_empty() { return a.len(); }
-    let mut prev: Vec<usize> = (0..=b.len()).collect();
-    let mut cur = vec![0; b.len()+1];
-    for (i, ca) in a.chars().enumerate() {
-        cur[0] = i + 1;
-        for (j, cb) in b.chars().enumerate() {
-            let cost = if ca == cb { 0 } else { 1 };
-            cur[j+1] = (prev[j+1] + 1)
-                .min(cur[j] + 1)
-                .min(prev[j] + cost);
-        }
-        std::mem::swap(&mut prev, &mut cur);
-    }
-    prev[b.len()]
-}
-
 /// Score a candidate string against the query.
-/// Higher is better. Substring matches get high base scores; distance adjusts otherwise.
+/// Higher is better. Only substring matches are allowed - no fuzzy matching.
 fn score_candidate(candidate: &str, query: &str) -> f64 {
     if query.is_empty() { return 0.0; }
     let c = candidate.to_lowercase();
     let q = query.to_lowercase();
+    
+    // Exact match - highest score
     if c == q { return 100.0; }
+    
+    // Starts with query - very high score  
     if c.starts_with(&q) { return 95.0; }
+    
+    // Contains query as substring - high score
     if c.contains(&q) { return 85.0; }
-    // Fuzzy fallback: use Levenshtein normalized
-    let dist = levenshtein(&c, &q) as f64;
-    let len = c.len().max(q.len()) as f64;
-    let similarity = 1.0 - (dist / len).min(1.0); // 0..1
-    // Scale into 0..70 range (below strict substring matches)
-    similarity * 70.0
+    
+    // No fuzzy matching - if query is not a substring, return 0
+    0.0
 }
 
 /// Aggregate best score across name and plot for an item.
 fn score_item(item: &Item, query: &str) -> f64 {
     let name_score = score_candidate(&item.name, query);
-    let plot_score = if item.plot.is_empty() { 0.0 } else { score_candidate(&item.plot, query) * 0.6 }; // plot weniger gewichten
+    
+    // Only consider plot if name doesn't match well enough
+    // This prevents items with query in plot but not in name from ranking too high
+    if name_score >= 85.0 {
+        return name_score; // Good name match, ignore plot
+    }
+    
+    let plot_score = if item.plot.is_empty() { 
+        0.0 
+    } else { 
+        score_candidate(&item.plot, query) * 0.4 // plot significantly less weighted
+    };
+    
     name_score.max(plot_score)
 }
 
 /// Fuzzy + substring search across movies and series.
 /// Returns sorted results (best score first) and filters out low quality matches.
-pub fn search_items(movies: &Vec<Item>, series: &Vec<Item>, text: &str) -> Vec<SearchItem> {
+pub fn search_items(movies: &Vec<Item>, series: &Vec<Item>, channels: &Vec<Item>, text: &str) -> Vec<SearchItem> {
     let query = text.trim();
     if query.is_empty() { return Vec::new(); }
-    let mut scored: Vec<(f64, &Item, &'static str)> = Vec::new();
+    
+    // Für sehr kurze Queries (<=2 Zeichen) nur einfache substring Suche (Performance + Erwartung)
+    if query.len() <= 2 { 
+        return legacy_substring(movies, series, channels, query); 
+    }
+    
+    // Use HashMap to deduplicate by ID and keep best score
+    let mut best_scores: std::collections::HashMap<String, (f64, &Item, &'static str)> = std::collections::HashMap::new();
+    
+    // Score all items and keep best score per ID
+    // Only items with score > 0 (substring match) are included
     for m in movies {
         let sc = score_item(m, query);
-        if sc >= 35.0 { // Schwelle für Relevanz
-            scored.push((sc, m, "Movie"));
+        if sc > 0.0 {
+            best_scores.entry(m.id.clone())
+                .and_modify(|e| { if sc > e.0 { *e = (sc, m, "Movie"); } })
+                .or_insert((sc, m, "Movie"));
         }
     }
     for s in series {
         let sc = score_item(s, query);
-        if sc >= 35.0 {
-            scored.push((sc, s, "Series"));
+        if sc > 0.0 {
+            best_scores.entry(s.id.clone())
+                .and_modify(|e| { if sc > e.0 { *e = (sc, s, "Series"); } })
+                .or_insert((sc, s, "Series"));
         }
     }
-    // Sort descending by score
+    for c in channels {
+        let sc = score_item(c, query);
+        if sc > 0.0 {
+            best_scores.entry(c.id.clone())
+                .and_modify(|e| { if sc > e.0 { *e = (sc, c, "Channel"); } })
+                .or_insert((sc, c, "Channel"));
+        }
+    }
+    
+    if best_scores.is_empty() {
+        // Fallback: alte substring Logik (kein Score Filter)
+        return legacy_substring(movies, series, channels, query);
+    }
+    
+    // Convert to vector and sort by score
+    let mut scored: Vec<(f64, &Item, &'static str)> = best_scores.into_iter().map(|(_, v)| v).collect();
     scored.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal));
-    // Limit extreme result sets (performance safeguard)
-    let max_results = 500; // arbitrary cap
-    scored.truncate(max_results);
+    scored.truncate(500);
+    
+    // Convert to SearchItems
     scored.into_iter().map(|(_sc, it, kind)| SearchItem {
         id: it.id.clone(),
         name: it.name.clone(),
@@ -77,4 +102,60 @@ pub fn search_items(movies: &Vec<Item>, series: &Vec<Item>, text: &str) -> Vec<S
         rating_5based: it.rating_5based,
         genre: it.genre.clone(),
     }).collect()
+}
+
+fn legacy_substring(movies: &Vec<Item>, series: &Vec<Item>, channels: &Vec<Item>, q: &str) -> Vec<SearchItem> {
+    let t = q.to_lowercase();
+    let mut seen_ids: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let mut out = Vec::new();
+    
+    for m in movies {
+        if (m.name.to_lowercase().contains(&t) || m.plot.to_lowercase().contains(&t)) 
+            && seen_ids.insert(m.id.clone()) {
+            out.push(SearchItem { 
+                id: m.id.clone(), 
+                name: m.name.clone(), 
+                info: "Movie".into(), 
+                container_extension: m.container_extension.clone(), 
+                cover: m.cover.clone(), 
+                year: m.year.clone(), 
+                release_date: m.release_date.clone(), 
+                rating_5based: m.rating_5based, 
+                genre: m.genre.clone() 
+            });
+        }
+    }
+    for s in series {
+        if (s.name.to_lowercase().contains(&t) || s.plot.to_lowercase().contains(&t))
+            && seen_ids.insert(s.id.clone()) {
+            out.push(SearchItem { 
+                id: s.id.clone(), 
+                name: s.name.clone(), 
+                info: "Series".into(), 
+                container_extension: s.container_extension.clone(), 
+                cover: s.cover.clone(), 
+                year: s.year.clone(), 
+                release_date: s.release_date.clone(), 
+                rating_5based: s.rating_5based, 
+                genre: s.genre.clone() 
+            });
+        }
+    }
+    for c in channels {
+        if (c.name.to_lowercase().contains(&t) || c.plot.to_lowercase().contains(&t))
+            && seen_ids.insert(c.id.clone()) {
+            out.push(SearchItem { 
+                id: c.id.clone(), 
+                name: c.name.clone(), 
+                info: "Channel".into(), 
+                container_extension: c.container_extension.clone(), 
+                cover: c.cover.clone(), 
+                year: c.year.clone(), 
+                release_date: c.release_date.clone(), 
+                rating_5based: c.rating_5based, 
+                genre: c.genre.clone() 
+            });
+        }
+    }
+    out
 }

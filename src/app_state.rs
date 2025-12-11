@@ -18,6 +18,16 @@ pub enum SortKey {
     Genre,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SearchStatus {
+    Idle,
+    Indexing { progress: String },
+    Searching,
+    NoResults,
+    Error(String),
+    Completed { results: usize },
+}
+
 #[derive(Debug, Clone)]
 pub enum Msg {
     // Category loading
@@ -51,11 +61,17 @@ pub enum Msg {
     IndexBuilt {
         movies: usize,
         series: usize,
+        channels: usize,
     },
+    IndexProgress { message: String },
     SearchReady(Vec<Row>),
+    SearchStarted,
+    SearchCompleted { results: usize },
+    SearchFailed { error: String },
     IndexData {
         movies: Vec<(Item, String)>,
         series: Vec<(Item, String)>,
+        channels: Vec<(Item, String)>,
     },
     
     // Preloading

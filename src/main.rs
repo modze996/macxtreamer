@@ -7,7 +7,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::time::{Duration, Instant};
-use tokio::io::AsyncReadExt;
+// removed unused AsyncReadExt import after refactor
 use tokio::sync::Semaphore;
 
 mod api;
@@ -25,8 +25,8 @@ mod storage;
 mod ui_helpers;
 
 use api::{fetch_categories, fetch_items, fetch_series_episodes};
-use app_state::{Msg, SortKey, ViewState};
-use cache::{clear_all_caches, file_age_secs, image_cache_path};
+use app_state::{Msg, SearchStatus, SortKey, ViewState};
+use cache::{clear_all_caches};
 use config::{read_config, save_config};
 use downloads::{BulkOptions, sanitize_filename};
 
@@ -86,14 +86,14 @@ struct ScannedDownload {
     size: u64,
     modified: std::time::SystemTime,
 }
-use images::image_meta_path;
+// use images::image_meta_path; // ungenutzt nach Bereinigung
 use logger::log_line;
 use models::{Category, Config, FavItem, Item, RecentItem, Row};
 use ui_helpers::{colored_text_by_type, render_loading_spinner, format_file_size, file_path_to_uri};
 use player::{build_url_by_type, start_player};
 use once_cell::sync::OnceCell;
 static GLOBAL_TX: OnceCell<Sender<Msg>> = OnceCell::new();
-use reqwest::header::{ETAG, IF_MODIFIED_SINCE, IF_NONE_MATCH, LAST_MODIFIED};
+// Entfernte Header-Imports (ETAG etc.) – nicht mehr genutzt
 use search::search_items;
 use storage::{add_to_recently, load_favorites, load_recently_played, toggle_favorite};
 
@@ -110,8 +110,97 @@ async fn main() -> Result<(), eframe::Error> {
     eframe::run_native(
         "MacXtreamer",
         options,
-        Box::new(|_cc| Box::new(MacXtreamer::new())),
+        Box::new(|cc| {
+            // Setup fonts with extended Unicode support
+            setup_custom_fonts(&cc.egui_ctx);
+            Box::new(MacXtreamer::new())
+        }),
     )
+}
+
+fn setup_custom_fonts(ctx: &egui::Context) {
+    use egui::FontFamily;
+    
+    let mut fonts = egui::FontDefinitions::default();
+    
+    // Load system fonts that support extended Unicode characters
+    #[cfg(target_os = "macos")]
+    {
+        let mut loaded_fonts = Vec::new();
+        
+        // Try to load Arial Unicode MS - has comprehensive Unicode coverage including modifier letters
+        if let Ok(font_data) = std::fs::read("/System/Library/Fonts/Supplemental/Arial Unicode.ttf") {
+            // Explicitly enable extended Unicode ranges including modifier letters (U+02B0-02FF)
+            // and other special characters
+            let font_data_with_tweak = egui::FontData::from_owned(font_data).tweak(
+                egui::FontTweak {
+                    scale: 1.0,
+                    y_offset_factor: 0.0,
+                    y_offset: 0.0,
+                    baseline_offset_factor: 0.0,
+                }
+            );
+            
+            fonts.font_data.insert("ArialUnicode".to_owned(), font_data_with_tweak);
+            fonts.families.get_mut(&FontFamily::Proportional).unwrap().insert(0, "ArialUnicode".to_owned());
+            fonts.families.get_mut(&FontFamily::Monospace).unwrap().insert(0, "ArialUnicode".to_owned());
+            loaded_fonts.push("Arial Unicode");
+        }
+        
+        // Also try Menlo which has good Unicode support
+        if let Ok(font_data) = std::fs::read("/System/Library/Fonts/Menlo.ttc") {
+            fonts.font_data.insert("Menlo".to_owned(), egui::FontData::from_owned(font_data));
+            fonts.families.get_mut(&FontFamily::Proportional).unwrap().push("Menlo".to_owned());
+            loaded_fonts.push("Menlo");
+        }
+        
+        // Helvetica as additional fallback
+        if let Ok(font_data) = std::fs::read("/System/Library/Fonts/Helvetica.ttc") {
+            fonts.font_data.insert("Helvetica".to_owned(), egui::FontData::from_owned(font_data));
+            fonts.families.get_mut(&FontFamily::Proportional).unwrap().push("Helvetica".to_owned());
+            loaded_fonts.push("Helvetica");
+        }
+        
+        if !loaded_fonts.is_empty() {
+            println!("✅ Fonts geladen: {}", loaded_fonts.join(", "));
+        } else {
+            println!("⚠️ Keine zusätzlichen Fonts geladen - Unicode-Zeichen könnten nicht korrekt dargestellt werden");
+        }
+    }
+    
+    #[cfg(not(target_os = "macos"))]
+    {
+        // For Linux/Windows, try common Unicode fonts
+        let unicode_fonts = [
+            "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
+            "/usr/share/fonts/TTF/DejaVuSans.ttf",
+            "C:\\Windows\\Fonts\\arial.ttf",
+            "C:\\Windows\\Fonts\\arialuni.ttf",
+            "C:\\Windows\\Fonts\\seguisym.ttf",
+        ];
+        
+        for font_path in &unicode_fonts {
+            if let Ok(font_data) = std::fs::read(font_path) {
+                let font_name = Path::new(font_path)
+                    .file_stem()
+                    .and_then(|s| s.to_str())
+                    .unwrap_or("Unicode");
+                fonts.font_data.insert(
+                    font_name.to_owned(),
+                    egui::FontData::from_owned(font_data)
+                );
+                fonts.families.get_mut(&FontFamily::Proportional).unwrap().insert(0, font_name.to_owned());
+                println!("✅ Font geladen: {}", font_name);
+                break;
+            }
+        }
+    }
+    
+    ctx.set_fonts(fonts);
+    
+    // Force immediate font atlas rebuild with full Unicode support
+    ctx.request_repaint();
+    println!("✅ Font-Konfiguration angewendet mit erweiterten Unicode-Bereichen");
 }
 
 struct MacXtreamer {
@@ -124,6 +213,7 @@ struct MacXtreamer {
     content_rows: Vec<Row>,
     all_movies: Vec<Item>,
     all_series: Vec<Item>,
+    all_channels: Vec<Item>,
     recently: Vec<RecentItem>,
     favorites: Vec<FavItem>,
 
@@ -142,12 +232,17 @@ struct MacXtreamer {
 
     // UI State
     search_text: String,
+    search_history: Vec<String>,
+    show_search_history: bool,
+    search_status: SearchStatus,
     is_loading: bool,
     loading_done: usize,
     loading_total: usize,
     last_error: Option<String>,
     show_config: bool,
     pending_save_config: bool,
+    show_server_manager: bool,
+    new_profile_name: String,
     selected_playlist: Option<usize>,
     selected_vod: Option<usize>,
     selected_series: Option<usize>,
@@ -185,7 +280,7 @@ struct MacXtreamer {
     current_view: Option<ViewState>,
     view_stack: Vec<ViewState>,
     wisdom_gate_recommendations: Option<String>,
-    wisdom_gate_last_fetch: Option<std::time::Instant>,
+    _wisdom_gate_last_fetch: Option<std::time::Instant>,
     vlc_diag_lines: VecDeque<String>,
     vlc_diag_suggestion: Option<(u32,u32,u32)>,
     has_vlc: bool,
@@ -202,6 +297,7 @@ struct MacXtreamer {
     avg_frame_ms: f32,
     last_forced_repaint: std::time::Instant,
     pending_repaint_due_to_msg: bool,
+    pending_player_redetect: bool,
 }
 
 impl MacXtreamer {
@@ -209,7 +305,14 @@ impl MacXtreamer {
         let read_result = read_config();
         let (config, had_file) = match read_result {
             Ok(c) => (c, true),
-            Err(_) => (Config::default(), false),
+            Err(_) => {
+                let mut cfg = Config::default();
+                // Ensure profiles are initialized
+                cfg.migrate_to_profiles();
+                // Save immediately to persist default config
+                let _ = save_config(&cfg);
+                (cfg, false)
+            },
         };
         
         // Check for cached recommendations
@@ -233,6 +336,7 @@ impl MacXtreamer {
             content_rows: vec![],
             all_movies: vec![],
             all_series: vec![],
+            all_channels: vec![],
             recently: load_recently_played(),
             favorites: load_favorites(),
 
@@ -246,12 +350,17 @@ impl MacXtreamer {
             cover_sem: Arc::new(Semaphore::new(6)),
             cover_height: 60.0,
             search_text: String::new(),
+            search_history: Vec::new(),
+            show_search_history: false,
+            search_status: SearchStatus::Idle,
             is_loading: false,
             loading_done: 0,
             loading_total: 0,
             last_error: None,
             show_config: false,
             pending_save_config: false,
+            show_server_manager: false,
+            new_profile_name: String::new(),
             selected_playlist: None,
             selected_vod: None,
             selected_series: None,
@@ -296,7 +405,7 @@ impl MacXtreamer {
             current_view: None,
             view_stack: Vec::new(),
             wisdom_gate_recommendations: cached_recommendations,
-            wisdom_gate_last_fetch: None,
+            _wisdom_gate_last_fetch: None,
             vlc_diag_lines: VecDeque::with_capacity(128),
             vlc_diag_suggestion: None,
             has_vlc: false,
@@ -313,6 +422,7 @@ impl MacXtreamer {
             avg_frame_ms: 0.0,
             last_forced_repaint: std::time::Instant::now(),
             pending_repaint_due_to_msg: false,
+            pending_player_redetect: false,
         };
 
         // Konfig prüfen – falls unvollständig, Config Dialog anzeigen
@@ -328,34 +438,15 @@ impl MacXtreamer {
             app.resume_incomplete_downloads();
         }
 
-        // Player Erkennung in Hintergrund-Thread starten
+        // SYNCHRON Player Erkennung direkt beim Start plus späteres Thread-Refresh
+        app.perform_player_detection();
         {
             let tx_detect = app.tx.clone();
+            let cfg_for_custom = app.config.clone();
             std::thread::spawn(move || {
-                use std::process::Command;
-                use std::process::Stdio;
-                // VLC Detection
-                let (has_vlc, vlc_version, vlc_path) = match Command::new("vlc").arg("--version").stdout(Stdio::piped()).stderr(Stdio::null()).output() {
-                    Ok(out) => {
-                        let ver = String::from_utf8(out.stdout).ok().and_then(|s| s.lines().next().map(|l| l.to_string()));
-                        let path = Command::new("which").arg("vlc").output().ok()
-                            .and_then(|o| String::from_utf8(o.stdout).ok())
-                            .map(|s| s.trim().to_string());
-                        (true, ver, path)
-                    }
-                    Err(_) => (false, None, None),
-                };
-                // mpv Detection
-                let (has_mpv, mpv_version, mpv_path) = match Command::new("mpv").arg("--version").stdout(Stdio::piped()).stderr(Stdio::null()).output() {
-                    Ok(out) => {
-                        let ver = String::from_utf8(out.stdout).ok().and_then(|s| s.lines().next().map(|l| l.to_string()));
-                        let path = Command::new("which").arg("mpv").output().ok()
-                            .and_then(|o| String::from_utf8(o.stdout).ok())
-                            .map(|s| s.trim().to_string());
-                        (true, ver, path)
-                    }
-                    Err(_) => (false, None, None),
-                };
+                // Kleines Delay um GUI ersten Frame zu erlauben
+                std::thread::sleep(std::time::Duration::from_millis(250));
+                let (has_vlc, has_mpv, vlc_path, mpv_path, vlc_version, mpv_version) = MacXtreamer::detect_players(&cfg_for_custom);
                 let _ = tx_detect.send(Msg::PlayerDetection { has_vlc, has_mpv, vlc_version, mpv_version, vlc_path, mpv_path });
             });
         }
@@ -394,6 +485,43 @@ impl MacXtreamer {
 
     }
 
+    // Statische Erkennung von VLC/mpv (auch für Wiederverwendung im Thread)
+    fn detect_players(cfg: &Config) -> (bool,bool,Option<String>,Option<String>,Option<String>,Option<String>) {
+        use std::process::Command; use std::path::Path;
+        let which = |name: &str| -> Option<String> {
+            Command::new("which").arg(name).output().ok()
+                .and_then(|o| String::from_utf8(o.stdout).ok())
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty())
+        };
+        let vlc_path = which("vlc");
+        let mut mpv_path = if !cfg.mpv_custom_path.trim().is_empty() { Some(cfg.mpv_custom_path.trim().to_string()) } else { which("mpv") };
+        if mpv_path.as_ref().map(|p| !Path::new(p).exists()).unwrap_or(false) { mpv_path = None; }
+        if mpv_path.is_none() {
+            let candidates = [
+                "/opt/homebrew/bin/mpv",
+                "/usr/local/bin/mpv",
+                "/usr/bin/mpv",
+                "/Applications/mpv.app/Contents/MacOS/mpv",
+            ];
+            for c in candidates.iter() { if Path::new(c).exists() { mpv_path = Some(c.to_string()); break; } }
+        }
+        let mpv_version = mpv_path.as_ref().and_then(|p| Command::new(p).arg("--version").output().ok()
+            .and_then(|o| String::from_utf8(o.stdout).ok())
+            .map(|s| s.lines().next().unwrap_or("").to_string()));
+        let vlc_version = vlc_path.as_ref().and_then(|p| Command::new(p).arg("--version").output().ok()
+            .and_then(|o| String::from_utf8(o.stdout).ok())
+            .map(|s| s.lines().next().unwrap_or("").to_string()));
+        (vlc_path.is_some(), mpv_path.is_some(), vlc_path, mpv_path, vlc_version, mpv_version)
+    }
+
+    fn perform_player_detection(&mut self) {
+        let (has_vlc, has_mpv, vlc_path, mpv_path, vlc_version, mpv_version) = Self::detect_players(&self.config);
+        self.has_vlc = has_vlc; self.has_mpv = has_mpv; self.detected_vlc_path = vlc_path; self.detected_mpv_path = mpv_path; self.vlc_version = vlc_version; self.mpv_version = mpv_version;
+        if self.config.use_mpv && !self.has_mpv { self.config.use_mpv = false; self.last_error = Some("mpv nicht gefunden – zurück zu VLC".into()); self.pending_save_config = true; }
+        if !self.config.use_mpv && self.has_mpv && !self.has_vlc { self.config.use_mpv = true; self.pending_save_config = true; }
+    }
+
     fn config_is_complete(&self) -> bool {
         !self.config.address.trim().is_empty()
             && !self.config.username.trim().is_empty()
@@ -428,267 +556,307 @@ impl MacXtreamer {
         start_player(self.effective_config(), &path_str).map_err(|e| e)
     }
 
+    fn generate_m3u_content(&self, _category_id: &str) -> String {
+        let mut content = String::from("#EXTM3U\n");
+        
+        // Get all channels for this category
+        for item in &self.all_channels {
+            // Build stream URL for this channel
+            let url = crate::player::build_stream_url(&self.config, &item.id);
+            content.push_str(&format!("#EXTINF:-1,{}\n", item.name));
+            content.push_str(&format!("{}\n", url));
+        }
+        
+        content
+    }
+    
+    fn copy_to_clipboard(&mut self, text: String) {
+        use arboard::Clipboard;
+        match Clipboard::new() {
+            Ok(mut clipboard) => {
+                if clipboard.set_text(&text).is_ok() {
+                    self.last_error = Some("✅ Copied to clipboard!".into());
+                } else {
+                    self.last_error = Some("❌ Failed to copy to clipboard".into());
+                }
+            }
+            Err(_) => {
+                self.last_error = Some("❌ Clipboard not available".into());
+            }
+        }
+    }
+    
+    fn save_m3u_file(&mut self, content: String, category_name: &str) {
+        use std::io::Write;
+        
+        // Use native file dialog
+        let default_name = format!("{}.m3u", category_name.replace(" ", "_"));
+        
+        if let Some(path) = rfd::FileDialog::new()
+            .set_file_name(&default_name)
+            .add_filter("M3U Playlist", &["m3u"])
+            .save_file()
+        {
+            match std::fs::File::create(&path) {
+                Ok(mut file) => {
+                    if file.write_all(content.as_bytes()).is_ok() {
+                        self.last_error = Some(format!("✅ Saved to {}", path.display()));
+                    } else {
+                        self.last_error = Some("❌ Failed to write file".into());
+                    }
+                }
+                Err(e) => {
+                    self.last_error = Some(format!("❌ Failed to create file: {}", e));
+                }
+            }
+        }
+    }
+    
+    fn play_all_channels(&mut self, _category_id: &str, _category_name: &str) {
+        let mut entries: Vec<(String, String)> = Vec::new();
+        
+        for item in &self.all_channels {
+            let url = crate::player::build_stream_url(&self.config, &item.id);
+            entries.push((item.name.clone(), url));
+        }
+        
+        if entries.is_empty() {
+            self.last_error = Some("No channels found in this category".into());
+            return;
+        }
+        
+        if let Err(e) = self.create_and_play_m3u(&entries) {
+            self.last_error = Some(format!("Failed to play playlist: {}", e));
+        }
+    }
+
     fn resume_incomplete_downloads(&mut self) {
+        // Temporär minimal: alte fehlerhafte Logik entfernt nach Patch-Kollision.
+        // TODO: Reimplementierung des fortsetzbaren Download-Scans.
         if !self.config.enable_downloads { return; }
-        let dir = self.expand_download_dir();
-        let Ok(entries) = std::fs::read_dir(&dir) else { return; };
-        for ent in entries.flatten() {
-            let path = ent.path();
-            if path.extension().and_then(|e| e.to_str()) != Some("part") { continue; }
-            // Ableiten ursprünglicher Erweiterung (dateiname.mp4.part -> file_stem = dateiname.mp4)
-            let stem = path.file_stem().and_then(|s| s.to_str()).unwrap_or_default().to_string();
-            let (base_name, orig_ext) = match stem.rsplit_once('.') { Some((b,e)) => (b.to_string(), e.to_string()), None => (stem.clone(), "mp4".to_string()) };
-            let sidecar = path.with_file_name(format!("{}.{}.json", base_name, orig_ext));
-            if !sidecar.exists() { 
-                // Ohne Sidecar keine Resume-Metadaten -> überspringen
-                continue; 
-            }
-            let meta_json = match std::fs::read(&sidecar) { Ok(d)=>d, Err(_)=>continue }; 
-            let mut id = String::new();
-            let mut name = base_name.clone();
-            let mut info = "Movie".to_string();
-            let mut container_extension = Some(orig_ext.clone());
-            if let Ok(js) = serde_json::from_slice::<serde_json::Value>(&meta_json) {
-                if let Some(v)=js.get("id").and_then(|v| v.as_str()) { id = v.to_string(); }
-                if let Some(v)=js.get("name").and_then(|v| v.as_str()) { name = v.to_string(); }
-                if let Some(v)=js.get("info").and_then(|v| v.as_str()) { info = v.to_string(); }
-                if let Some(v)=js.get("ext").and_then(|v| v.as_str()) { container_extension = Some(v.to_string()); }
-            }
-            if id.is_empty() { continue; }
-            if self.downloads.contains_key(&id) { continue; }
-            // Prüfen ob finale Datei bereits existiert -> dann part löschen
-            let final_path = self.local_file_path(&id, &name, container_extension.as_deref());
-            if final_path.exists() { let _ = std::fs::remove_file(&path); continue; }
-            // DownloadState / Meta anlegen und direkt starten
-            let meta = DownloadMeta { id: id.clone(), name: name.clone(), info: info.clone(), container_extension: container_extension.clone(), size: None, modified: None };
-            self.download_meta.insert(id.clone(), meta);
-            self.download_order.push(id.clone());
-            self.downloads.insert(id.clone(), DownloadState { waiting: true, path: Some(final_path.to_string_lossy().into()), ..Default::default() });
-        }
-        // Versuche ausstehende (wartende) Downloads zu starten
-        self.maybe_start_next_download();
+        // Placeholder – macht aktuell nichts außer schneller Rückkehr.
     }
 
-    fn spawn_load_items(&self, kind: &str, category_id: String) {
-        if !self.config_is_complete() {
-            return;
-        }
-        let cfg = self.config.clone();
+    // Lade Items einer Kategorie (Live/VOD/Series) asynchron und sende Ergebnis zurück.
+    fn spawn_load_items(&mut self, kind: &str, category_id: String) {
+        if !self.config_is_complete() { return; }
         let tx = self.tx.clone();
+        let cfg = self.config.clone();
         let kind_s = kind.to_string();
+        self.is_loading = true;
+        self.loading_total = 1;
+        self.loading_done = 0;
         tokio::spawn(async move {
-            let res = fetch_items(&cfg, &kind_s, &category_id).await;
-            let _ = tx.send(Msg::ItemsLoaded {
-                kind: kind_s,
-                items: res.map_err(|e| e.to_string()),
-            });
+            let res = fetch_items(&cfg, &kind_s, &category_id).await.map_err(|e| e.to_string());
+            let _ = tx.send(Msg::ItemsLoaded { kind: kind_s, items: res });
         });
     }
 
-    fn spawn_load_episodes(&self, series_id: String) {
-        if !self.config_is_complete() {
-            return;
-        }
-        let cfg = self.config.clone();
+    // Lade Episoden einer Serie
+    fn spawn_load_episodes(&mut self, series_id: String) {
+        if !self.config_is_complete() { return; }
         let tx = self.tx.clone();
-        let sid = series_id;
-        tokio::spawn(async move {
-            let res = fetch_series_episodes(&cfg, &sid).await;
-            let _ = tx.send(Msg::EpisodesLoaded {
-                series_id: sid,
-                episodes: res.map_err(|e| e.to_string()),
-            });
-        });
-    }
-
-    fn spawn_fetch_episodes_for_download(&self, series_id: String) {
-        if !self.config_is_complete() {
-            return;
-        }
         let cfg = self.config.clone();
-        let tx = self.tx.clone();
-        let sid = series_id;
+        self.is_loading = true;
+        self.loading_total = 1;
+        self.loading_done = 0;
         tokio::spawn(async move {
-            let res = fetch_series_episodes(&cfg, &sid).await;
-            let _ = tx.send(Msg::SeriesEpisodesForDownload {
-                series_id: sid,
-                episodes: res.map_err(|e| e.to_string()),
-            });
+            let res = fetch_series_episodes(&cfg, &series_id).await.map_err(|e| e.to_string());
+            let _ = tx.send(Msg::EpisodesLoaded { series_id, episodes: res });
         });
     }
 
+    // Episoden für Bulk-Download laden (nur Enqueue – keine UI-Anzeige)
+    fn spawn_fetch_episodes_for_download(&mut self, series_id: String) {
+        if !self.config_is_complete() { return; }
+        let tx = self.tx.clone();
+        let cfg = self.config.clone();
+        tokio::spawn(async move {
+            let res = fetch_series_episodes(&cfg, &series_id).await.map_err(|e| e.to_string());
+            let _ = tx.send(Msg::SeriesEpisodesForDownload { series_id, episodes: res });
+        });
+    }
+
+    // Einzelnes Cover abrufen (falls nicht bereits vorhanden oder in Arbeit)
     fn spawn_fetch_cover(&mut self, url: &str) {
-        if self.pending_covers.contains(url) {
-            return;
-        }
+        if url.is_empty() { return; }
+        if self.textures.contains_key(url) { return; }
+        if self.pending_covers.contains(url) { return; }
+        if self.pending_decode_urls.contains(url) { return; }
+        // Mark as pending
         self.pending_covers.insert(url.to_string());
         let tx = self.tx.clone();
-        let url_s = url.to_string();
-        let sem = self.cover_sem.clone();
-        let ttl_secs: u64 = (self.config.cover_ttl_days.max(1) as u64) * 24 * 60 * 60;
         let client = self.http_client.clone();
+        let url_s = url.to_string();
         tokio::spawn(async move {
-            let _permit = sem.acquire_owned().await.ok();
-            // Versuche Disk-Cache mit TTL zuerst
-            let mut served_any = false;
-            let mut need_refresh = false;
-            // Load cached meta (etag/last-modified) if any
-            let (mut cached_etag, mut cached_lm) = (None::<String>, None::<String>);
-            if let Some(mpath) = image_meta_path(&url_s) {
-                if let Ok(mut f) = tokio::fs::File::open(&mpath).await {
-                    let mut s = String::new();
-                    let _ = tokio::io::AsyncReadExt::read_to_string(&mut f, &mut s).await;
-                    for line in s.lines() {
-                        if let Some(val) = line.strip_prefix("etag: ") {
-                            cached_etag = Some(val.trim().to_string());
-                        } else if let Some(val) = line.strip_prefix("last_modified: ") {
-                            cached_lm = Some(val.trim().to_string());
-                        }
-                    }
+            match client.get(&url_s).send().await {
+                Ok(resp) => {
+                    if let Ok(bytes) = resp.bytes().await { let _ = tx.send(Msg::CoverLoaded { url: url_s, bytes: bytes.to_vec() }); }
                 }
-            }
-            if let Some(path) = image_cache_path(&url_s) {
-                if let Some(age) = file_age_secs(&path) {
-                    if let Ok(mut f) = tokio::fs::File::open(&path).await {
-                        let mut buf = Vec::new();
-                        if f.read_to_end(&mut buf).await.is_ok() {
-                            let _ = tx.send(Msg::CoverLoaded {
-                                url: url_s.clone(),
-                                bytes: buf,
-                            });
-                            served_any = true;
-                            if age > ttl_secs {
-                                need_refresh = true;
-                            }
-                        }
-                    }
-                }
-            }
-            if !served_any || need_refresh {
-                let mut req = client.get(&url_s);
-                if let Some(et) = cached_etag.as_deref() {
-                    req = req.header(IF_NONE_MATCH, et);
-                }
-                if let Some(lm) = cached_lm.as_deref() {
-                    req = req.header(IF_MODIFIED_SINCE, lm);
-                }
-                if let Ok(resp) = req.send().await {
-                    if resp.status() == reqwest::StatusCode::NOT_MODIFIED {
-                        // Cache ist aktuell: ggf. mtime auffrischen, keine Doppel-Lieferung nötig
-                        if let Some(path) = image_cache_path(&url_s) {
-                            if let Ok(mut f) = tokio::fs::File::open(&path).await {
-                                let mut buf = Vec::new();
-                                if tokio::io::AsyncReadExt::read_to_end(&mut f, &mut buf)
-                                    .await
-                                    .is_ok()
-                                {
-                                    let _ = tokio::fs::write(&path, &buf).await;
-                                }
-                            }
-                        }
-                        return;
-                    }
-                    // Capture ETag/Last-Modified before consuming body
-                    let et_hdr = resp
-                        .headers()
-                        .get(ETAG)
-                        .and_then(|v| v.to_str().ok())
-                        .map(|s| s.to_string());
-                    let lm_hdr = resp
-                        .headers()
-                        .get(LAST_MODIFIED)
-                        .and_then(|v| v.to_str().ok())
-                        .map(|s| s.to_string());
-                    if let Ok(bytes) = resp.bytes().await {
-                        let data = bytes.to_vec();
-                        // Schreibe in Disk-Cache
-                        if let Some(path) = image_cache_path(&url_s) {
-                            if let Some(parent) = path.parent() {
-                                let _ = tokio::fs::create_dir_all(parent).await;
-                            }
-                            let _ = tokio::fs::write(&path, &data).await;
-                            // Write sidecar meta with ETag/Last-Modified
-                            if let Some(mpath) = image_meta_path(&url_s) {
-                                if let Some(parent) = mpath.parent() {
-                                    let _ = tokio::fs::create_dir_all(parent).await;
-                                }
-                                let et = et_hdr.as_deref().unwrap_or("");
-                                let lm = lm_hdr.as_deref().unwrap_or("");
-                                let meta = format!("etag: {}\nlast_modified: {}\n", et, lm);
-                                let _ = tokio::fs::write(&mpath, meta).await;
-                            }
-                        }
-                        let _ = tx.send(Msg::CoverLoaded {
-                            url: url_s.clone(),
-                            bytes: data,
-                        });
-                        return;
-                    }
-                }
-                // Netzwerk fehlgeschlagen: Fallback zu evtl. vorhandenem, aber stale Cache
-                if let Some(path) = image_cache_path(&url_s) {
-                    if let Ok(mut f) = tokio::fs::File::open(&path).await {
-                        let mut buf = Vec::new();
-                        if f.read_to_end(&mut buf).await.is_ok() {
-                            let _ = tx.send(Msg::CoverLoaded {
-                                url: url_s.clone(),
-                                bytes: buf,
-                            });
-                        }
-                    }
+                Err(_e) => {
+                    // Fehler ignorieren – Eintrag wird später bereinigt
                 }
             }
         });
     }
 
     fn spawn_build_index(&mut self) {
-        if self.indexing {
-            return;
-        }
-        if !self.config_is_complete() {
-            return;
-        }
+        if self.indexing || !self.config_is_complete() { return; }
         self.indexing = true;
+        self.search_status = SearchStatus::Indexing { progress: "Starte Index-Aufbau...".to_string() };
         let tx = self.tx.clone();
         let cfg = self.config.clone();
         tokio::spawn(async move {
-            // Fetch categories
-            let vod = fetch_categories(&cfg, "get_vod_categories")
-                .await
-                .unwrap_or_default();
-            let ser = fetch_categories(&cfg, "get_series_categories")
-                .await
-                .unwrap_or_default();
-            let mut all_movies: Vec<(Item, String)> = Vec::new();
-            let mut all_series: Vec<(Item, String)> = Vec::new();
-            for c in vod {
-                let path = format!("VOD / {}", c.name);
-                if let Ok(items) = fetch_items(&cfg, "vod", &c.id).await {
-                    all_movies.extend(items.into_iter().map(|it| (it, path.clone())));
+            println!("📂 Starte Index-Aufbau...");
+            let _ = tx.send(Msg::IndexProgress { message: "Lade Kategorien...".to_string() });
+            println!("⚡ Lade alle Kategorien parallel...");
+            let _ = tx.send(Msg::IndexProgress { message: "Lade Kategorien parallel...".to_string() });
+            let (vod_result, ser_result, live_result) = tokio::join!(
+                fetch_categories(&cfg, "get_vod_categories"),
+                fetch_categories(&cfg, "get_series_categories"),
+                fetch_categories(&cfg, "get_live_categories")
+            );
+            
+            let vod = match vod_result {
+                Ok(cats) => { println!("✅ VOD: {} Kategorien", cats.len()); cats }
+                Err(e) => { println!("❌ VOD Fehler: {}", e); Vec::new() }
+            };
+            let ser = match ser_result {
+                Ok(cats) => { println!("✅ Serien: {} Kategorien", cats.len()); cats }
+                Err(e) => { println!("❌ Serien Fehler: {}", e); Vec::new() }
+            };
+            let live = match live_result {
+                Ok(cats) => { println!("✅ Live: {} Kategorien", cats.len()); cats }
+                Err(e) => { println!("❌ Live Fehler: {}", e); Vec::new() }
+            };
+            let mut all_movies: Vec<(Item,String)> = Vec::new();
+            let mut all_series: Vec<(Item,String)> = Vec::new();
+            let mut all_channels: Vec<(Item,String)> = Vec::new();
+            let total_categories = vod.len() + ser.len() + live.len();
+            let _ = tx.send(Msg::IndexProgress { message: format!("Lade Inhalte aus {} Kategorien...", total_categories) });
+            println!("⚡ Lade Items parallel...");
+            
+            // Parallel loading mit begrenzter Concurrency (max 10 gleichzeitig)
+            use futures::stream::{self, StreamExt};
+            
+            // VOD Items parallel laden
+            if !vod.is_empty() {
+                let vod_futures = vod.into_iter().map(|c| {
+                    let cfg = cfg.clone();
+                    let path = format!("VOD / {}", c.name);
+                    let name = c.name.clone();
+                    async move {
+                        match fetch_items(&cfg, "vod", &c.id).await {
+                            Ok(items) => {
+                                let count = items.len();
+                                (Ok(items.into_iter().map(|it| (it, path.clone())).collect::<Vec<_>>()), name, count)
+                            }
+                            Err(e) => (Err(e), name, 0)
+                        }
+                    }
+                });
+                let vod_results: Vec<_> = stream::iter(vod_futures)
+                    .buffer_unordered(10)
+                    .collect().await;
+                
+                for (result, name, count) in vod_results {
+                    match result {
+                        Ok(items) => {
+                            println!("🎬 {} Movies ({})", count, name);
+                            all_movies.extend(items);
+                        }
+                        Err(e) => println!("❌ VOD '{}': {}", name, e)
+                    }
                 }
             }
-            for c in ser {
-                let path = format!("Series / {}", c.name);
-                if let Ok(items) = fetch_items(&cfg, "series", &c.id).await {
-                    all_series.extend(items.into_iter().map(|it| (it, path.clone())));
+            
+            // Series Items parallel laden  
+            if !ser.is_empty() {
+                let ser_futures = ser.into_iter().map(|c| {
+                    let cfg = cfg.clone();
+                    let path = format!("Series / {}", c.name);
+                    let name = c.name.clone();
+                    async move {
+                        match fetch_items(&cfg, "series", &c.id).await {
+                            Ok(items) => {
+                                let count = items.len();
+                                (Ok(items.into_iter().map(|it| (it, path.clone())).collect::<Vec<_>>()), name, count)
+                            }
+                            Err(e) => (Err(e), name, 0)
+                        }
+                    }
+                });
+                let ser_results: Vec<_> = stream::iter(ser_futures)
+                    .buffer_unordered(10)
+                    .collect().await;
+                
+                for (result, name, count) in ser_results {
+                    match result {
+                        Ok(items) => {
+                            println!("📚 {} Series ({})", count, name);
+                            all_series.extend(items);
+                        }
+                        Err(e) => println!("❌ Series '{}': {}", name, e)
+                    }
                 }
             }
-            // Dedup by id (first movies then series)
-            let mut seen = std::collections::HashSet::new();
-            all_movies.retain(|(i, _)| seen.insert(i.id.clone()));
-            seen.clear();
-            all_series.retain(|(i, _)| seen.insert(i.id.clone()));
-            // Wichtig: Erst IndexData senden (füllt Caches), dann IndexBuilt (setzt indexing=false und triggert Suche)
-            let movies_len = all_movies.len();
-            let series_len = all_series.len();
-            let _ = tx.send(Msg::IndexData {
-                movies: all_movies,
-                series: all_series,
-            });
-            let _ = tx.send(Msg::IndexBuilt {
-                movies: movies_len,
-                series: series_len,
-            });
+            
+            // Live Channels parallel laden
+            if !live.is_empty() {
+                let live_futures = live.into_iter().map(|c| {
+                    let cfg = cfg.clone();
+                    let path = format!("Live / {}", c.name);
+                    let name = c.name.clone();
+                    async move {
+                        match fetch_items(&cfg, "subplaylist", &c.id).await {
+                            Ok(items) => {
+                                let count = items.len();
+                                (Ok(items.into_iter().map(|it| (it, path.clone())).collect::<Vec<_>>()), name, count)
+                            }
+                            Err(e) => (Err(e), name, 0)
+                        }
+                    }
+                });
+                let live_results: Vec<_> = stream::iter(live_futures)
+                    .buffer_unordered(10)
+                    .collect().await;
+                
+                for (result, name, count) in live_results {
+                    match result {
+                        Ok(items) => {
+                            println!("📡 {} Channels ({})", count, name);
+                            all_channels.extend(items);
+                        }
+                        Err(e) => println!("❌ Live '{}': {}", name, e)
+                    }
+                }
+            }
+            // Deduplicate items using a HashMap to keep the first occurrence
+            let mut movies_map: std::collections::HashMap<String, (Item, String)> = std::collections::HashMap::new();
+            let mut series_map: std::collections::HashMap<String, (Item, String)> = std::collections::HashMap::new();
+            let mut channels_map: std::collections::HashMap<String, (Item, String)> = std::collections::HashMap::new();
+            
+            for (item, path) in all_movies {
+                movies_map.entry(item.id.clone()).or_insert((item, path));
+            }
+            for (item, path) in all_series {
+                series_map.entry(item.id.clone()).or_insert((item, path));
+            }
+            for (item, path) in all_channels {
+                channels_map.entry(item.id.clone()).or_insert((item, path));
+            }
+            
+            let deduplicated_movies: Vec<(Item, String)> = movies_map.into_iter().map(|(_, v)| v).collect();
+            let deduplicated_series: Vec<(Item, String)> = series_map.into_iter().map(|(_, v)| v).collect();
+            let deduplicated_channels: Vec<(Item, String)> = channels_map.into_iter().map(|(_, v)| v).collect();
+            
+            let movies_len = deduplicated_movies.len();
+            let series_len = deduplicated_series.len();
+            let channels_len = deduplicated_channels.len();
+            
+            println!("✅ Index-Aufbau abgeschlossen: {} Movies, {} Series, {} Channels", movies_len, series_len, channels_len);
+            let _ = tx.send(Msg::IndexData { movies: deduplicated_movies, series: deduplicated_series, channels: deduplicated_channels });
+            let _ = tx.send(Msg::IndexBuilt { movies: movies_len, series: series_len, channels: channels_len });
         });
     }
 
@@ -696,42 +864,72 @@ impl MacXtreamer {
         let tx = self.tx.clone();
         let movies = self.all_movies.clone();
         let series = self.all_series.clone();
+        let channels = self.all_channels.clone();
         let query = self.search_text.clone();
-        if movies.is_empty() && series.is_empty() && !self.indexing {
-            self.spawn_build_index();
-            // Return early - search will be performed after index is built
-            return;
+        
+        // Debug-Informationen für die Suche
+        println!("🔍 Starte Suche mit Query: '{}'", query);
+        println!("📊 Index-Größen: Movies={}, Series={}, Channels={}", movies.len(), series.len(), channels.len());
+        println!("⚙️ Indexing: {}, Config komplett: {}", self.indexing, self.config_is_complete());
+        
+        if movies.is_empty() && series.is_empty() && channels.is_empty() && !self.indexing {
+            println!("📂 Index leer, starte Index-Aufbau...");
+            self.spawn_build_index(); return; }
+        if self.indexing { 
+            println!("⏳ Indexing läuft bereits...");
+            return; 
         }
-        // If indexing is in progress, wait for it to complete
-        if self.indexing {
-            return;
-        }
-        self.is_loading = true;
-        self.loading_total = 1;
-        self.loading_done = 0;
+        
+        // Send search started message and update status
+        let _ = tx.send(Msg::SearchStarted);
+        self.search_status = SearchStatus::Searching;
+        self.is_loading = true; self.loading_total = 1; self.loading_done = 0;
+        
         tokio::spawn(async move {
-            let results = search_items(&movies, &series, &query);
-            let rows: Vec<Row> = results
-                .into_iter()
-                .map(|s| Row {
-                    name: s.name.clone(),
-                    id: s.id,
-                    info: s.info,
-                    container_extension: if s.container_extension.is_empty() {
-                        None
+            match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                println!("🔎 Führe Suche durch...");
+                search_items(&movies, &series, &channels, &query)
+            })) {
+                Ok(results) => {
+                    println!("✅ Suche abgeschlossen, {} Treffer gefunden", results.len());
+                    
+                    // Deduplicate results by ID before converting to Rows
+                    let mut seen_ids: std::collections::HashSet<String> = std::collections::HashSet::new();
+                    let unique_results: Vec<_> = results.into_iter()
+                        .filter(|s| seen_ids.insert(s.id.clone()))
+                        .collect();
+                    
+                    let rows: Vec<Row> = unique_results.into_iter().map(|s| Row {
+                        name: s.name.clone(), 
+                        id: s.id, 
+                        info: s.info, 
+                        container_extension: if s.container_extension.is_empty(){None}else{Some(s.container_extension)}, 
+                        stream_url: None, 
+                        cover_url: s.cover, 
+                        year: s.year.clone(), 
+                        release_date: s.release_date.clone().or_else(|| extract_year_from_title(&s.name)), 
+                        rating_5based: s.rating_5based, 
+                        genre: s.genre, 
+                        path: None 
+                    }).collect();
+                    
+                    let result_count = rows.len();
+                    println!("📊 {} eindeutige Ergebnisse nach Deduplizierung", result_count);
+                    let _ = tx.send(Msg::SearchReady(rows));
+                    
+                    if result_count == 0 {
+                        println!("❌ Keine Suchergebnisse");
+                        let _ = tx.send(Msg::SearchCompleted { results: 0 });
                     } else {
-                        Some(s.container_extension)
-                    },
-                    stream_url: None,
-                    cover_url: s.cover,
-                    year: s.year.clone(),
-                    release_date: s.release_date.clone().or_else(|| extract_year_from_title(&s.name)),
-                    rating_5based: s.rating_5based,
-                    genre: s.genre,
-                    path: None,
-                })
-                .collect();
-            let _ = tx.send(Msg::SearchReady(rows));
+                        println!("📤 Sende {} Ergebnisse an UI", result_count);
+                        let _ = tx.send(Msg::SearchCompleted { results: result_count });
+                    }
+                },
+                Err(e) => {
+                    println!("💥 Suchfehler: {:?}", e);
+                    let _ = tx.send(Msg::SearchFailed { error: "Suche fehlgeschlagen".to_string() });
+                }
+            }
         });
     }
 
@@ -1281,26 +1479,20 @@ impl MacXtreamer {
         // Fetch recommendations button
         ui.horizontal(|ui| {
             if ui.button("🔄 Empfehlungen aktualisieren").clicked() {
-                // Check if cache is valid first
-                if self.config.is_wisdom_gate_cache_valid() && !self.config.wisdom_gate_cache_content.is_empty() {
-                    // Use cached content
-                    let cache_age = self.config.get_wisdom_gate_cache_age_hours();
-                    println!("📦 Verwende gecachte Empfehlungen (Alter: {}h)", cache_age);
-                    self.wisdom_gate_recommendations = Some(format!("📦 **Gecachte Empfehlungen** (vor {}h aktualisiert)\n\n{}", 
-                        cache_age, self.config.wisdom_gate_cache_content));
-                } else {
-                    // Fetch new content
-                    let tx = self.tx.clone();
-                    let api_key = self.config.wisdom_gate_api_key.clone();
-                    let model = self.config.wisdom_gate_model.clone();
-                    let prompt = self.config.wisdom_gate_prompt.clone();
-                    
-                    tokio::spawn(async move {
-                        println!("🌐 Lade neue Empfehlungen von Wisdom-Gate...");
-                        let content = crate::api::fetch_wisdom_gate_recommendations_safe(&api_key, &prompt, &model).await;
-                        let _ = tx.send(crate::app_state::Msg::WisdomGateRecommendations(content));
-                    });
-                }
+                // Always fetch new content when button is clicked - ignore cache
+                let tx = self.tx.clone();
+                let api_key = self.config.wisdom_gate_api_key.clone();
+                let model = self.config.wisdom_gate_model.clone();
+                let prompt = self.config.wisdom_gate_prompt.clone();
+                // Clone config to move into async task without borrowing/moving self
+                let cfg = self.config.clone();
+                
+                tokio::spawn(async move {
+                    println!("🌐 Lade neue Empfehlungen von Wisdom-Gate...");
+                    let endpoint = cfg.wisdom_gate_endpoint.clone();
+                    let content = crate::api::fetch_wisdom_gate_recommendations_safe(&api_key, &prompt, &model, &endpoint).await;
+                    let _ = tx.send(crate::app_state::Msg::WisdomGateRecommendations(content));
+                });
             }
 
             // Show cache status
@@ -1318,6 +1510,18 @@ impl MacXtreamer {
 
         // Display recommendations
         if let Some(ref content) = self.wisdom_gate_recommendations {
+            // Zusatz-Hinweis bei DNS / Endpoint Problemen
+            if content.contains("DNS/Verbindungsfehler") || (content.contains("Endpoint:") && content.contains("nicht erreichbar")) {
+                ui.colored_label(egui::Color32::RED, "🛑 Endpoint nicht erreichbar");
+                ui.label("Die angegebene Wisdom-Gate API konnte nicht aufgelöst oder verbunden werden.");
+                ui.label("Prüfe:");
+                ui.label("• Internet / Firewall / VPN / Proxy");
+                ui.label("• DNS Schreibweise der Domain");
+                ui.label("• Alternative Domain ohne/mit Bindestrich testen");
+                ui.add_space(4.0);
+                ui.monospace(&self.config.wisdom_gate_endpoint);
+                ui.add_space(6.0);
+            }
             egui::ScrollArea::vertical().show(ui, |ui| {
                 ui.label(egui::RichText::new("🎬 Heutige Streaming-Empfehlungen:")
                     .strong()
@@ -1381,6 +1585,8 @@ impl eframe::App for MacXtreamer {
         let now = std::time::Instant::now();
         let dt = now.duration_since(self.last_frame_time).as_millis() as f32;
         self.last_frame_time = now;
+        // Zeit seit letztem erzwungenen Repaint (ms) für Ultra Flicker Guard
+        let time_since_forced: u64 = now.duration_since(self.last_forced_repaint).as_millis() as u64;
         // Exponentielles Glätten
         if self.avg_frame_ms == 0.0 { self.avg_frame_ms = dt; } else { self.avg_frame_ms = self.avg_frame_ms * 0.9 + dt * 0.1; }
         // Theme anwenden (einmalig oder bei Wechsel)
@@ -1603,11 +1809,37 @@ impl eframe::App for MacXtreamer {
                     if !self.config.use_mpv && self.has_mpv && !self.has_vlc { self.config.use_mpv = true; self.pending_save_config = true; }
                 }
                 Msg::PlayerSpawnFailed { player, error } => {
-                    if player.contains("mpv") { self.mpv_fail_count = self.mpv_fail_count.saturating_add(1); }
-                    if player.to_lowercase().contains("vlc") { self.vlc_fail_count = self.vlc_fail_count.saturating_add(1); }
-                    self.last_error = Some(format!("{} Startfehler: {}", player, error));
-                    if self.config.use_mpv && self.mpv_fail_count >= 3 && self.has_vlc { self.config.use_mpv = false; self.pending_save_config = true; self.last_error = Some("mpv wiederholt fehlgeschlagen – Wechsel auf VLC".into()); }
-                    if !self.config.use_mpv && self.vlc_fail_count >= 3 && self.has_mpv { self.config.use_mpv = true; self.pending_save_config = true; self.last_error = Some("VLC wiederholt fehlgeschlagen – Wechsel auf mpv".into()); }
+                    // Detaillierte Fehlerbehandlung je nach Player-Typ
+                    if player.contains("mpv") { 
+                        self.mpv_fail_count = self.mpv_fail_count.saturating_add(1); 
+                        log_line(&format!("🔥 mpv Fehler #{}: {}", self.mpv_fail_count, error));
+                    }
+                    if player.to_lowercase().contains("vlc") { 
+                        self.vlc_fail_count = self.vlc_fail_count.saturating_add(1); 
+                        log_line(&format!("🔥 VLC Fehler #{}: {}", self.vlc_fail_count, error));
+                    }
+                    
+                    // Spezielle Behandlung für System-Fehler (kein Player verfügbar)
+                    if player == "System" {
+                        self.last_error = Some(format!("❌ KRITISCHER FEHLER: {}", error));
+                        log_line(&format!("💥 System-Fehler: {}", error));
+                    } else {
+                        self.last_error = Some(format!("🔥 {} Startfehler: {}", player, error));
+                    }
+                    
+                    // Auto-Fallback bei wiederholten Fehlern
+                    if self.config.use_mpv && self.mpv_fail_count >= 3 && self.has_vlc { 
+                        self.config.use_mpv = false; 
+                        self.pending_save_config = true; 
+                        self.last_error = Some("⚠️ mpv wiederholt fehlgeschlagen – Automatischer Wechsel auf VLC".into()); 
+                        log_line("🔄 Auto-Wechsel: mpv → VLC");
+                    }
+                    if !self.config.use_mpv && self.vlc_fail_count >= 3 && self.has_mpv { 
+                        self.config.use_mpv = true; 
+                        self.pending_save_config = true; 
+                        self.last_error = Some("⚠️ VLC wiederholt fehlgeschlagen – Automatischer Wechsel auf mpv".into()); 
+                        log_line("🔄 Auto-Wechsel: VLC → mpv");
+                    }
                 }
                 Msg::DiagnosticsStopped => {
                     self.last_error = Some("VLC Diagnose gestoppt".into());
@@ -1630,13 +1862,11 @@ impl eframe::App for MacXtreamer {
                                     _ => "Item",
                                 };
                                 if info == "Movie" {
-                                    if seen_ids.insert(it.id.clone()) {
-                                        self.all_movies.push(it.clone());
-                                    }
+                                    if seen_ids.insert(it.id.clone()) { self.all_movies.push(it.clone()); }
                                 } else if info == "Series" {
-                                    if seen_ids.insert(it.id.clone()) {
-                                        self.all_series.push(it.clone());
-                                    }
+                                    if seen_ids.insert(it.id.clone()) { self.all_series.push(it.clone()); }
+                                } else if info == "Channel" {
+                                    if seen_ids.insert(it.id.clone()) { self.all_channels.push(it.clone()); }
                                 }
                                 self.content_rows.push(Row {
                                     name: it.name.clone(),
@@ -1697,8 +1927,75 @@ impl eframe::App for MacXtreamer {
                     episodes,
                 } => match episodes {
                     Ok(eps) => {
+                        // Sort episodes by parsed season and episode number (e.g., S27E05)
+                        fn parse_season_episode(s: &str) -> Option<(u32, u32)> {
+                            // Robust parsing for patterns: S27E05, s01e01, 27x05, Season 27 Episode 5
+                            let t = s.to_ascii_uppercase();
+                            let bytes = t.as_bytes();
+                            // Helper to read number starting at idx
+                            fn read_num(bytes: &[u8], start: usize) -> (u32, usize) {
+                                let mut i = start;
+                                let mut val: u32 = 0;
+                                let mut any = false;
+                                while i < bytes.len() {
+                                    let b = bytes[i];
+                                    if b.is_ascii_digit() {
+                                        any = true;
+                                        val = val * 10 + (b - b'0') as u32;
+                                        i += 1;
+                                    } else { break; }
+                                }
+                                (if any { val } else { 0 }, i)
+                            }
+                            // SxxEyy
+                            if let Some(si) = t.find('S') {
+                                let (season, after_s) = read_num(bytes, si + 1);
+                                if season > 0 {
+                                    if let Some(ei_rel) = t[after_s..].find('E') {
+                                        let ei = after_s + ei_rel + 1; // start of digits after E
+                                        let (episode, _) = read_num(bytes, ei);
+                                        if episode > 0 { return Some((season, episode)); }
+                                    }
+                                }
+                            }
+                            // 27x05
+                            if let Some(xpos) = t.find('X') {
+                                // read number to the left (scan backwards to first digit run)
+                                let mut l = xpos;
+                                while l > 0 && !bytes[l-1].is_ascii_digit() { l -= 1; }
+                                let mut start = l;
+                                while start > 0 && bytes[start-1].is_ascii_digit() { start -= 1; }
+                                let (season, _) = read_num(bytes, start);
+                                let (episode, _) = read_num(bytes, xpos + 1);
+                                if season > 0 && episode > 0 { return Some((season, episode)); }
+                            }
+                            // Season 27 Episode 5
+                            if let Some(pos) = t.find("SEASON ") {
+                                let (season, after_season) = read_num(bytes, pos + "SEASON ".len());
+                                if season > 0 {
+                                    if let Some(ep_pos) = t[after_season..].find("EPISODE ") {
+                                        let ep_idx = after_season + ep_pos + "EPISODE ".len();
+                                        let (episode, _) = read_num(bytes, ep_idx);
+                                        if episode > 0 { return Some((season, episode)); }
+                                    }
+                                }
+                            }
+                            None
+                        }
+
+                        let mut eps_sorted = eps.clone();
+                        use std::cmp::Ordering;
+                        eps_sorted.sort_by(|a, b| {
+                            match (parse_season_episode(&a.name), parse_season_episode(&b.name)) {
+                                (Some((sa, ea)), Some((sb, eb))) => sa.cmp(&sb).then(ea.cmp(&eb)),
+                                (Some(_), None) => Ordering::Less,   // parsed episodes come before unknowns
+                                (None, Some(_)) => Ordering::Greater,
+                                (None, None) => a.name.cmp(&b.name),
+                            }
+                        });
+
                         self.content_rows.clear();
-                        for ep in eps {
+                        for ep in eps_sorted {
                             self.content_rows.push(Row {
                                 name: ep.name,
                                 id: ep.episode_id,
@@ -1783,31 +2080,47 @@ impl eframe::App for MacXtreamer {
                             .push_back((url.clone(), rgba, w, h));
                     }
                 }
-                Msg::IndexBuilt {
-                    movies: _m,
-                    series: _s,
-                } => {
+                Msg::IndexProgress { message } => {
+                    self.search_status = SearchStatus::Indexing { progress: message };
+                }
+                Msg::IndexBuilt { movies: _m, series: _s, channels: _c } => {
                     // Bei Bedarf könnten wir hier all_movies/all_series aktualisieren,
                     // aktuell dienen die Caches von fetch_*; setze Flag zurück
+                    println!("🏗️ Index aufgebaut: {} Movies, {} Series, {} Channels", _m, _s, _c);
                     self.indexing = false;
+                    self.search_status = SearchStatus::Idle;
+                    self.search_status = SearchStatus::Idle;
                     
-                    // If we're in search view and have a search query, flag to perform the search
-                    if let Some(ViewState::Search { .. }) = &self.current_view {
-                        if !self.search_text.trim().is_empty() {
-                            self.should_start_search = true;
-                        }
+                    // If we have a search query, flag to perform/repeat the search
+                    // This ensures search includes all content types (movies, series, channels)
+                    if !self.search_text.trim().is_empty() {
+                        println!("🔄 Wiederhole Suche mit vollständigem Index (inkl. {} Channels)...", _c);
+                        self.should_start_search = true;
                     }
                 }
-                Msg::IndexData { movies, series } => {
-                    self.all_movies = movies.iter().map(|(i, _)| i.clone()).collect();
-                    self.all_series = series.iter().map(|(i, _)| i.clone()).collect();
+                Msg::IndexData { movies, series, channels } => {
+                    // Clear existing data to avoid accumulation
+                    self.all_movies.clear();
+                    self.all_series.clear();
+                    self.all_channels.clear();
                     self.index_paths.clear();
-                    for (it, p) in movies.into_iter() {
-                        self.index_paths.insert(it.id, p);
+                    
+                    // Build new index from deduplicated data
+                    for (item, path) in movies {
+                        self.all_movies.push(item.clone());
+                        self.index_paths.insert(item.id, path);
                     }
-                    for (it, p) in series.into_iter() {
-                        self.index_paths.insert(it.id, p);
+                    for (item, path) in series {
+                        self.all_series.push(item.clone());
+                        self.index_paths.insert(item.id, path);
                     }
+                    for (item, path) in channels {
+                        self.all_channels.push(item.clone());
+                        self.index_paths.insert(item.id, path);
+                    }
+                    
+                    println!("📊 Index aktualisiert: {} Movies, {} Series, {} Channels in Speicher", 
+                             self.all_movies.len(), self.all_series.len(), self.all_channels.len());
                 }
                 Msg::PreloadSet { total } => {
                     self.is_loading = true;
@@ -1971,106 +2284,76 @@ impl eframe::App for MacXtreamer {
                         st.finished = true;
                     }
                 }
+                Msg::SearchStarted => {
+                    self.search_status = SearchStatus::Searching;
+                }
                 Msg::SearchReady(mut rows) => {
-                    // Fill paths for search results using index_paths if available
+                    // Deduplicate rows by ID (keep first occurrence)
+                    let mut seen_ids: std::collections::HashSet<String> = std::collections::HashSet::new();
+                    rows.retain(|r| seen_ids.insert(r.id.clone()));
+                    
+                    // Add paths from index
                     for r in &mut rows {
                         if r.path.is_none() {
-                            if let Some(p) = self.index_paths.get(&r.id) {
-                                r.path = Some(p.clone());
+                            if let Some(p) = self.index_paths.get(&r.id) { 
+                                r.path = Some(p.clone()); 
                             }
                         }
                     }
+                    
                     self.content_rows = rows;
+                    self.is_loading = false;
+                    
+                    println!("📊 Suchergebnisse gesetzt: {} eindeutige Treffer", self.content_rows.len());
+                }
+                Msg::SearchCompleted { results } => {
+                    if results == 0 {
+                        self.search_status = SearchStatus::NoResults;
+                    } else {
+                        self.search_status = SearchStatus::Completed { results };
+                    }
+                }
+                Msg::SearchFailed { error } => {
+                    self.search_status = SearchStatus::Error(error);
                     self.is_loading = false;
                 }
                 Msg::DownloadsScanned(list) => {
-                    // Verschmolzen mit existierenden Download-States falls IDs erkannt werden
                     for d in &list {
-                        // Falls bereits bekannt (Session-Download), Pfad/Progress nicht überschreiben
                         if let Some(st) = self.downloads.get_mut(&d.id) {
-                            if st.path.is_none() {
-                                st.path = Some(d.path.clone());
-                            }
-                            if !st.finished {
-                                st.finished = true;
-                            }
+                            if st.path.is_none() { st.path = Some(d.path.clone()); }
+                            if !st.finished { st.finished = true; }
                             if let Some(meta) = self.download_meta.get_mut(&d.id) {
                                 meta.size = Some(d.size);
                                 meta.modified = Some(d.modified);
                             }
                         } else {
-                            // Neue Session-unabhängige Einträge hinzufügen (nur Meta minimal)
                             self.downloads.insert(
                                 d.id.clone(),
-                                DownloadState {
-                                    finished: true,
-                                    path: Some(d.path.clone()),
-                                    ..Default::default()
-                                },
+                                DownloadState { finished: true, path: Some(d.path.clone()), ..Default::default() }
                             );
                             self.download_order.push(d.id.clone());
                             self.download_meta.insert(
                                 d.id.clone(),
-                                DownloadMeta {
-                                    id: d.id.clone(),
-                                    name: d.name.clone(),
-                                    info: d.info.clone(),
-                                    container_extension: d.container_extension.clone(),
-                                    size: Some(d.size),
-                                    modified: Some(d.modified),
-                                },
+                                DownloadMeta { id: d.id.clone(), name: d.name.clone(), info: d.info.clone(), container_extension: d.container_extension.clone(), size: Some(d.size), modified: Some(d.modified) }
                             );
                         }
                     }
                 }
-                Msg::SearchResults {
-                    query: _query,
-                    results,
-                } => {
-                    // Convert search results to content rows
-                    let mut rows = Vec::new();
-                    for item in results {
-                        rows.push(Row {
-                            name: item.name.clone(),
-                            id: item.id.clone(),
-                            info: format!(
-                                "Year: {} - Rating: {:.1}/5",
-                                item.year.clone().unwrap_or("N/A".to_string()),
-                                item.rating_5based.unwrap_or(0.0)
-                            ),
-                            container_extension: Some(item.container_extension.clone()),
-                            stream_url: item.stream_url.clone(),
-                            cover_url: item.cover.clone(),
-                            year: item.year.clone(),
-                            release_date: item.release_date.clone().or_else(|| extract_year_from_title(&item.name)).or_else(|| item.year.clone()),
-                            rating_5based: item.rating_5based,
-                            genre: item.genre.clone(),
-                            path: None,
-                        });
-                    }
-                    self.content_rows = rows;
+                Msg::SearchResults { .. } => {
+                    // Legacy Such-Ergebnisse – aktuell nicht genutzt (SearchReady wird verwendet)
                     self.is_loading = false;
                 }
-
                 Msg::WisdomGateRecommendations(content) => {
-                    // Update cache with new content (only if it's not an error or demo content)
                     if !content.starts_with("API Fehler") && !content.starts_with("🌐 **Offline-Modus**") {
                         self.config.update_wisdom_gate_cache(content.clone());
-                        // Save config to persist cache
                         if let Err(e) = crate::config::write_config(&self.config) {
                             println!("⚠️ Fehler beim Speichern des Caches: {}", e);
-                        } else {
-                            println!("💾 Cache erfolgreich gespeichert");
-                        }
+                        } else { println!("💾 Cache erfolgreich gespeichert"); }
                     }
-                    
                     self.wisdom_gate_recommendations = Some(content);
-                    self.wisdom_gate_last_fetch = Some(std::time::Instant::now());
                 }
-            }
-        }
-        // Decide if we trigger a repaint now (mouse move shouldn't force full re-render if nothing changed)
-    let time_since_forced = now.duration_since(self.last_forced_repaint).as_millis() as u64;
+            } // end match msg
+        } // end while let Ok(msg)
     // Ultra Flicker Guard erhöht Intervall und erzwingt ausschließlich Event-basierte Repaints
     let repaint_interval = if self.config.ultra_low_flicker_mode { 900 } else if self.config.low_cpu_mode { 500 } else { 120 }; // base cadence
         if self.pending_repaint_due_to_msg || got_msg {
@@ -2244,9 +2527,20 @@ impl eframe::App for MacXtreamer {
                     ui.vertical(|ui| {
                         let (n,l,f) = crate::player::apply_bias(&self.config);
                         ui.label(egui::RichText::new(format!("VLC: {}", shorten(&vlc_preview))).small()).on_hover_text(format!("Bias -> network={}ms live={}ms file={}ms", n,l,f));
-                        ui.label(egui::RichText::new(format!("MPV: {}", shorten(&mpv_preview))).small()).on_hover_text(if self.has_mpv { format!("MPV Cache Mapping: cache-secs={} readahead basiert auf Bias/Overrides", if self.config.mpv_cache_secs_override!=0 { self.config.mpv_cache_secs_override.to_string() } else { ((n/1000).max(1)).to_string() }) } else { "mpv nicht verfügbar".into() });
+                        let mpv_hover = if self.has_mpv {
+                            format!("MPV Cache Mapping: cache-secs={} readahead basiert auf Bias/Overrides\nPfad: {}\nVersion: {}",
+                                if self.config.mpv_cache_secs_override!=0 { self.config.mpv_cache_secs_override.to_string() } else { ((n/1000).max(1)).to_string() },
+                                self.detected_mpv_path.clone().unwrap_or("?".into()),
+                                self.mpv_version.clone().unwrap_or("?".into()))
+                        } else {
+                            "mpv nicht verfügbar – optional manuellen Pfad in Settings setzen".into()
+                        };
+                        ui.label(egui::RichText::new(format!("MPV: {}", shorten(&mpv_preview))).small()).on_hover_text(mpv_hover);
                         if self.config.low_cpu_mode {
                             ui.label(egui::RichText::new(format!("Pending tex:{} covers:{} decodes:{} dl:{}", self.pending_texture_uploads.len(), self.pending_covers.len(), self.pending_decode_urls.len(), self.active_downloads())).small()).on_hover_text("Debug Statistiken im Low-CPU Mode");
+                        }
+                        if !self.has_mpv {
+                            ui.colored_label(egui::Color32::YELLOW, "mpv nicht gefunden – Settings öffnen und Pfad setzen falls installiert");
                         }
                     });
                     if ui.button("Settings").clicked() {
@@ -2329,33 +2623,169 @@ impl eframe::App for MacXtreamer {
                         });
                     }
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        if ui.button("Search").clicked() {
-                            if let Some(cv) = &self.current_view {
-                                self.view_stack.push(cv.clone());
+                        let search_enabled = !self.indexing && matches!(self.search_status, SearchStatus::Idle | SearchStatus::Completed { .. } | SearchStatus::NoResults | SearchStatus::Error(_));
+                        
+                        ui.add_enabled_ui(search_enabled, |ui| {
+                            if ui.button("Search").clicked() {
+                                if let Some(cv) = &self.current_view {
+                                    self.view_stack.push(cv.clone());
+                                }
+                                self.current_view = Some(ViewState::Search {
+                                    query: self.search_text.clone(),
+                                });
+                                self.start_search();
                             }
-                            self.current_view = Some(ViewState::Search {
-                                query: self.search_text.clone(),
-                            });
-                            self.start_search();
-                        }
-                        let resp = egui::TextEdit::singleline(&mut self.search_text)
-                            .hint_text("Search…")
-                            .desired_width(220.0)
-                            .lock_focus(true)
-                            .show(ui);
-                        if resp.response.ctx.input(|i| i.key_pressed(egui::Key::Enter)) {
-                            if let Some(cv) = &self.current_view {
-                                self.view_stack.push(cv.clone());
+                        });
+                        
+                        if !search_enabled {
+                            if self.indexing {
+                                ui.label(RichText::new("🏗️ Index wird erstellt...").size(12.0).color(Color32::from_rgb(255, 165, 0)));
                             }
-                            self.current_view = Some(ViewState::Search {
-                                query: self.search_text.clone(),
-                            });
-                            self.start_search();
-                            resp.response.request_focus();
                         }
+                        
+                        // Enhanced search box with history
+                        ui.horizontal(|ui| {
+                            let text_edit_resp = egui::TextEdit::singleline(&mut self.search_text)
+                                .hint_text(if self.indexing { "Index wird erstellt..." } else { "🔍 Suchen..." })
+                                .desired_width(180.0)
+                                .lock_focus(true)
+                                .show(ui);
+                            
+                            let enter_pressed = search_enabled && text_edit_resp.response.ctx.input(|i| i.key_pressed(egui::Key::Enter));
+                            
+                            // Clear button
+                            if !self.search_text.is_empty() {
+                                if ui.button("✖").on_hover_text("Suche löschen").clicked() {
+                                    self.search_text.clear();
+                                }
+                            }
+                            
+                            // History dropdown button
+                            if !self.search_history.is_empty() {
+                                let history_button = ui.button("🕐").on_hover_text("Suchverlauf");
+                                if history_button.clicked() {
+                                    self.show_search_history = !self.show_search_history;
+                                }
+                                
+                                // Show history popup
+                                if self.show_search_history {
+                                    egui::Window::new("Suchverlauf")
+                                        .anchor(egui::Align2::RIGHT_TOP, [-10.0, 40.0])
+                                        .collapsible(false)
+                                        .resizable(false)
+                                        .show(ui.ctx(), |ui| {
+                                            ui.set_min_width(250.0);
+                                            ui.label(RichText::new("Letzte Suchen:").strong());
+                                            ui.separator();
+                                            
+                                            let mut clicked_query: Option<String> = None;
+                                            for (i, query) in self.search_history.iter().enumerate() {
+                                                ui.horizontal(|ui| {
+                                                    if ui.button("🔍").clicked() {
+                                                        clicked_query = Some(query.clone());
+                                                    }
+                                                    if ui.selectable_label(false, query).clicked() {
+                                                        clicked_query = Some(query.clone());
+                                                    }
+                                                });
+                                                if i < self.search_history.len() - 1 {
+                                                    ui.add_space(2.0);
+                                                }
+                                            }
+                                            
+                                            ui.separator();
+                                            if ui.button("🗑 Verlauf löschen").clicked() {
+                                                self.search_history.clear();
+                                                self.show_search_history = false;
+                                            }
+                                            
+                                            if let Some(query) = clicked_query {
+                                                self.search_text = query.clone();
+                                                self.show_search_history = false;
+                                                if let Some(cv) = &self.current_view {
+                                                    self.view_stack.push(cv.clone());
+                                                }
+                                                self.current_view = Some(ViewState::Search { query });
+                                                self.start_search();
+                                            }
+                                        });
+                                }
+                            }
+                            
+                            if enter_pressed && !self.search_text.trim().is_empty() {
+                                let query = self.search_text.clone();
+                                
+                                // Add to history (avoid duplicates, keep max 10)
+                                self.search_history.retain(|q| q != &query);
+                                self.search_history.insert(0, query.clone());
+                                if self.search_history.len() > 10 {
+                                    self.search_history.truncate(10);
+                                }
+                                self.show_search_history = false;
+                                
+                                if let Some(cv) = &self.current_view {
+                                    self.view_stack.push(cv.clone());
+                                }
+                                self.current_view = Some(ViewState::Search { query });
+                                self.start_search();
+                                text_edit_resp.response.request_focus();
+                            }
+                        });
                     });
+                    
+                    // Such-Status-Anzeige
+                    match &self.search_status {
+                        SearchStatus::Searching => {
+                            ui.horizontal(|ui| {
+                                ui.spinner();
+                                ui.label(colored_text_by_type("Suche läuft...", "info"));
+                            });
+                        }
+                        SearchStatus::NoResults => {
+                            ui.label(colored_text_by_type("⚠ Keine Ergebnisse gefunden", "warning"));
+                        }
+                        SearchStatus::Error(err) => {
+                            ui.label(colored_text_by_type(&format!("❌ Suchfehler: {}", err), "error"));
+                        }
+                        SearchStatus::Completed { results } => {
+                            ui.label(colored_text_by_type(&format!("✅ {} Ergebnisse gefunden", results), "success"));
+                        }
+                        SearchStatus::Idle => {
+                            // Keine Anzeige bei Idle
+                        }
+                        SearchStatus::Indexing { progress } => {
+                            ui.horizontal(|ui| {
+                                ui.spinner();
+                                ui.label(colored_text_by_type(&format!("🏗️ {}", progress), "info"));
+                            });
+                        }
+                    }
+                    
                     if self.indexing {
                         render_loading_spinner(ui, "Indexing");
+                    }
+                    
+                    // Kritische Fehlermeldungen prominent anzeigen
+                    let should_clear_error = if let Some(ref error) = self.last_error {
+                        if error.contains("KRITISCHER FEHLER") || error.contains("kein Player") {
+                            ui.separator();
+                            let mut clear = false;
+                            ui.horizontal(|ui| {
+                                ui.label(RichText::new("🚨").size(16.0));
+                                ui.label(RichText::new(error).color(Color32::from_rgb(255, 100, 100)).strong());
+                                if ui.small_button("❌").on_hover_text("Fehlermeldung schließen").clicked() {
+                                    clear = true;
+                                }
+                            });
+                            clear
+                        } else {
+                            false
+                        }
+                    } else {
+                        false
+                    };
+                    if should_clear_error {
+                        self.last_error = None;
                     }
                 });
 
@@ -2368,10 +2798,10 @@ impl eframe::App for MacXtreamer {
                         .id_source("live_list")
                         .show(&mut cols[0], |ui| {
                             for (i, c) in self.playlists.clone().into_iter().enumerate() {
-                                if ui
-                                    .selectable_label(self.selected_playlist == Some(i), &c.name)
-                                    .clicked()
-                                {
+                                let response = ui.selectable_label(self.selected_playlist == Some(i), &c.name);
+                                
+                                // Left click - load category
+                                if response.clicked() {
                                     if let Some(cv) = &self.current_view {
                                         self.view_stack.push(cv.clone());
                                     }
@@ -2386,8 +2816,38 @@ impl eframe::App for MacXtreamer {
                                     self.loading_total = 1;
                                     self.loading_done = 0;
                                     self.last_live_cat_id = Some(c.id.clone());
-                                    self.spawn_load_items("subplaylist", c.id);
+                                    self.spawn_load_items("subplaylist", c.id.clone());
                                 }
+                                
+                                // Right click - show context menu
+                                response.context_menu(|ui| {
+                                    let cat_id = c.id.clone();
+                                    let cat_name = c.name.clone();
+                                    
+                                    if ui.button("▶ Play All").clicked() {
+                                        // First load the items if not loaded
+                                        if self.selected_playlist != Some(i) {
+                                            self.selected_playlist = Some(i);
+                                            self.spawn_load_items("subplaylist", cat_id.clone());
+                                            // Give it a moment to load
+                                            std::thread::sleep(std::time::Duration::from_millis(500));
+                                        }
+                                        self.play_all_channels(&cat_id, &cat_name);
+                                        ui.close_menu();
+                                    }
+                                    
+                                    if ui.button("📋 Copy M3U to Clipboard").clicked() {
+                                        let content = self.generate_m3u_content(&cat_id);
+                                        self.copy_to_clipboard(content);
+                                        ui.close_menu();
+                                    }
+                                    
+                                    if ui.button("💾 Save as M3U Playlist").clicked() {
+                                        let content = self.generate_m3u_content(&cat_id);
+                                        self.save_m3u_file(content, &cat_name);
+                                        ui.close_menu();
+                                    }
+                                });
                             }
                         });
 
@@ -2687,6 +3147,82 @@ impl eframe::App for MacXtreamer {
             let avail_w = ui.available_width();
             let avail_h = ui.available_height();
             ui.set_width(avail_w);
+            
+            // Spezielle Behandlung für Suchansicht
+            if let Some(ViewState::Search { query }) = &self.current_view {
+                match &self.search_status {
+                    SearchStatus::Indexing { progress } => {
+                        ui.vertical_centered(|ui| {
+                            ui.add_space(avail_h / 3.0);
+                            ui.horizontal(|ui| {
+                                ui.add_space(avail_w / 2.0 - 120.0);
+                                ui.spinner();
+                                ui.label(RichText::new("🏗️ Index wird erstellt").size(18.0).strong());
+                            });
+                            ui.add_space(10.0);
+                            ui.label(RichText::new(progress).size(14.0).color(Color32::GRAY));
+                            ui.add_space(10.0);
+                            ui.add(
+                                egui::ProgressBar::new(0.5)
+                                    .show_percentage()
+                                    .text("Katalog wird aufgebaut...")
+                                    .desired_width(300.0),
+                            );
+                            ui.add_space(10.0);
+                            ui.label(RichText::new("Suche ist verfügbar sobald der Index fertig ist.").size(12.0).color(Color32::from_rgb(150, 150, 150)));
+                        });
+                        return; // Früher Return, um Tabelle nicht zu rendern
+                    }
+                    SearchStatus::Searching => {
+                        ui.vertical_centered(|ui| {
+                            ui.add_space(avail_h / 3.0);
+                            ui.horizontal(|ui| {
+                                ui.add_space(avail_w / 2.0 - 100.0);
+                                ui.spinner();
+                                ui.label(RichText::new(&format!("Suche nach '{}'...", query)).size(16.0));
+                            });
+                            ui.add_space(10.0);
+                            ui.add(
+                                egui::ProgressBar::new(0.5)
+                                    .show_percentage()
+                                    .text("Durchsuche Katalog...")
+                                    .desired_width(300.0),
+                            );
+                        });
+                        return; // Früher Return, um Tabelle nicht zu rendern
+                    }
+                    SearchStatus::NoResults => {
+                        ui.vertical_centered(|ui| {
+                            ui.add_space(avail_h / 3.0);
+                            ui.label(RichText::new("🔍 Keine Ergebnisse gefunden").size(18.0).color(Color32::from_rgb(255, 165, 0)));
+                            ui.add_space(10.0);
+                            ui.label(RichText::new(&format!("Für '{}' wurden keine Inhalte gefunden.", query)).size(14.0));
+                            ui.add_space(10.0);
+                            ui.label("Versuche es mit einem anderen Suchbegriff.");
+                        });
+                        return;
+                    }
+                    SearchStatus::Error(err) => {
+                        ui.vertical_centered(|ui| {
+                            ui.add_space(avail_h / 3.0);
+                            ui.label(RichText::new("❌ Suchfehler").size(18.0).color(Color32::RED));
+                            ui.add_space(10.0);
+                            ui.label(RichText::new(err).size(14.0).color(Color32::from_rgb(200, 100, 100)));
+                        });
+                        return;
+                    }
+                    SearchStatus::Completed { results } => {
+                        ui.horizontal(|ui| {
+                            ui.label(RichText::new(&format!("🔍 Suchergebnisse für '{}': {} gefunden", query, results)).strong());
+                        });
+                        ui.separator();
+                    }
+                    SearchStatus::Idle => {
+                        // Zeige normale Tabelle
+                    }
+                }
+            }
+            
             let mut rows = self.content_rows.clone();
             // Apply sorting if active
             if let Some(key) = self.sort_key {
@@ -3148,12 +3684,42 @@ impl eframe::App for MacXtreamer {
                             let draft = self.config_draft.get_or_insert_with(|| self.config.clone());
                             
                             ui.collapsing("📡 Server", |ui| {
+                                // Server Profile Selector and Manager
+                                ui.horizontal(|ui| {
+                                    ui.label("Profile:");
+                                    let profile_names: Vec<String> = draft.server_profiles.iter().enumerate()
+                                        .map(|(i, p)| format!("{}: {}", i + 1, p.name))
+                                        .collect();
+                                    let mut selected = draft.active_profile_index;
+                                    let current_text = profile_names.get(selected)
+                                        .cloned()
+                                        .unwrap_or_else(|| "No profiles".to_string());
+                                    egui::ComboBox::from_id_source("server_profile_selector")
+                                        .selected_text(current_text)
+                                        .show_ui(ui, |ui| {
+                                            for (i, name) in profile_names.iter().enumerate() {
+                                                if ui.selectable_value(&mut selected, i, name).clicked() {
+                                                    draft.active_profile_index = i;
+                                                }
+                                            }
+                                        });
+                                    if ui.button("⚙ Manage").on_hover_text("Manage server profiles").clicked() {
+                                        self.show_server_manager = true;
+                                    }
+                                });
+                                
+                                ui.separator();
+                                
+                                // Edit active profile
+                                let active = draft.active_profile_mut();
+                                ui.label("Profile Name");
+                                ui.add(egui::TextEdit::singleline(&mut active.name).desired_width(f32::INFINITY));
                                 ui.label("URL");
-                                ui.add(egui::TextEdit::singleline(&mut draft.address).desired_width(f32::INFINITY));
+                                ui.add(egui::TextEdit::singleline(&mut active.address).desired_width(f32::INFINITY));
                                 ui.label("Username");
-                                ui.add(egui::TextEdit::singleline(&mut draft.username).desired_width(f32::INFINITY));
+                                ui.add(egui::TextEdit::singleline(&mut active.username).desired_width(f32::INFINITY));
                                 ui.label("Password");
-                                ui.add(egui::TextEdit::singleline(&mut draft.password).password(true).desired_width(f32::INFINITY));
+                                ui.add(egui::TextEdit::singleline(&mut active.password).password(true).desired_width(f32::INFINITY));
                             });
 
                             ui.collapsing("🎬 Player", |ui| {
@@ -3189,6 +3755,21 @@ impl eframe::App for MacXtreamer {
                                 });
                                 ui.collapsing("MPV Optionen", |ui| {
                                     if !self.has_mpv { ui.colored_label(egui::Color32::RED, "mpv nicht installiert"); }
+                                    let mut custom = draft.mpv_custom_path.clone();
+                                    if ui.add(egui::TextEdit::singleline(&mut custom).hint_text("mpv Custom Path (optional)")).changed(){ draft.mpv_custom_path = custom; }
+                                    if ui.small_button("Test mpv Pfad").on_hover_text("Versucht mpv --version auszuführen").clicked() {
+                                        if !draft.mpv_custom_path.trim().is_empty() {
+                                            if std::path::Path::new(draft.mpv_custom_path.trim()).exists() {
+                                                if let Ok(out) = std::process::Command::new(draft.mpv_custom_path.trim()).arg("--version").output() {
+                                                    if let Ok(txt) = String::from_utf8(out.stdout) { println!("mpv custom test: {}", txt.lines().next().unwrap_or("(leer)")); }
+                                                }
+                                            } else { println!("mpv custom path existiert nicht"); }
+                                        }
+                                    }
+                                    if ui.small_button("Detect jetzt").on_hover_text("Erneute Player-Erkennung mit Custom Path").clicked() {
+                                        // Nur Flag setzen – tatsächliche Erkennung außerhalb des UI-Borrows
+                                        self.pending_player_redetect = true;
+                                    }
                                     let mut extra = draft.mpv_extra_args.clone(); if ui.add(egui::TextEdit::singleline(&mut extra).hint_text("extra mpv args")).changed(){ draft.mpv_extra_args=extra; }
                                     ui.horizontal(|ui| {
                                         let mut cache_override = draft.mpv_cache_secs_override.to_string(); if ui.add(egui::TextEdit::singleline(&mut cache_override).hint_text("cache-secs (0 auto)")).changed(){ draft.mpv_cache_secs_override=cache_override.parse().unwrap_or(0);} 
@@ -3500,13 +4081,20 @@ impl eframe::App for MacXtreamer {
                         egui::ComboBox::from_label("")
                             .selected_text(&draft.wisdom_gate_model)
                             .show_ui(ui, |ui| {
-                                ui.selectable_value(&mut draft.wisdom_gate_model, "wisdom-ai-dsv3".to_string(), "Wisdom-AI DSV3 (Standard)");
-                                ui.selectable_value(&mut draft.wisdom_gate_model, "deepseek-v3".to_string(), "DeepSeek V3");
-                                ui.selectable_value(&mut draft.wisdom_gate_model, "gemini-2.5-flash".to_string(), "Gemini 2.5 Flash");
-                                ui.selectable_value(&mut draft.wisdom_gate_model, "gemini-2.5-flash-image".to_string(), "Gemini 2.5 Flash (Vision)");
-                                ui.selectable_value(&mut draft.wisdom_gate_model, "wisdom-ai-gemini-2.5-flash".to_string(), "Wisdom-AI Gemini 2.5 Flash");
-                                ui.selectable_value(&mut draft.wisdom_gate_model, "wisdom-vision-gemini-2.5-flash-image".to_string(), "Wisdom Vision Gemini 2.5 Flash");
-                                ui.selectable_value(&mut draft.wisdom_gate_model, "tts-1".to_string(), "TTS-1 (Text-to-Speech)");
+                                ui.selectable_value(&mut draft.wisdom_gate_model, "gpt-3.5-turbo".to_string(), "🥇 GPT-3.5 Turbo (Empfohlen)");
+                                ui.selectable_value(&mut draft.wisdom_gate_model, "gpt-4".to_string(), "🧠 GPT-4 (Premium)");
+                                ui.selectable_value(&mut draft.wisdom_gate_model, "claude-3-sonnet".to_string(), "🎭 Claude 3 Sonnet");
+                                ui.selectable_value(&mut draft.wisdom_gate_model, "gemini-pro".to_string(), "💎 Gemini Pro");
+                                ui.selectable_value(&mut draft.wisdom_gate_model, "llama-2-70b-chat".to_string(), "🦙 Llama 2 70B Chat");
+                                ui.selectable_value(&mut draft.wisdom_gate_model, "mistral-7b-instruct".to_string(), "⚡ Mistral 7B (Schnell)");
+
+                                ui.separator();
+                                ui.label("Endpoint:");
+                                ui.text_edit_singleline(&mut draft.wisdom_gate_endpoint);
+                                ui.separator();
+                                ui.label("⚠️ Alte Modelle (evtl. nicht verfügbar):");
+                                ui.selectable_value(&mut draft.wisdom_gate_model, "wisdom-ai-dsv3".to_string(), "❌ Wisdom-AI DSV3 (veraltet)");
+                                ui.selectable_value(&mut draft.wisdom_gate_model, "deepseek-v3".to_string(), "❌ DeepSeek V3 (veraltet)");
                             });
                     });
                     
@@ -3554,6 +4142,114 @@ impl eframe::App for MacXtreamer {
             }
         }
 
+        // Server Profile Manager Window
+        if self.show_server_manager {
+            let mut open = self.show_server_manager;
+            egui::Window::new("🌐 Server Profile Manager")
+                .collapsible(false)
+                .resizable(true)
+                .default_width(500.0)
+                .default_height(400.0)
+                .anchor(egui::Align2::CENTER_CENTER, egui::vec2(0.0, 0.0))
+                .open(&mut open)
+                .show(ctx, |ui| {
+                    egui::ScrollArea::vertical()
+                        .auto_shrink([false; 2])
+                        .show(ui, |ui| {
+                            let draft = self.config_draft.get_or_insert_with(|| self.config.clone());
+                            
+                            ui.heading("Server Profiles");
+                            ui.separator();
+                            
+                            // List all profiles
+                            let mut profile_to_delete: Option<usize> = None;
+                            let mut profile_to_switch: Option<usize> = None;
+                            
+                            for (i, profile) in draft.server_profiles.iter().enumerate() {
+                                let is_active = i == draft.active_profile_index;
+                                ui.horizontal(|ui| {
+                                    let badge = if is_active { "✓" } else { "" };
+                                    let color = if is_active { 
+                                        egui::Color32::from_rgb(100, 200, 100)
+                                    } else {
+                                        ui.visuals().text_color()
+                                    };
+                                    
+                                    ui.colored_label(color, format!("{} {}", badge, profile.name));
+                                    ui.label(egui::RichText::new(&profile.address).small().weak());
+                                    
+                                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                                        if !is_active && ui.small_button("❌").on_hover_text("Delete profile").clicked() {
+                                            profile_to_delete = Some(i);
+                                        }
+                                        if !is_active && ui.small_button("✓").on_hover_text("Switch to this profile").clicked() {
+                                            profile_to_switch = Some(i);
+                                        }
+                                    });
+                                });
+                                ui.separator();
+                            }
+                            
+                            // Handle profile actions
+                            if let Some(idx) = profile_to_delete {
+                                if draft.server_profiles.len() > 1 {
+                                    draft.server_profiles.remove(idx);
+                                    // Adjust active index if needed
+                                    if draft.active_profile_index >= draft.server_profiles.len() {
+                                        draft.active_profile_index = draft.server_profiles.len().saturating_sub(1);
+                                    }
+                                }
+                            }
+                            
+                            if let Some(idx) = profile_to_switch {
+                                draft.active_profile_index = idx;
+                                self.show_server_manager = false;
+                                // Auto-save to make switch immediate
+                                self.config = draft.clone();
+                                self.pending_save_config = true;
+                            }
+                            
+                            ui.add_space(8.0);
+                            
+                            // Add new profile section
+                            ui.heading("Add New Profile");
+                            ui.separator();
+                            
+                            ui.horizontal(|ui| {
+                                ui.label("Name:");
+                                ui.add(egui::TextEdit::singleline(&mut self.new_profile_name)
+                                    .hint_text("e.g., Main Server, Test Server")
+                                    .desired_width(200.0));
+                            });
+                            
+                            ui.horizontal(|ui| {
+                                if ui.button("➕ Add Profile").clicked() {
+                                    let name = if self.new_profile_name.trim().is_empty() {
+                                        format!("Server {}", draft.server_profiles.len() + 1)
+                                    } else {
+                                        self.new_profile_name.trim().to_string()
+                                    };
+                                    
+                                    draft.server_profiles.push(crate::models::ServerProfile {
+                                        name,
+                                        address: String::new(),
+                                        username: String::new(),
+                                        password: String::new(),
+                                    });
+                                    
+                                    self.new_profile_name.clear();
+                                }
+                                
+                                if ui.button("Close").clicked() {
+                                    self.show_server_manager = false;
+                                }
+                            });
+                        });
+                });
+            
+            self.show_server_manager = open;
+        }
+
 
 
         // Log viewer window
@@ -3575,6 +4271,29 @@ impl eframe::App for MacXtreamer {
                             let _ = std::fs::write(path, "");
                             self.log_text.clear();
                         }
+                        if ui.small_button("Open in Editor").clicked() {
+                            let path = crate::logger::log_path();
+                            #[cfg(target_os = "macos")]
+                            {
+                                let _ = std::process::Command::new("open")
+                                    .arg(&path)
+                                    .spawn();
+                            }
+                            #[cfg(target_os = "linux")]
+                            {
+                                let _ = std::process::Command::new("xdg-open")
+                                    .arg(&path)
+                                    .spawn();
+                            }
+                            #[cfg(target_os = "windows")]
+                            {
+                                let _ = std::process::Command::new("notepad")
+                                    .arg(&path)
+                                    .spawn();
+                            }
+                        }
+                        ui.separator();
+                        ui.label("📄 Log-Datei: ~/.macxtreamer/app.log");
                     });
                     egui::ScrollArea::vertical()
                         .stick_to_bottom(true)
@@ -3589,6 +4308,8 @@ impl eframe::App for MacXtreamer {
 
         // Handle deferred save to avoid mutable borrow inside Window closure
         if self.pending_save_config {
+            // Sync active profile to legacy fields before saving
+            self.config.sync_active_profile();
             let _ = save_config(&self.config);
             // Übernehme neue Parallelität sofort
             let permits = if self.config.cover_parallel == 0 {
@@ -3678,6 +4399,12 @@ impl eframe::App for MacXtreamer {
             if !open {
                 self.confirm_bulk = None;
             }
+        }
+
+        // Ausstehende Player Neu-Erkennung nach UI Aktionen durchführen
+        if self.pending_player_redetect {
+            self.perform_player_detection();
+            self.pending_player_redetect = false;
         }
 
         // Process any pending bulk downloads enqueued by messages to avoid borrow conflicts

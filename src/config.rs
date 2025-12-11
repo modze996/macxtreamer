@@ -84,6 +84,7 @@ pub fn read_config() -> Result<Config, io::Error> {
                 "wisdom_gate_api_key" => cfg.wisdom_gate_api_key = v.trim().to_string(),
                 "wisdom_gate_prompt" => cfg.wisdom_gate_prompt = v.trim().to_string(),
                 "wisdom_gate_model" => cfg.wisdom_gate_model = v.trim().to_string(),
+                "wisdom_gate_endpoint" => cfg.wisdom_gate_endpoint = v.trim().to_string(),
                 "wisdom_gate_cache_content" => {
                     // Decode base64 content for multiline support
                     if let Ok(decoded_bytes) = general_purpose::STANDARD.decode(v.trim()) {
@@ -102,22 +103,59 @@ pub fn read_config() -> Result<Config, io::Error> {
                 "ultra_low_flicker_mode" => cfg.ultra_low_flicker_mode = v.trim().parse::<u8>().map(|n| n!=0).unwrap_or(false),
                 "bottom_panel_height" => cfg.bottom_panel_height = v.trim().parse::<f32>().unwrap_or(0.0),
                 "left_panel_width" => cfg.left_panel_width = v.trim().parse::<f32>().unwrap_or(0.0),
+                "active_profile_index" => cfg.active_profile_index = v.trim().parse::<usize>().unwrap_or(0),
+                "server_profile" => {
+                    // Format: name|address|username|password
+                    let parts: Vec<&str> = v.split('|').collect();
+                    if parts.len() == 4 {
+                        cfg.server_profiles.push(crate::models::ServerProfile {
+                            name: parts[0].to_string(),
+                            address: parts[1].to_string(),
+                            username: parts[2].to_string(),
+                            password: parts[3].to_string(),
+                        });
+                    }
+                },
                 _ => {}
             }
         }
     }
-    if cfg.download_dir.trim().is_empty() {
-        if let Ok(home) = std::env::var("HOME") {
-            cfg.download_dir = format!("{}/Downloads/macxtreamer", home);
+    
+    // Migrate legacy config to profiles if needed (only if no profiles exist yet)
+    let had_no_profiles = cfg.server_profiles.is_empty();
+    if had_no_profiles {
+        cfg.migrate_to_profiles();
+    } else {
+        // If profiles exist, just sync the active one to legacy fields
+        // Ensure active_profile_index is valid
+        if cfg.active_profile_index >= cfg.server_profiles.len() {
+            cfg.active_profile_index = 0;
         }
+        cfg.sync_active_profile();
     }
     
-    // Set default Wisdom-Gate values if empty
-    if cfg.wisdom_gate_prompt.trim().is_empty() {
+    // Ensure at least one profile exists after migration/sync
+    if cfg.server_profiles.is_empty() {
+        cfg.server_profiles.push(crate::models::ServerProfile::default());
+        cfg.active_profile_index = 0;
+    }
+    
+    // Only save if we had no profiles before and now have them (first migration)
+    let needs_save = had_no_profiles && !cfg.server_profiles.is_empty();
+    
+    if cfg.download_dir.trim().is_empty() {
         cfg.wisdom_gate_prompt = crate::models::default_wisdom_gate_prompt();
     }
     if cfg.wisdom_gate_model.trim().is_empty() {
-        cfg.wisdom_gate_model = "wisdom-ai-dsv3".to_string(); // Default model - actually available
+        cfg.wisdom_gate_model = "gpt-3.5-turbo".to_string(); // Default model - actually available
+    }
+    if cfg.wisdom_gate_endpoint.trim().is_empty() {
+        cfg.wisdom_gate_endpoint = "https://api.wisdom-gate.ai/v1/chat/completions".to_string();
+    }
+    
+    // Save immediately after migration to persist profiles
+    if needs_save {
+        let _ = save_config(&cfg);
     }
     
     Ok(cfg)
@@ -127,9 +165,51 @@ pub fn save_config(cfg: &Config) -> Result<(), io::Error> {
     let path = config_file_path();
     if let Some(parent) = path.parent() { fs::create_dir_all(parent)?; }
     let mut f = fs::File::create(path)?;
-    if !cfg.address.is_empty() { writeln!(f, "address={}", cfg.address)?; }
-    if !cfg.username.is_empty() { writeln!(f, "username={}", cfg.username)?; }
-    if !cfg.password.is_empty() { writeln!(f, "password={}", cfg.password)?; }
+    
+    // Create a cleaned copy of profiles without empty Default profiles
+    let mut cleaned_profiles: Vec<&crate::models::ServerProfile> = Vec::new();
+    let mut old_to_new_index: Vec<usize> = Vec::new();
+    
+    for (_old_idx, profile) in cfg.server_profiles.iter().enumerate() {
+        // Skip empty Default profiles
+        if profile.name == "Default" && profile.address.is_empty() && profile.username.is_empty() && profile.password.is_empty() {
+            old_to_new_index.push(usize::MAX); // Mark as removed
+            continue;
+        }
+        old_to_new_index.push(cleaned_profiles.len());
+        cleaned_profiles.push(profile);
+    }
+    
+    // If no profiles remain, save at least one default
+    if cleaned_profiles.is_empty() {
+        writeln!(f, "server_profile=Default|||")?;
+        writeln!(f, "active_profile_index=0")?;
+    } else {
+        // Save cleaned profiles
+        for profile in &cleaned_profiles {
+            writeln!(f, "server_profile={}|{}|{}|{}", profile.name, profile.address, profile.username, profile.password)?;
+        }
+        
+        // Map the active_profile_index to the cleaned list
+        let valid_index = if cfg.active_profile_index < old_to_new_index.len() {
+            let new_idx = old_to_new_index[cfg.active_profile_index];
+            if new_idx != usize::MAX {
+                new_idx
+            } else {
+                0 // Active profile was removed, default to first
+            }
+        } else {
+            0
+        };
+        writeln!(f, "active_profile_index={}", valid_index)?;
+    }
+    
+    // Save active profile data to legacy fields for backward compatibility
+    let active = cfg.active_profile();
+    writeln!(f, "address={}", active.address)?;
+    writeln!(f, "username={}", active.username)?;
+    writeln!(f, "password={}", active.password)?;
+    
     if !cfg.player_command.is_empty() { writeln!(f, "player_command={}", cfg.player_command)?; }
     if !cfg.theme.is_empty() { writeln!(f, "theme={}", cfg.theme)?; }
     if cfg.cover_ttl_days != 0 { writeln!(f, "cover_ttl_days={}", cfg.cover_ttl_days)?; }
@@ -172,6 +252,7 @@ pub fn save_config(cfg: &Config) -> Result<(), io::Error> {
     if !cfg.wisdom_gate_api_key.is_empty() { writeln!(f, "wisdom_gate_api_key={}", cfg.wisdom_gate_api_key)?; }
     if !cfg.wisdom_gate_prompt.is_empty() { writeln!(f, "wisdom_gate_prompt={}", cfg.wisdom_gate_prompt)?; }
     if !cfg.wisdom_gate_model.is_empty() { writeln!(f, "wisdom_gate_model={}", cfg.wisdom_gate_model)?; }
+    if !cfg.wisdom_gate_endpoint.is_empty() { writeln!(f, "wisdom_gate_endpoint={}", cfg.wisdom_gate_endpoint)?; }
     if !cfg.wisdom_gate_cache_content.is_empty() { 
         // Encode cache content as base64 to handle multiline text (save_config)
         let encoded = general_purpose::STANDARD.encode(cfg.wisdom_gate_cache_content.as_bytes());
@@ -188,72 +269,6 @@ pub fn save_config(cfg: &Config) -> Result<(), io::Error> {
 }
 
 pub fn write_config(cfg: &Config) -> Result<(), io::Error> {
-    // Try to write to primary config location first, fallback to local file
-    let primary = config_file_path();
-    
-    // Create directory if it doesn't exist
-    if let Some(parent) = primary.parent() {
-        let _ = std::fs::create_dir_all(parent);
-    }
-    
-    match write_config_to_file(&primary, cfg) {
-        Ok(()) => Ok(()),
-        Err(_) => write_config_to_file(&PathBuf::from("xtream_config.txt"), cfg),
-    }
-}
-
-fn write_config_to_file(path: &PathBuf, cfg: &Config) -> Result<(), io::Error> {
-    let mut f = fs::OpenOptions::new()
-        .write(true)
-        .create(true)
-        .truncate(true)
-        .open(path)?;
-    
-    if !cfg.address.trim().is_empty() { writeln!(f, "address={}", cfg.address)?; }
-    if !cfg.username.trim().is_empty() { writeln!(f, "username={}", cfg.username)?; }
-    if !cfg.password.trim().is_empty() { writeln!(f, "password={}", cfg.password)?; }
-    if !cfg.player_command.trim().is_empty() { writeln!(f, "player_command={}", cfg.player_command)?; }
-    if !cfg.theme.trim().is_empty() { writeln!(f, "theme={}", cfg.theme)?; }
-    if cfg.cover_ttl_days != 0 { writeln!(f, "cover_ttl_days={}", cfg.cover_ttl_days)?; }
-    if cfg.cover_parallel != 0 { writeln!(f, "cover_parallel={}", cfg.cover_parallel)?; }
-    if cfg.font_scale != 0.0 { writeln!(f, "font_scale={:.2}", cfg.font_scale)?; }
-    if !cfg.download_dir.is_empty() { writeln!(f, "download_dir={}", cfg.download_dir)?; }
-    writeln!(f, "reuse_vlc={}", if cfg.reuse_vlc { 1 } else { 0 })?;
-    writeln!(f, "vlc_network_caching_ms={}", cfg.vlc_network_caching_ms)?;
-    writeln!(f, "vlc_live_caching_ms={}", cfg.vlc_live_caching_ms)?;
-    writeln!(f, "vlc_prefetch_buffer_bytes={}", cfg.vlc_prefetch_buffer_bytes)?;
-    writeln!(f, "vlc_file_caching_ms={}", cfg.vlc_file_caching_ms)?;
-    writeln!(f, "vlc_mux_caching_ms={}", cfg.vlc_mux_caching_ms)?;
-    writeln!(f, "vlc_http_reconnect={}", if cfg.vlc_http_reconnect { 1 } else { 0 })?;
-    writeln!(f, "vlc_timeout_ms={}", cfg.vlc_timeout_ms)?;
-    if !cfg.vlc_extra_args.trim().is_empty() { writeln!(f, "vlc_extra_args={}", cfg.vlc_extra_args)?; }
-    writeln!(f, "vlc_profile_bias={}", cfg.vlc_profile_bias)?;
-    writeln!(f, "vlc_verbose={}", if cfg.vlc_verbose {1} else {0})?;
-    writeln!(f, "vlc_diagnose_on_start={}", if cfg.vlc_diagnose_on_start {1} else {0})?;
-    writeln!(f, "vlc_continuous_diagnostics={}", if cfg.vlc_continuous_diagnostics {1} else {0})?;
-    writeln!(f, "use_mpv={}", if cfg.use_mpv {1} else {0})?;
-    if cfg.cover_uploads_per_frame != 0 { writeln!(f, "cover_uploads_per_frame={}", cfg.cover_uploads_per_frame)?; }
-    if cfg.cover_decode_parallel != 0 { writeln!(f, "cover_decode_parallel={}", cfg.cover_decode_parallel)?; }
-    if cfg.texture_cache_limit != 0 { writeln!(f, "texture_cache_limit={}", cfg.texture_cache_limit)?; }
-    if cfg.category_parallel != 0 { writeln!(f, "category_parallel={}", cfg.category_parallel)?; }
-    if cfg.cover_height != 0.0 { writeln!(f, "cover_height={:.1}", cfg.cover_height)?; }
-    writeln!(f, "enable_downloads={}", if cfg.enable_downloads { 1 } else { 0 })?;
-    if cfg.max_parallel_downloads != 0 { writeln!(f, "max_parallel_downloads={}", cfg.max_parallel_downloads)?; }
-    
-    // Save Wisdom-Gate configuration
-    if !cfg.wisdom_gate_api_key.is_empty() { writeln!(f, "wisdom_gate_api_key={}", cfg.wisdom_gate_api_key)?; }
-    if !cfg.wisdom_gate_prompt.is_empty() { writeln!(f, "wisdom_gate_prompt={}", cfg.wisdom_gate_prompt)?; }
-    if !cfg.wisdom_gate_model.is_empty() { writeln!(f, "wisdom_gate_model={}", cfg.wisdom_gate_model)?; }
-    if !cfg.wisdom_gate_cache_content.is_empty() { 
-        // Encode cache content as base64 to handle multiline text (write_config_to_file)
-        let encoded = general_purpose::STANDARD.encode(cfg.wisdom_gate_cache_content.as_bytes());
-        writeln!(f, "wisdom_gate_cache_content={}", encoded)?; 
-    }
-    if cfg.wisdom_gate_cache_timestamp > 0 { writeln!(f, "wisdom_gate_cache_timestamp={}", cfg.wisdom_gate_cache_timestamp)?; }
-    if !cfg.vlc_diag_history.trim().is_empty() { writeln!(f, "vlc_diag_history={}", cfg.vlc_diag_history)?; }
-    writeln!(f, "low_cpu_mode={}", if cfg.low_cpu_mode {1} else {0})?;
-    if cfg.bottom_panel_height > 0.0 { writeln!(f, "bottom_panel_height={:.1}", cfg.bottom_panel_height)?; }
-    if cfg.left_panel_width > 0.0 { writeln!(f, "left_panel_width={:.1}", cfg.left_panel_width)?; }
-    
-    Ok(())
+    // Use save_config which includes server profiles
+    save_config(cfg)
 }
