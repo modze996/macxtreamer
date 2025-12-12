@@ -352,14 +352,36 @@ pub struct RecentItem {
     pub container_extension: Option<String>,
 }
 
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct FavItem {
     pub id: String,
     pub info: String,
     pub name: String,
+    #[serde(default)]
+    pub item_type: String, // "Movie", "Series", "Channel", "Episode"
+    #[serde(default)]
     pub stream_url: Option<String>,
     #[serde(default)]
     pub container_extension: Option<String>,
+    #[serde(default)]
+    pub cover: Option<String>,
+    #[serde(default)]
+    pub series_id: Option<String>, // For episodes: reference to parent series
+}
+
+impl Default for FavItem {
+    fn default() -> Self {
+        Self {
+            id: String::new(),
+            info: String::new(),
+            name: String::new(),
+            item_type: String::new(),
+            stream_url: None,
+            container_extension: None,
+            cover: None,
+            series_id: None,
+        }
+    }
 }
 
 #[derive(Debug, Clone)]

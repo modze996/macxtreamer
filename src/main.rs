@@ -95,7 +95,7 @@ use once_cell::sync::OnceCell;
 static GLOBAL_TX: OnceCell<Sender<Msg>> = OnceCell::new();
 // Entfernte Header-Imports (ETAG etc.) – nicht mehr genutzt
 use search::search_items;
-use storage::{add_to_recently, load_favorites, load_recently_played, toggle_favorite};
+use storage::{add_to_recently, load_favorites, load_recently_played, toggle_favorite, is_favorite, load_search_history, save_search_history};
 
 #[tokio::main]
 async fn main() -> Result<(), eframe::Error> {
@@ -350,7 +350,7 @@ impl MacXtreamer {
             cover_sem: Arc::new(Semaphore::new(6)),
             cover_height: 60.0,
             search_text: String::new(),
-            search_history: Vec::new(),
+            search_history: load_search_history(),
             show_search_history: false,
             search_status: SearchStatus::Idle,
             is_loading: false,
@@ -2696,6 +2696,7 @@ impl eframe::App for MacXtreamer {
                                             ui.separator();
                                             if ui.button("🗑 Verlauf löschen").clicked() {
                                                 self.search_history.clear();
+                                                save_search_history(&self.search_history);
                                                 self.show_search_history = false;
                                             }
                                             
@@ -2721,6 +2722,7 @@ impl eframe::App for MacXtreamer {
                                 if self.search_history.len() > 10 {
                                     self.search_history.truncate(10);
                                 }
+                                save_search_history(&self.search_history);
                                 self.show_search_history = false;
                                 
                                 if let Some(cv) = &self.current_view {
@@ -2990,15 +2992,32 @@ impl eframe::App for MacXtreamer {
                                     let favorites = self.favorites.clone();
                                     for it in &favorites {
                                         ui.horizontal(|ui| {
-                                            ui.label(format!("{} ({})", it.name, it.info));
-                                            if it.info == "Series" {
+                                            // Display name with type indicator
+                                            let type_icon = match it.item_type.as_str() {
+                                                "Series" => "📺",
+                                                "Movie" => "🎬",
+                                                "Channel" => "📡",
+                                                "Episode" => "📺",
+                                                _ => "📄"
+                                            };
+                                            ui.label(format!("{} {} ({})", type_icon, it.name, it.item_type));
+                                            
+                                            if it.item_type == "Series" {
+                                                // For series, navigate to episodes view
                                                 if ui.small_button("Episodes").clicked() {
+                                                    if let Some(cv) = &self.current_view {
+                                                        self.view_stack.push(cv.clone());
+                                                    }
+                                                    self.current_view = Some(ViewState::Episodes {
+                                                        series_id: it.id.clone(),
+                                                    });
                                                     self.is_loading = true;
                                                     self.loading_total = 1;
                                                     self.loading_done = 0;
                                                     self.spawn_load_episodes(it.id.clone());
                                                 }
                                             } else {
+                                                // For movies/channels/episodes, show play button
                                                 let url =
                                                     it.stream_url.clone().unwrap_or_else(|| {
                                                         build_url_by_type(
@@ -3015,6 +3034,11 @@ impl eframe::App for MacXtreamer {
                                                 if ui.small_button("Copy").clicked() {
                                                     ui.output_mut(|o| o.copied_text = url.clone());
                                                 }
+                                            }
+                                            // Remove from favorites button
+                                            if ui.small_button("✕").on_hover_text("Aus Favoriten entfernen").clicked() {
+                                                toggle_favorite(&it);
+                                                self.favorites = load_favorites();
                                             }
                                         });
                                     }
@@ -3487,6 +3511,22 @@ impl eframe::App for MacXtreamer {
                                         self.loading_done = 0;
                                         self.spawn_load_episodes(r.id.clone());
                                     }
+                                    // Favoriten-Button für Series
+                                    let is_fav = is_favorite(&r.id, &r.info, "Series");
+                                    let fav_text = if is_fav { "★" } else { "☆" };
+                                    if ui.small_button(fav_text).on_hover_text("Zu Favoriten hinzufügen/entfernen").clicked() {
+                                        toggle_favorite(&FavItem {
+                                            id: r.id.clone(),
+                                            info: r.info.clone(),
+                                            name: r.name.clone(),
+                                            item_type: "Series".to_string(),
+                                            stream_url: None,
+                                            container_extension: None,
+                                            cover: r.cover_url.clone(),
+                                            series_id: None,
+                                        });
+                                        self.favorites = load_favorites();
+                                    }
                                     // Für Series kein direktes File, aber wir bieten Download (öffnet Episoden zum Downloaden)
                                     if self.config.enable_downloads
                                         && ui
@@ -3649,12 +3689,16 @@ impl eframe::App for MacXtreamer {
                                         }
                                     }
                                     if ui.small_button("Fav").clicked() {
+                                        let item_type = r.info.clone(); // "Movie", "Channel", "Episode"
                                         toggle_favorite(&FavItem {
                                             id: r.id.clone(),
                                             info: r.info.clone(),
                                             name: r.name.clone(),
+                                            item_type,
                                             stream_url: Some(url.clone()),
                                             container_extension: r.container_extension.clone(),
+                                            cover: r.cover_url.clone(),
+                                            series_id: None,
                                         });
                                         self.favorites = load_favorites();
                                     }
