@@ -1466,36 +1466,71 @@ impl MacXtreamer {
         ui.heading("🧠 AI Empfehlungen");
         ui.add_space(5.0);
 
+        // Check API Key based on selected provider
+        let has_api_key = if self.config.ai_provider == "perplexity" {
+            !self.config.perplexity_api_key.is_empty()
+        } else {
+            !self.config.wisdom_gate_api_key.is_empty()
+        };
+
         // API Key Status
-        if self.config.wisdom_gate_api_key.is_empty() {
+        if !has_api_key {
             ui.colored_label(egui::Color32::YELLOW, "⚠️ Kein API-Key konfiguriert");
-            ui.label("Bitte API-Key in den Einstellungen hinzufügen.");
+            let provider_name = if self.config.ai_provider == "perplexity" {
+                "Perplexity"
+            } else {
+                "Wisdom-Gate"
+            };
+            ui.label(format!("Bitte {} API-Key in den Einstellungen hinzufügen.", provider_name));
             ui.add_space(5.0);
-            ui.label(format!("Model: {}", self.config.wisdom_gate_model));
+            if self.config.ai_provider == "perplexity" {
+                ui.label(format!("Provider: 🔮 Perplexity"));
+                ui.label(format!("Model: {}", self.config.perplexity_model));
+            } else {
+                ui.label(format!("Provider: 🤖 Wisdom-Gate"));
+                ui.label(format!("Model: {}", self.config.wisdom_gate_model));
+            }
             ui.label(format!("Prompt: {}", self.config.wisdom_gate_prompt.chars().take(50).collect::<String>() + "..."));
             return;
         }
 
         // Fetch recommendations button
         ui.horizontal(|ui| {
-            if ui.button("🔄 Empfehlungen aktualisieren").clicked() {
+            if ui.button("🔄 Empfehlungen laden").clicked() {
                 // Always fetch new content when button is clicked - ignore cache
                 let tx = self.tx.clone();
-                let api_key = self.config.wisdom_gate_api_key.clone();
-                let model = self.config.wisdom_gate_model.clone();
-                let prompt = self.config.wisdom_gate_prompt.clone();
-                // Clone config to move into async task without borrowing/moving self
                 let cfg = self.config.clone();
                 
                 tokio::spawn(async move {
-                    println!("🌐 Lade neue Empfehlungen von Wisdom-Gate...");
-                    let endpoint = cfg.wisdom_gate_endpoint.clone();
-                    let content = crate::api::fetch_wisdom_gate_recommendations_safe(&api_key, &prompt, &model, &endpoint).await;
+                    let content = if cfg.ai_provider == "perplexity" {
+                        println!("🔮 Lade neue Empfehlungen von Perplexity...");
+                        crate::api::fetch_perplexity_recommendations_safe(
+                            &cfg.perplexity_api_key,
+                            &cfg.wisdom_gate_prompt,
+                            &cfg.perplexity_model
+                        ).await
+                    } else {
+                        println!("🌐 Lade neue Empfehlungen von Wisdom-Gate...");
+                        crate::api::fetch_wisdom_gate_recommendations_safe(
+                            &cfg.wisdom_gate_api_key,
+                            &cfg.wisdom_gate_prompt,
+                            &cfg.wisdom_gate_model,
+                            &cfg.wisdom_gate_endpoint
+                        ).await
+                    };
                     let _ = tx.send(crate::app_state::Msg::WisdomGateRecommendations(content));
                 });
             }
 
-            // Show cache status
+            // Show provider and cache status
+            let provider_icon = if self.config.ai_provider == "perplexity" {
+                "🔮"
+            } else {
+                "🤖"
+            };
+            ui.label(format!("{} {}", provider_icon, 
+                if self.config.ai_provider == "perplexity" { "Perplexity" } else { "Wisdom-Gate" }));
+            
             if self.config.is_wisdom_gate_cache_valid() {
                 let cache_age = self.config.get_wisdom_gate_cache_age_hours();
                 ui.label(format!("📦 Cache: {}h alt", cache_age));
@@ -4107,54 +4142,101 @@ impl eframe::App for MacXtreamer {
                     });
                     
                     ui.collapsing("🧠 AI Empfehlungen", |ui| {
-                    ui.label("🤖 Wisdom-Gate AI");
                     ui.horizontal(|ui| {
-                        ui.label("API Key:");
-                        ui.add(
-                            egui::TextEdit::singleline(&mut draft.wisdom_gate_api_key)
-                                .password(true)
-                                .hint_text("sk-xxx...")
-                        );
-                    });
-                    if draft.wisdom_gate_api_key.trim().is_empty() {
-                        ui.weak("API Key erforderlich für AI-Empfehlungen");
-                    }
-                    
-                    ui.horizontal(|ui| {
-                        ui.label("Model:");
-                        egui::ComboBox::from_label("")
-                            .selected_text(&draft.wisdom_gate_model)
-                            .show_ui(ui, |ui| {
-                                ui.selectable_value(&mut draft.wisdom_gate_model, "gpt-3.5-turbo".to_string(), "🥇 GPT-3.5 Turbo (Empfohlen)");
-                                ui.selectable_value(&mut draft.wisdom_gate_model, "gpt-4".to_string(), "🧠 GPT-4 (Premium)");
-                                ui.selectable_value(&mut draft.wisdom_gate_model, "claude-3-sonnet".to_string(), "🎭 Claude 3 Sonnet");
-                                ui.selectable_value(&mut draft.wisdom_gate_model, "gemini-pro".to_string(), "💎 Gemini Pro");
-                                ui.selectable_value(&mut draft.wisdom_gate_model, "llama-2-70b-chat".to_string(), "🦙 Llama 2 70B Chat");
-                                ui.selectable_value(&mut draft.wisdom_gate_model, "mistral-7b-instruct".to_string(), "⚡ Mistral 7B (Schnell)");
-
-                                ui.separator();
-                                ui.label("Endpoint:");
-                                ui.text_edit_singleline(&mut draft.wisdom_gate_endpoint);
-                                ui.separator();
-                                ui.label("⚠️ Alte Modelle (evtl. nicht verfügbar):");
-                                ui.selectable_value(&mut draft.wisdom_gate_model, "wisdom-ai-dsv3".to_string(), "❌ Wisdom-AI DSV3 (veraltet)");
-                                ui.selectable_value(&mut draft.wisdom_gate_model, "deepseek-v3".to_string(), "❌ DeepSeek V3 (veraltet)");
-                            });
+                        ui.label("AI Provider:");
+                        ui.radio_value(&mut draft.ai_provider, "wisdom-gate".to_string(), "🤖 Wisdom-Gate");
+                        ui.radio_value(&mut draft.ai_provider, "perplexity".to_string(), "🔮 Perplexity");
                     });
                     
-                    ui.label("Prompt für Empfehlungen:");
-                    ui.add(
-                        egui::TextEdit::multiline(&mut draft.wisdom_gate_prompt)
-                            .desired_rows(3)
-                            .hint_text("Was sind die besten Streaming-Empfehlungen für heute?")
-                    );
+                    ui.separator();
                     
-                    ui.horizontal(|ui| {
-                        if ui.button("Standard Prompt").clicked() {
-                            draft.wisdom_gate_prompt = crate::models::default_wisdom_gate_prompt();
+                    if draft.ai_provider == "wisdom-gate" {
+                        ui.label("🤖 Wisdom-Gate AI");
+                        ui.horizontal(|ui| {
+                            ui.label("API Key:");
+                            ui.add(
+                                egui::TextEdit::singleline(&mut draft.wisdom_gate_api_key)
+                                    .password(true)
+                                    .hint_text("sk-xxx...")
+                            );
+                        });
+                        if draft.wisdom_gate_api_key.trim().is_empty() {
+                            ui.weak("API Key erforderlich für AI-Empfehlungen");
                         }
-                        ui.weak("Tipp: Frage nach aktuellen Filmen und Serien");
-                    });
+                        
+                        ui.horizontal(|ui| {
+                            ui.label("Model:");
+                            egui::ComboBox::from_label("")
+                                .selected_text(&draft.wisdom_gate_model)
+                                .show_ui(ui, |ui| {
+                                    ui.selectable_value(&mut draft.wisdom_gate_model, "gpt-3.5-turbo".to_string(), "🥇 GPT-3.5 Turbo (Empfohlen)");
+                                    ui.selectable_value(&mut draft.wisdom_gate_model, "gpt-4".to_string(), "🧠 GPT-4 (Premium)");
+                                    ui.selectable_value(&mut draft.wisdom_gate_model, "claude-3-sonnet".to_string(), "🎭 Claude 3 Sonnet");
+                                    ui.selectable_value(&mut draft.wisdom_gate_model, "gemini-pro".to_string(), "💎 Gemini Pro");
+                                    ui.selectable_value(&mut draft.wisdom_gate_model, "llama-2-70b-chat".to_string(), "🦙 Llama 2 70B Chat");
+                                    ui.selectable_value(&mut draft.wisdom_gate_model, "mistral-7b-instruct".to_string(), "⚡ Mistral 7B (Schnell)");
+
+                                    ui.separator();
+                                    ui.label("Endpoint:");
+                                    ui.text_edit_singleline(&mut draft.wisdom_gate_endpoint);
+                                    ui.separator();
+                                    ui.label("⚠️ Alte Modelle (evtl. nicht verfügbar):");
+                                    ui.selectable_value(&mut draft.wisdom_gate_model, "wisdom-ai-dsv3".to_string(), "❌ Wisdom-AI DSV3 (veraltet)");
+                                    ui.selectable_value(&mut draft.wisdom_gate_model, "deepseek-v3".to_string(), "❌ DeepSeek V3 (veraltet)");
+                                });
+                        });
+                        
+                        ui.label("Prompt für Empfehlungen:");
+                        ui.add(
+                            egui::TextEdit::multiline(&mut draft.wisdom_gate_prompt)
+                                .desired_rows(3)
+                                .hint_text("Was sind die besten Streaming-Empfehlungen für heute?")
+                        );
+                        
+                        ui.horizontal(|ui| {
+                            if ui.button("Standard Prompt").clicked() {
+                                draft.wisdom_gate_prompt = crate::models::default_wisdom_gate_prompt();
+                            }
+                            ui.weak("Tipp: Frage nach aktuellen Filmen und Serien");
+                        });
+                    } else if draft.ai_provider == "perplexity" {
+                        ui.label("🔮 Perplexity AI");
+                        ui.horizontal(|ui| {
+                            ui.label("API Key:");
+                            ui.add(
+                                egui::TextEdit::singleline(&mut draft.perplexity_api_key)
+                                    .password(true)
+                                    .hint_text("pplx-xxx...")
+                            );
+                        });
+                        if draft.perplexity_api_key.trim().is_empty() {
+                            ui.weak("API Key erforderlich für Perplexity-Empfehlungen");
+                        }
+                        
+                        ui.horizontal(|ui| {
+                            ui.label("Model:");
+                            egui::ComboBox::from_label("")
+                                .selected_text(&draft.perplexity_model)
+                                .show_ui(ui, |ui| {
+                                    ui.selectable_value(&mut draft.perplexity_model, "sonar".to_string(), "🦙 Sonar (Empfohlen)");
+                                    ui.selectable_value(&mut draft.perplexity_model, "sonar-pro".to_string(), "💎 Sonar Pro (Premium)");
+                                });
+                        });
+                        
+                        ui.label("Prompt für Empfehlungen:");
+                        ui.add(
+                            egui::TextEdit::multiline(&mut draft.wisdom_gate_prompt)
+                                .desired_rows(3)
+                                .hint_text("Was sind die besten Streaming-Empfehlungen für heute?")
+                        );
+                        
+                        ui.horizontal(|ui| {
+                            if ui.button("Standard Prompt").clicked() {
+                                draft.wisdom_gate_prompt = crate::models::default_wisdom_gate_prompt();
+                            }
+                            ui.weak("Tipp: Perplexity hat Zugriff auf aktuelle Informationen");
+                        });
+                    }
                     });
                     
                     ui.horizontal(|ui| {

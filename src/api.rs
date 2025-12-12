@@ -378,61 +378,133 @@ pub async fn fetch_wisdom_gate_recommendations_safe(api_key: &str, prompt: &str,
                 let err_txt = e.to_string();
                 println!("❌ Fehler mit Modell {}: {}", try_model, err_txt);
 
-                // DNS / Verbindungsfehler früh erkennen und abbrechen (alle Modelle würden scheitern)
-                let lower = err_txt.to_lowercase();
-                let is_dns = lower.contains("dns") || lower.contains("failed to lookup") || lower.contains("nodename nor servname") || lower.contains("name or service not known") || lower.contains("network unreachable") || lower.contains("connection refused") || lower.contains("no route to host");
-                let is_connect = lower.contains("error trying to connect") || lower.contains("connect timeout") || lower.contains("timed out") || lower.contains("could not connect");
-                if attempt == 0 && (is_dns || is_connect) {
-                    println!("🛑 Verbindungsfehler ({}). Versuche alternativen Endpoint...", if is_dns {"DNS"} else {"Connect"});
-                    // Versuche automatisch alternative Endpoint-Varianten einmal
-                    let mut alt_endpoints: Vec<String> = Vec::new();
-                    if endpoint.contains("wisdom-gate.juheapi.com") {
-                        alt_endpoints.push("https://api.wisdom-gate.ai/v1/chat/completions".to_string());
-                        alt_endpoints.push("https://wisdom-gate.juheapi.com/v1/chat/completions".to_string()); // original
-                    } else if endpoint.contains("api.wisdom-gate.ai") {
-                        alt_endpoints.push("https://wisdom-gate.juheapi.com/v1/chat/completions".to_string());
-                        alt_endpoints.push("https://api.wisdom-gate.ai/v1/chat/completions".to_string()); // original
-                    } else if endpoint.contains("wisdomgate") {
-                        alt_endpoints.push("https://api.wisdom-gate.ai/v1/chat/completions".to_string());
-                        alt_endpoints.push("https://wisdom-gate.juheapi.com/v1/chat/completions".to_string());
-                    }
-
-                    for alt in alt_endpoints {
-                        println!("🔁 Teste alternativen Endpoint: {}", alt);
-                        match fetch_wisdom_gate_recommendations(&api_keys, prompt, try_model, &alt).await {
-                            Ok(content) => {
-                                if !content.starts_with("API Fehler") && !content.starts_with("Modell") {
-                                    println!("✅ Alternativer Endpoint erfolgreich");
-                                    return content;
-                                }
-                            }
-                            Err(e2) => {
-                                println!("⚠️ Alternativer Endpoint fehlgeschlagen: {}", e2);
-                            }
+                // Alternative endpoints für Wisdom Gate versuchen
+                if attempt < 2 {
+                    let alt = if endpoint.contains("juheapi.com") {
+                        "https://api.wisdom-gate.ai/v1/chat/completions"
+                    } else {
+                        "https://wisdom-gate.juheapi.com/v1/chat/completions"
+                    };
+                    println!("🔄 Versuche alternativen Endpoint: {}", alt);
+                    if let Ok(content) = fetch_wisdom_gate_recommendations(&api_keys, prompt, try_model, &alt).await {
+                        if !content.starts_with("Modell") && !content.starts_with("API Fehler") {
+                            println!("✅ Alternativer Endpoint erfolgreich!");
+                            return content;
                         }
                     }
-
-                    println!("🛑 Schwerer Verbindungsfehler ({}). Breche Fallback-Kette ab.", if is_dns {"DNS"} else {"Connect"});
-                    let mut hint = String::new();
-                    if endpoint.contains("wisdom-gate") {
-                        hint.push_str("💡 Tipp: Probiere alternativ https://api.wisdomgate.ai/v1/chat/completions (ohne Bindestrich)\n");
-                    } else if endpoint.contains("wisdomgate") {
-                        hint.push_str("💡 Tipp: Probiere alternativ https://api.wisdom-gate.ai/v1/chat/completions (mit Bindestrich)\n");
-                    }
-                    hint.push_str("💡 Prüfe außerdem: Internetzugang, DNS, Proxy/VPN, Firewall.");
-                    return format!(
-                        "🌐 DNS/Verbindungsfehler: {}\nEndpoint: {} nicht erreichbar.\n{}\n\n{}",
-                        err_txt,
-                        endpoint,
-                        hint,
-                        get_demo_recommendations()
-                    );
                 }
-                // Andere Fehler -> weiter versuchen
+            }
+        }
+    }
+    format!("⚠️ Alle {} Modellversuche fehlgeschlagen.\n\n{}", models_to_try.len(), get_demo_recommendations())
+}
+
+// Fetch recommendations from Perplexity AI
+pub async fn fetch_perplexity_recommendations(api_key: &str, prompt: &str, model: &str) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
+    // Check cache first
+    let cache_key = format!("perplexity_{}_{}_{}", prompt, model, api_key.len());
+    let mut hasher = DefaultHasher::new();
+    cache_key.hash(&mut hasher);
+    let cache_hash = hasher.finish();
+    let cache_file = format!("/tmp/perplexity_cache_{}_{}.json", model.replace(['/', ':', '-'], "_"), cache_hash);
+    
+    // Load cache if exists
+    if let Ok(cache_content) = std::fs::read_to_string(&cache_file) {
+        if let Ok(cache_data) = serde_json::from_str::<serde_json::Value>(&cache_content) {
+            if let Some(cached_result) = cache_data.get("result").and_then(|v| v.as_str()) {
+                println!("📦 Perplexity aus Cache: {}", model);
+                return Ok(cached_result.to_string());
             }
         }
     }
 
-    println!("🌐 Alle Modelle fehlgeschlagen - Verwende Demo-Empfehlungen");
-    format!("🌐 **Offline-Modus** (Alle Modelle fehlgeschlagen)\n\n{}", get_demo_recommendations())
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(30))
+        .connect_timeout(std::time::Duration::from_secs(10))
+        .build()?;
+    
+    println!("🔮 Verwende Perplexity API mit Modell: {}", model);
+    
+    let headers = if api_key.starts_with("Bearer ") {
+        api_key.to_string()
+    } else {
+        format!("Bearer {}", api_key)
+    };
+    
+    let request_body = serde_json::json!({
+        "model": model,
+        "messages": [{
+            "role": "user",
+            "content": prompt
+        }],
+        "temperature": 0.2,
+        "max_tokens": 2048
+    });
+    
+    let response = client
+        .post("https://api.perplexity.ai/chat/completions")
+        .header("Content-Type", "application/json")
+        .header("Authorization", &headers)
+        .json(&request_body)
+        .send()
+        .await?;
+    
+    let status = response.status();
+    let response_text = response.text().await?;
+    
+    if !status.is_success() {
+        println!("❌ Perplexity API Error: Status {}", status);
+        return Err(format!("Perplexity API error: {} - {}", status, response_text).into());
+    }
+    
+    // Parse response
+    let json: serde_json::Value = serde_json::from_str(&response_text)?;
+    let content = json
+        .get("choices")
+        .and_then(|c| c.get(0))
+        .and_then(|c| c.get("message"))
+        .and_then(|m| m.get("content"))
+        .and_then(|c| c.as_str())
+        .unwrap_or("");
+    
+    if content.is_empty() {
+        return Err("Leere Antwort von Perplexity".into());
+    }
+    
+    // Cache the result
+    let cache_data = serde_json::json!({
+        "result": content,
+        "timestamp": SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs()
+    });
+    let _ = std::fs::write(&cache_file, serde_json::to_string_pretty(&cache_data).unwrap_or_default());
+    
+    Ok(content.to_string())
 }
+
+pub async fn fetch_perplexity_recommendations_safe(api_key: &str, prompt: &str, model: &str) -> String {
+    // Try Perplexity with the selected model
+    println!("🔮 Starte Perplexity API-Anfrage...");
+    
+    match fetch_perplexity_recommendations(api_key, prompt, model).await {
+        Ok(content) => {
+            println!("✅ Perplexity Empfehlungen erfolgreich abgerufen");
+            content
+        }
+        Err(e) => {
+            println!("❌ Perplexity Fehler: {}", e);
+            
+            // Try with fallback model
+            let fallback_model = "sonar";
+            if model != fallback_model {
+                println!("🔄 Versuche Fallback-Modell: {}", fallback_model);
+                if let Ok(content) = fetch_perplexity_recommendations(api_key, prompt, fallback_model).await {
+                    println!("✅ Fallback erfolgreich!");
+                    return content;
+                }
+            }
+            
+            format!("⚠️ Perplexity API nicht verfügbar: {}\n\n{}", e, get_demo_recommendations())
+        }
+    }
+}
+

@@ -119,6 +119,12 @@ pub struct Config {
     #[serde(default)]
     pub wisdom_gate_cache_timestamp: u64,   // Timestamp when cache was created (Unix timestamp)
     #[serde(default)]
+    pub ai_provider: String,          // AI provider selection: "wisdom-gate" or "perplexity"
+    #[serde(default)]
+    pub perplexity_api_key: String,   // API key for Perplexity
+    #[serde(default)]
+    pub perplexity_model: String,     // Model selection for Perplexity
+    #[serde(default)]
     pub vlc_diag_history: String, // Semikolon-separierte Liste angewandter Vorschläge: ts:net:live:file;...
     #[serde(default)]
     pub low_cpu_mode: bool, // Aktiviert zusätzliche Drosselung (Repaint & Diagnose-Sleep)
@@ -184,6 +190,9 @@ impl Default for Config {
             wisdom_gate_endpoint: "https://wisdom-gate.juheapi.com/v1/chat/completions".to_string(),
             wisdom_gate_cache_content: String::new(),
             wisdom_gate_cache_timestamp: 0,
+            ai_provider: "wisdom-gate".to_string(),
+            perplexity_api_key: String::new(),
+            perplexity_model: "sonar".to_string(),
             vlc_diag_history: String::new(),
             low_cpu_mode: false,
             ultra_low_flicker_mode: false,
