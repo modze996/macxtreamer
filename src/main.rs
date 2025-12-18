@@ -10,11 +10,14 @@ use std::time::{Duration, Instant};
 // removed unused AsyncReadExt import after refactor
 use tokio::sync::Semaphore;
 
+mod ai_panel;
 mod api;
 mod app_state;
 mod cache;
 mod config;
+mod download_utils;
 mod downloads;
+mod helpers;
 mod icon;
 mod images;
 mod logger;
@@ -24,77 +27,21 @@ mod search;
 mod storage;
 mod ui_helpers;
 
+use ai_panel::render_ai_panel;
 use api::{fetch_categories, fetch_items, fetch_series_episodes};
 use app_state::{Msg, SearchStatus, SortKey, ViewState};
 use cache::{clear_all_caches};
 use config::{read_config, save_config};
+use download_utils::{DownloadMeta, DownloadState, ScannedDownload, expand_download_dir};
 use downloads::{BulkOptions, sanitize_filename};
-
-// Local download tracking structs (specialized for UI & retry logic)
-#[derive(Debug, Clone)]
-struct DownloadMeta {
-    id: String,
-    name: String,
-    info: String,
-    container_extension: Option<String>,
-    size: Option<u64>,
-    modified: Option<std::time::SystemTime>,
-}
-
-#[derive(Debug, Clone)]
-struct DownloadState {
-    waiting: bool,
-    finished: bool,
-    error: Option<String>,
-    path: Option<String>,
-    received: u64,
-    total: Option<u64>,
-    cancel_flag: Option<Arc<AtomicBool>>,
-    started_at: Option<std::time::Instant>,
-    last_update_at: Option<std::time::Instant>,
-    prev_received: u64,
-    current_speed_bps: f64,
-    avg_speed_bps: f64,
-}
-
-impl Default for DownloadState {
-    fn default() -> Self {
-        Self {
-            waiting: false,
-            finished: false,
-            error: None,
-            path: None,
-            received: 0,
-            total: None,
-            cancel_flag: None,
-            started_at: None,
-            last_update_at: None,
-            prev_received: 0,
-            current_speed_bps: 0.0,
-            avg_speed_bps: 0.0,
-        }
-    }
-}
-
-#[derive(Debug, Clone)]
-struct ScannedDownload {
-    id: String,
-    name: String,
-    info: String,
-    container_extension: Option<String>,
-    path: String,
-    size: u64,
-    modified: std::time::SystemTime,
-}
-// use images::image_meta_path; // ungenutzt nach Bereinigung
+use helpers::{file_path_to_uri, format_file_size};
 use logger::log_line;
 use models::{Category, Config, FavItem, Item, RecentItem, Row};
-use ui_helpers::{colored_text_by_type, render_loading_spinner, format_file_size, file_path_to_uri};
+use ui_helpers::{colored_text_by_type, render_loading_spinner};
 use player::{build_url_by_type, start_player};
 use once_cell::sync::OnceCell;
 static GLOBAL_TX: OnceCell<Sender<Msg>> = OnceCell::new();
-// Entfernte Header-Imports (ETAG etc.) – nicht mehr genutzt
-use search::search_items;
+use search::search_items_with_language_filter;
 use storage::{add_to_recently, load_favorites, load_recently_played, toggle_favorite, is_favorite, load_search_history, save_search_history};
 
 #[tokio::main]
@@ -235,6 +182,8 @@ struct MacXtreamer {
     search_history: Vec<String>,
     show_search_history: bool,
     search_status: SearchStatus,
+    search_language_filter: Vec<String>, // Selected languages for search filtering
+    show_language_filter: bool, // Show language filter dropdown
     is_loading: bool,
     loading_done: usize,
     loading_total: usize,
@@ -262,6 +211,8 @@ struct MacXtreamer {
     rx: Receiver<Msg>,
     show_log: bool,
     log_text: String,
+    show_error_dialog: bool,
+    loading_error: String,
     initial_config_pending: bool,
     downloads: HashMap<String, DownloadState>,
     download_order: Vec<String>,
@@ -327,6 +278,7 @@ impl MacXtreamer {
         
         let (tx, rx) = mpsc::channel();
     let _ = GLOBAL_TX.set(tx.clone());
+    let default_search_langs = config.default_search_languages.clone();
     let mut app = Self {
             config,
             config_draft: None,
@@ -353,6 +305,8 @@ impl MacXtreamer {
             search_history: load_search_history(),
             show_search_history: false,
             search_status: SearchStatus::Idle,
+            search_language_filter: default_search_langs,
+            show_language_filter: false,
             is_loading: false,
             loading_done: 0,
             loading_total: 0,
@@ -378,6 +332,8 @@ impl MacXtreamer {
             rx,
             show_log: false,
             log_text: String::new(),
+            show_error_dialog: false,
+            loading_error: String::new(),
             initial_config_pending: false,
             downloads: HashMap::new(),
             download_order: Vec::new(),
@@ -538,8 +494,17 @@ impl MacXtreamer {
         self.pending_covers.clear();
         // Dateisystem Cache leeren (Images, ggf. andere)
         clear_all_caches();
+        // Suchindex leeren und neu aufbauen
+        self.all_movies.clear();
+        self.all_series.clear();
+        self.all_channels.clear();
+        self.index_paths.clear();
         // Kategorien neu laden falls Konfig vollständig
-        if self.config_is_complete() { self.reload_categories(); }
+        if self.config_is_complete() { 
+            self.reload_categories();
+            // Index neu aufbauen
+            self.spawn_build_index();
+        }
     }
 
     fn create_and_play_m3u(&mut self, entries: &[(String,String)]) -> Result<(), String> {
@@ -647,7 +612,9 @@ impl MacXtreamer {
         self.loading_total = 1;
         self.loading_done = 0;
         tokio::spawn(async move {
-            let res = fetch_items(&cfg, &kind_s, &category_id).await.map_err(|e| e.to_string());
+            let action = match kind_s.as_str() { "subplaylist" => "get_live_streams", "vod" => "get_vod_streams", "series" => "get_series", other => other };
+            let url = format!("{}/player_api.php?username={}&password=***&action={}&category_id={}", cfg.address, cfg.username, action, category_id);
+            let res = fetch_items(&cfg, &kind_s, &category_id).await.map_err(|e| format!("{} (URL: {})", e, url));
             let _ = tx.send(Msg::ItemsLoaded { kind: kind_s, items: res });
         });
     }
@@ -661,7 +628,8 @@ impl MacXtreamer {
         self.loading_total = 1;
         self.loading_done = 0;
         tokio::spawn(async move {
-            let res = fetch_series_episodes(&cfg, &series_id).await.map_err(|e| e.to_string());
+            let url = format!("{}/player_api.php?username={}&password=***&action=get_series_info&series_id={}", cfg.address, cfg.username, series_id);
+            let res = fetch_series_episodes(&cfg, &series_id).await.map_err(|e| format!("{} (URL: {})", e, url));
             let _ = tx.send(Msg::EpisodesLoaded { series_id, episodes: res });
         });
     }
@@ -702,6 +670,49 @@ impl MacXtreamer {
 
     fn spawn_build_index(&mut self) {
         if self.indexing || !self.config_is_complete() { return; }
+        
+        // Versuche zuerst, den Index von Disk zu laden
+        if let Some((movies, series, channels, paths)) = crate::storage::load_search_index(&self.config.address, &self.config.username) {
+            println!("✨ Index aus Cache geladen");
+            self.all_movies = movies.clone();
+            self.all_series = series.clone();
+            self.all_channels = channels.clone();
+            self.index_paths = paths.clone();
+            
+            // Sende auch als IndexData für UI-Update
+            let movies_with_paths: Vec<(Item, String)> = movies.into_iter()
+                .map(|item| {
+                    let path = paths.get(&item.id).cloned().unwrap_or_default();
+                    (item, path)
+                })
+                .collect();
+            let series_with_paths: Vec<(Item, String)> = series.into_iter()
+                .map(|item| {
+                    let path = paths.get(&item.id).cloned().unwrap_or_default();
+                    (item, path)
+                })
+                .collect();
+            let channels_with_paths: Vec<(Item, String)> = channels.into_iter()
+                .map(|item| {
+                    let path = paths.get(&item.id).cloned().unwrap_or_default();
+                    (item, path)
+                })
+                .collect();
+            
+            let _ = self.tx.send(Msg::IndexData { 
+                movies: movies_with_paths, 
+                series: series_with_paths, 
+                channels: channels_with_paths 
+            });
+            let _ = self.tx.send(Msg::IndexBuilt { 
+                movies: self.all_movies.len(), 
+                series: self.all_series.len(), 
+                channels: self.all_channels.len() 
+            });
+            return;
+        }
+        
+        // Kein Cache vorhanden oder ungültig - baue Index neu auf
         self.indexing = true;
         self.search_status = SearchStatus::Indexing { progress: "Starte Index-Aufbau...".to_string() };
         let tx = self.tx.clone();
@@ -855,6 +866,23 @@ impl MacXtreamer {
             let channels_len = deduplicated_channels.len();
             
             println!("✅ Index-Aufbau abgeschlossen: {} Movies, {} Series, {} Channels", movies_len, series_len, channels_len);
+            
+            // Speichere Index auf Disk
+            let movies_only: Vec<Item> = deduplicated_movies.iter().map(|(item, _)| item.clone()).collect();
+            let series_only: Vec<Item> = deduplicated_series.iter().map(|(item, _)| item.clone()).collect();
+            let channels_only: Vec<Item> = deduplicated_channels.iter().map(|(item, _)| item.clone()).collect();
+            let mut paths_map: std::collections::HashMap<String, String> = std::collections::HashMap::new();
+            for (item, path) in &deduplicated_movies {
+                paths_map.insert(item.id.clone(), path.clone());
+            }
+            for (item, path) in &deduplicated_series {
+                paths_map.insert(item.id.clone(), path.clone());
+            }
+            for (item, path) in &deduplicated_channels {
+                paths_map.insert(item.id.clone(), path.clone());
+            }
+            crate::storage::save_search_index(&movies_only, &series_only, &channels_only, &paths_map, &cfg.address, &cfg.username);
+            
             let _ = tx.send(Msg::IndexData { movies: deduplicated_movies, series: deduplicated_series, channels: deduplicated_channels });
             let _ = tx.send(Msg::IndexBuilt { movies: movies_len, series: series_len, channels: channels_len });
         });
@@ -866,9 +894,11 @@ impl MacXtreamer {
         let series = self.all_series.clone();
         let channels = self.all_channels.clone();
         let query = self.search_text.clone();
+        let language_filter = self.search_language_filter.clone();
         
         // Debug-Informationen für die Suche
         println!("🔍 Starte Suche mit Query: '{}'", query);
+        println!("🌐 Sprach-Filter: {:?}", language_filter);
         println!("📊 Index-Größen: Movies={}, Series={}, Channels={}", movies.len(), series.len(), channels.len());
         println!("⚙️ Indexing: {}, Config komplett: {}", self.indexing, self.config_is_complete());
         
@@ -888,7 +918,7 @@ impl MacXtreamer {
         tokio::spawn(async move {
             match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                 println!("🔎 Führe Suche durch...");
-                search_items(&movies, &series, &channels, &query)
+                search_items_with_language_filter(&movies, &series, &channels, &query, &language_filter)
             })) {
                 Ok(results) => {
                     println!("✅ Suche abgeschlossen, {} Treffer gefunden", results.len());
@@ -910,7 +940,8 @@ impl MacXtreamer {
                         release_date: s.release_date.clone().or_else(|| extract_year_from_title(&s.name)), 
                         rating_5based: s.rating_5based, 
                         genre: s.genre, 
-                        path: None 
+                        path: None,
+                        audio_languages: None,
                     }).collect();
                     
                     let result_count = rows.len();
@@ -1049,34 +1080,7 @@ impl MacXtreamer {
     }
 
     fn expand_download_dir(&self) -> PathBuf {
-        let raw = self.config.download_dir.trim();
-        let default_dir = || {
-            if let Some(ud) = directories::UserDirs::new() {
-                if let Some(dl) = ud.download_dir() {
-                    return dl.join("macxtreamer");
-                }
-            }
-            if let Some(home) = std::env::var_os("HOME") {
-                let mut p = PathBuf::from(home);
-                p.push("Downloads");
-                p.push("macxtreamer");
-                return p;
-            }
-            let mut p = std::env::temp_dir();
-            p.push("macxtreamer_downloads");
-            p
-        };
-        if raw.is_empty() {
-            return default_dir();
-        }
-        if raw.starts_with("~/") {
-            if let Some(home) = std::env::var_os("HOME") {
-                let mut p = PathBuf::from(home);
-                p.push(&raw[2..]);
-                return p;
-            }
-        }
-        PathBuf::from(raw)
+        expand_download_dir(&self.config.download_dir)
     }
 
 
@@ -1349,8 +1353,23 @@ impl MacXtreamer {
                 let _ = tokio::io::AsyncWriteExt::flush(&mut file).await;
                 drop(file);
                 if let Some(total)=final_total { if received < total { let msg = format!("Early EOF detected id={} received={} total={}", id, received, total); println!("{}", msg); log_line(&msg); attempt+=1; if attempt<attempts_max { continue; } else { let _=tx.send(Msg::DownloadError { id: id.clone(), error: format!("Incomplete after {} attempts", attempts_max) }); return; } } }
-                // Erfolgreich
-                if let Err(e)=tokio::fs::rename(&tmp_path, &target_path).await { let _=tx.send(Msg::DownloadError { id: id.clone(), error: format!("Rename failed: {}", e) }); return; }
+                // Erfolgreich - rename mit Retry falls Datei noch von Player gelesen wird
+                let mut rename_attempts = 0;
+                loop {
+                    match tokio::fs::rename(&tmp_path, &target_path).await {
+                        Ok(_) => break,
+                        Err(e) => {
+                            rename_attempts += 1;
+                            if rename_attempts > 5 {
+                                let _=tx.send(Msg::DownloadError { id: id.clone(), error: format!("Rename failed after {} attempts: {}", rename_attempts, e) });
+                                return;
+                            }
+                            // Warte kurz und versuche erneut (Player könnte Datei noch lesen)
+                            log_line(&format!("Rename attempt {}/5 failed (file may be in use): {}", rename_attempts, e));
+                            tokio::time::sleep(Duration::from_millis(500)).await;
+                        }
+                    }
+                }
                 let _=tx.send(Msg::DownloadFinished { id: id.clone(), path: target_path.to_string_lossy().into() });
                 return;
             }
@@ -1402,7 +1421,8 @@ impl MacXtreamer {
             if let Ok(mut rd) = tokio::fs::read_dir(&dir).await {
                 while let Ok(Some(entry)) = rd.next_entry().await {
                     let path = entry.path();
-                    if path.extension().and_then(|e| e.to_str()) == Some("part") {
+                    let ext = path.extension().and_then(|e| e.to_str());
+                    if ext == Some("part") || ext == Some("json") {
                         continue;
                     }
                     if let Ok(md) = entry.metadata().await {
@@ -1463,154 +1483,7 @@ impl MacXtreamer {
 
 impl MacXtreamer {
     fn render_wisdom_gate_panel(&mut self, ui: &mut egui::Ui) {
-        ui.heading("🧠 AI Empfehlungen");
-        ui.add_space(5.0);
-
-        // Check API Key based on selected provider
-        let has_api_key = if self.config.ai_provider == "perplexity" {
-            !self.config.perplexity_api_key.is_empty()
-        } else {
-            !self.config.wisdom_gate_api_key.is_empty()
-        };
-
-        // API Key Status
-        if !has_api_key {
-            ui.colored_label(egui::Color32::YELLOW, "⚠️ Kein API-Key konfiguriert");
-            let provider_name = if self.config.ai_provider == "perplexity" {
-                "Perplexity"
-            } else {
-                "Wisdom-Gate"
-            };
-            ui.label(format!("Bitte {} API-Key in den Einstellungen hinzufügen.", provider_name));
-            ui.add_space(5.0);
-            if self.config.ai_provider == "perplexity" {
-                ui.label(format!("Provider: 🔮 Perplexity"));
-                ui.label(format!("Model: {}", self.config.perplexity_model));
-            } else {
-                ui.label(format!("Provider: 🤖 Wisdom-Gate"));
-                ui.label(format!("Model: {}", self.config.wisdom_gate_model));
-            }
-            ui.label(format!("Prompt: {}", self.config.wisdom_gate_prompt.chars().take(50).collect::<String>() + "..."));
-            return;
-        }
-
-        // Fetch recommendations button
-        ui.horizontal(|ui| {
-            if ui.button("🔄 Empfehlungen laden").clicked() {
-                // Always fetch new content when button is clicked - ignore cache
-                let tx = self.tx.clone();
-                let cfg = self.config.clone();
-                
-                tokio::spawn(async move {
-                    let content = if cfg.ai_provider == "perplexity" {
-                        println!("🔮 Lade neue Empfehlungen von Perplexity...");
-                        crate::api::fetch_perplexity_recommendations_safe(
-                            &cfg.perplexity_api_key,
-                            &cfg.wisdom_gate_prompt,
-                            &cfg.perplexity_model
-                        ).await
-                    } else {
-                        println!("🌐 Lade neue Empfehlungen von Wisdom-Gate...");
-                        crate::api::fetch_wisdom_gate_recommendations_safe(
-                            &cfg.wisdom_gate_api_key,
-                            &cfg.wisdom_gate_prompt,
-                            &cfg.wisdom_gate_model,
-                            &cfg.wisdom_gate_endpoint
-                        ).await
-                    };
-                    let _ = tx.send(crate::app_state::Msg::WisdomGateRecommendations(content));
-                });
-            }
-
-            // Show provider and cache status
-            let provider_icon = if self.config.ai_provider == "perplexity" {
-                "🔮"
-            } else {
-                "🤖"
-            };
-            ui.label(format!("{} {}", provider_icon, 
-                if self.config.ai_provider == "perplexity" { "Perplexity" } else { "Wisdom-Gate" }));
-            
-            if self.config.is_wisdom_gate_cache_valid() {
-                let cache_age = self.config.get_wisdom_gate_cache_age_hours();
-                ui.label(format!("📦 Cache: {}h alt", cache_age));
-            } else if !self.config.wisdom_gate_cache_content.is_empty() {
-                ui.colored_label(egui::Color32::YELLOW, "⚠️ Cache abgelaufen");
-            } else {
-                ui.colored_label(egui::Color32::GRAY, "📭 Kein Cache");
-            }
-        });
-
-        ui.add_space(10.0);
-
-        // Display recommendations
-        if let Some(ref content) = self.wisdom_gate_recommendations {
-            // Zusatz-Hinweis bei DNS / Endpoint Problemen
-            if content.contains("DNS/Verbindungsfehler") || (content.contains("Endpoint:") && content.contains("nicht erreichbar")) {
-                ui.colored_label(egui::Color32::RED, "🛑 Endpoint nicht erreichbar");
-                ui.label("Die angegebene Wisdom-Gate API konnte nicht aufgelöst oder verbunden werden.");
-                ui.label("Prüfe:");
-                ui.label("• Internet / Firewall / VPN / Proxy");
-                ui.label("• DNS Schreibweise der Domain");
-                ui.label("• Alternative Domain ohne/mit Bindestrich testen");
-                ui.add_space(4.0);
-                ui.monospace(&self.config.wisdom_gate_endpoint);
-                ui.add_space(6.0);
-            }
-            egui::ScrollArea::vertical().show(ui, |ui| {
-                ui.label(egui::RichText::new("🎬 Heutige Streaming-Empfehlungen:")
-                    .strong()
-                    .size(16.0));
-                ui.add_space(8.0);
-                
-                if content.starts_with("Fehler") {
-                    ui.colored_label(egui::Color32::RED, 
-                        egui::RichText::new(content).size(14.0));
-                } else {
-                    // Parse and display with larger font and selectable text
-                    for line in content.lines() {
-                        if line.trim().is_empty() {
-                            ui.add_space(4.0);
-                            continue;
-                        }
-                        
-                        // Headers (### or ##)
-                        if line.starts_with("###") || line.starts_with("##") {
-                            let _ = ui.selectable_label(false, egui::RichText::new(line.trim_start_matches('#').trim())
-                                .strong()
-                                .size(18.0)
-                                .color(egui::Color32::from_rgb(100, 200, 255)));
-                            ui.add_space(3.0);
-                        } 
-                        // Bold text (**text**)
-                        else if line.starts_with("**") && line.ends_with("**") {
-                            let _ = ui.selectable_label(false, egui::RichText::new(line.trim_start_matches("**").trim_end_matches("**"))
-                                .strong()
-                                .size(15.0)
-                                .color(egui::Color32::from_rgb(255, 255, 150)));
-                            ui.add_space(2.0);
-                        } 
-                        // List items or content with bullets
-                        else if line.starts_with("*") || line.starts_with("-") || line.contains("–") {
-                            let _ = ui.selectable_label(false, egui::RichText::new(line.trim_start_matches('*').trim_start_matches('-').trim())
-                                .size(14.0)
-                                .color(egui::Color32::LIGHT_GRAY));
-                            ui.add_space(1.0);
-                        } 
-                        // Regular text
-                        else {
-                            let _ = ui.selectable_label(false, egui::RichText::new(line)
-                                .size(14.0)
-                                .color(egui::Color32::LIGHT_GRAY));
-                            ui.add_space(1.0);
-                        }
-                    }
-                }
-            });
-        } else {
-            ui.colored_label(egui::Color32::GRAY, "📭 Noch keine Empfehlungen geladen...");
-            ui.label("Klicken Sie auf 'Empfehlungen aktualisieren' um zu starten.");
-        }
+        render_ai_panel(ui, &self.config, &self.wisdom_gate_recommendations, &self.tx);
     }
 }
 
@@ -1662,17 +1535,30 @@ impl eframe::App for MacXtreamer {
             // Low CPU Mode: adaptive Thresholds basierend auf durchschnittlicher Frame-Zeit
             let base_critical = 2500u64; // länger
             let base_minor = 5000u64;
-            if has_critical_bg_work {
-                let delay = if self.avg_frame_ms < 25.0 { base_critical } else { base_critical / 2 }; // Wenn ohnehin langsam -> etwas schneller erlauben
-                ctx.request_repaint_after(Duration::from_millis(delay));
-            } else if has_minor_bg_work {
-                ctx.request_repaint_after(Duration::from_millis(base_minor));
-            }
-        } else {
-            if has_critical_bg_work {
+            let critical_threshold = if self.avg_frame_ms > 30.0 { base_critical * 2 } else { base_critical };
+            let minor_threshold = if self.avg_frame_ms > 30.0 { base_minor * 2 } else { base_minor };
+            if time_since_forced < critical_threshold && has_critical_bg_work {
+                // noch kein Repaint
+            } else if time_since_forced < minor_threshold && has_minor_bg_work {
+                // noch kein Repaint
+            } else if has_critical_bg_work {
                 ctx.request_repaint_after(Duration::from_millis(2000));
             } else if has_minor_bg_work {
                 ctx.request_repaint_after(Duration::from_millis(4000));
+            }
+        } else if self.config.ultra_low_flicker_mode {
+            // Ultra Flicker Guard: Nur heartbeats, keine Auto-Repaints außer bei kritischen Szenarien
+            let repaint_interval = 900u64;
+            if time_since_forced >= repaint_interval && has_critical_bg_work {
+                ctx.request_repaint();
+                self.last_forced_repaint = now;
+            }
+        } else {
+            // Normal Mode: milderere Strategie
+            if has_critical_bg_work {
+                ctx.request_repaint_after(Duration::from_millis(500));
+            } else if has_minor_bg_work {
+                ctx.request_repaint_after(Duration::from_millis(1000));
             }
         }
         // If no background work, NO automatic repaints at all!
@@ -1729,7 +1615,13 @@ impl eframe::App for MacXtreamer {
                                 }
                             }
                         }
-                        Err(e) => self.last_error = Some(e),
+                        Err(e) => {
+                            eprintln!("❌ LiveCategories Fehler: {}", e);
+                            self.last_error = Some(e.clone());
+                            let url = format!("{}/player_api.php?username={}&password=***&action=get_live_categories", self.config.address, self.config.username);
+                            self.loading_error = format!("Fehler beim Laden der Live-Kategorien:\n{}\n\nURL: {}", e, url);
+                            self.show_error_dialog = true;
+                        }
                     }
                     self.loading_done = self.loading_done.saturating_add(1);
                     if self.loading_done >= self.loading_total {
@@ -1773,7 +1665,13 @@ impl eframe::App for MacXtreamer {
                                 }
                             }
                         }
-                        Err(e) => self.last_error = Some(e),
+                        Err(e) => {
+                            eprintln!("❌ VodCategories Fehler: {}", e);
+                            self.last_error = Some(e.clone());
+                            let url = format!("{}/player_api.php?username={}&password=***&action=get_vod_categories", self.config.address, self.config.username);
+                            self.loading_error = format!("Fehler beim Laden der VOD-Kategorien:\n{}\n\nURL: {}", e, url);
+                            self.show_error_dialog = true;
+                        }
                     }
                     self.loading_done = self.loading_done.saturating_add(1);
                     if self.loading_done >= self.loading_total {
@@ -1817,7 +1715,13 @@ impl eframe::App for MacXtreamer {
                                 }
                             }
                         }
-                        Err(e) => self.last_error = Some(e),
+                        Err(e) => {
+                            eprintln!("❌ SeriesCategories Fehler: {}", e);
+                            self.last_error = Some(e.clone());
+                            let url = format!("{}/player_api.php?username={}&password=***&action=get_series_categories", self.config.address, self.config.username);
+                            self.loading_error = format!("Fehler beim Laden der Serien-Kategorien:\n{}\n\nURL: {}", e, url);
+                            self.show_error_dialog = true;
+                        }
                     }
                     self.loading_done = self.loading_done.saturating_add(1);
                     if self.loading_done >= self.loading_total {
@@ -1884,71 +1788,94 @@ impl eframe::App for MacXtreamer {
                     if let Some(flag) = &self.active_diag_stop { flag.store(true, std::sync::atomic::Ordering::Relaxed); }
                 }
                 Msg::ItemsLoaded { kind, items } => {
+                    // Ignore ItemsLoaded if we're not in an Items view (e.g., switched to Search)
+                    let should_process = match &self.current_view {
+                        Some(ViewState::Items { .. }) => true,
+                        _ => false,
+                    };
+                    
+                    if !should_process {
+                        println!("⚠️ Ignoriere ItemsLoaded - nicht in Items-View (current_view={:?})", self.current_view);
+                        // Still update loading state
+                        self.loading_done = self.loading_done.saturating_add(1);
+                        if self.loading_done >= self.loading_total {
+                            self.is_loading = false;
+                        }
+                        return;
+                    }
+                    
+                    // Reset search status when loading new items (but only if not in search view)
+                    if !matches!(self.current_view, Some(ViewState::Search { .. })) {
+                        self.search_status = SearchStatus::Idle;
+                    }
+                    
                     match items {
                         Ok(items) => {
-                            // map to rows and update all_movies/all_series caches
-                            self.content_rows.clear();
-                            let mut seen_ids: HashSet<String> = HashSet::new();
-                            for it in items {
-                                let info = match kind.as_str() {
-                                    "subplaylist" => "Channel",
-                                    "vod" => "Movie",
-                                    "series" => "Series",
-                                    _ => "Item",
-                                };
-                                if info == "Movie" {
-                                    if seen_ids.insert(it.id.clone()) { self.all_movies.push(it.clone()); }
-                                } else if info == "Series" {
-                                    if seen_ids.insert(it.id.clone()) { self.all_series.push(it.clone()); }
-                                } else if info == "Channel" {
-                                    if seen_ids.insert(it.id.clone()) { self.all_channels.push(it.clone()); }
+                            // Don't process items if we're in a search view - search results should not be overwritten
+                            if !matches!(self.current_view, Some(ViewState::Search { .. })) {
+                                // map to rows - DO NOT modify all_movies/all_series/all_channels here
+                                // those are only for the search index and should only be populated by IndexData
+                                self.content_rows.clear();
+                                for it in items {
+                                    let info = match kind.as_str() {
+                                        "subplaylist" => "Channel",
+                                        "vod" => "Movie",
+                                        "series" => "Series",
+                                        _ => "Item",
+                                    };
+                                    self.content_rows.push(Row {
+                                        name: it.name.clone(),
+                                        id: it.id,
+                                        info: info.to_string(),
+                                        container_extension: if info == "Movie"
+                                            && !it.container_extension.is_empty()
+                                        {
+                                            Some(it.container_extension)
+                                        } else {
+                                            None
+                                        },
+                                        stream_url: it.stream_url.clone(),
+                                        cover_url: it.cover.clone(),
+                                        year: it.year.clone(),
+                                        release_date: it.release_date.clone().or_else(|| extract_year_from_title(&it.name)).or_else(|| it.year.clone()),
+                                        rating_5based: it.rating_5based,
+                                        genre: it.genre.clone(),
+                                        audio_languages: it.audio_languages.clone(),
+                                        path: Some(match info {
+                                            "Movie" => format!(
+                                                "VOD / {}",
+                                                self.vod_categories
+                                                    .get(self.selected_vod.unwrap_or(0))
+                                                    .map(|c| c.name.clone())
+                                                    .unwrap_or_else(|| "?".into())
+                                            ),
+                                            "Series" => format!(
+                                                "Series / {}",
+                                                self.series_categories
+                                                    .get(self.selected_series.unwrap_or(0))
+                                                    .map(|c| c.name.clone())
+                                                    .unwrap_or_else(|| "?".into())
+                                            ),
+                                            "Channel" => format!(
+                                                "Live / {}",
+                                                self.playlists
+                                                    .get(self.selected_playlist.unwrap_or(0))
+                                                    .map(|c| c.name.clone())
+                                                    .unwrap_or_else(|| "?".into())
+                                            ),
+                                            _ => "".into(),
+                                        }),
+                                    });
                                 }
-                                self.content_rows.push(Row {
-                                    name: it.name.clone(),
-                                    id: it.id,
-                                    info: info.to_string(),
-                                    container_extension: if info == "Movie"
-                                        && !it.container_extension.is_empty()
-                                    {
-                                        Some(it.container_extension)
-                                    } else {
-                                        None
-                                    },
-                                    stream_url: it.stream_url.clone(),
-                                    cover_url: it.cover.clone(),
-                                    year: it.year.clone(),
-                                    release_date: it.release_date.clone().or_else(|| extract_year_from_title(&it.name)).or_else(|| it.year.clone()),
-                                    rating_5based: it.rating_5based,
-                                    genre: it.genre.clone(),
-                                    path: Some(match info {
-                                        "Movie" => format!(
-                                            "VOD / {}",
-                                            self.vod_categories
-                                                .get(self.selected_vod.unwrap_or(0))
-                                                .map(|c| c.name.clone())
-                                                .unwrap_or_else(|| "?".into())
-                                        ),
-                                        "Series" => format!(
-                                            "Series / {}",
-                                            self.series_categories
-                                                .get(self.selected_series.unwrap_or(0))
-                                                .map(|c| c.name.clone())
-                                                .unwrap_or_else(|| "?".into())
-                                        ),
-                                        "Channel" => format!(
-                                            "Live / {}",
-                                            self.playlists
-                                                .get(self.selected_playlist.unwrap_or(0))
-                                                .map(|c| c.name.clone())
-                                                .unwrap_or_else(|| "?".into())
-                                        ),
-                                        _ => "".into(),
-                                    }),
-                                });
+                            } else {
+                                println!("⚠️ Ignoriere ItemsLoaded während Suchansicht (current_view={:?})", self.current_view);
                             }
                         }
                         Err(e) => {
-                            self.last_error = Some(e);
+                            eprintln!("❌ ItemsLoaded Fehler: {}", e);
+                            self.last_error = Some(e.clone());
+                            self.loading_error = format!("Fehler beim Laden von Inhalten:\n{}", e);
+                            self.show_error_dialog = true;
                         }
                     }
                     // Always increment loading_done and check if we're finished
@@ -1960,7 +1887,13 @@ impl eframe::App for MacXtreamer {
                 Msg::EpisodesLoaded {
                     series_id: _sid,
                     episodes,
-                } => match episodes {
+                } => {
+                    // Reset search status when loading episodes (but only if not in search view)
+                    if !matches!(self.current_view, Some(ViewState::Search { .. })) {
+                        self.search_status = SearchStatus::Idle;
+                    }
+                    
+                    match episodes {
                     Ok(eps) => {
                         // Sort episodes by parsed season and episode number (e.g., S27E05)
                         fn parse_season_episode(s: &str) -> Option<(u32, u32)> {
@@ -2043,17 +1976,22 @@ impl eframe::App for MacXtreamer {
                                 rating_5based: None,
                                 genre: None,
                                 path: Some("Series / Episodes".into()),
+                                audio_languages: None,
                             });
                         }
                         self.is_loading = false;
                         self.loading_done = self.loading_total;
                     }
                     Err(e) => {
+                        eprintln!("❌ EpisodesLoaded Fehler: {}", e);
                         self.is_loading = false;
-                        self.last_error = Some(e);
+                        self.last_error = Some(e.clone());
+                        self.loading_error = format!("Fehler beim Laden der Episoden:\n{}", e);
+                        self.show_error_dialog = true;
                         self.loading_done = self.loading_total;
                     }
-                },
+                    }
+                }
                 Msg::CoverLoaded { url, bytes } => {
                     // Offload decoding/resizing to a background worker to avoid UI hitches
                     if self.textures.contains_key(&url) || self.pending_decode_urls.contains(&url) {
@@ -2323,6 +2261,10 @@ impl eframe::App for MacXtreamer {
                     self.search_status = SearchStatus::Searching;
                 }
                 Msg::SearchReady(mut rows) => {
+                    println!("📥 SearchReady empfangen mit {} Zeilen", rows.len());
+                    println!("🔍 Aktuelle View: {:?}", self.current_view);
+                    println!("📊 Aktuelle content_rows vor Update: {}", self.content_rows.len());
+                    
                     // Deduplicate rows by ID (keep first occurrence)
                     let mut seen_ids: std::collections::HashSet<String> = std::collections::HashSet::new();
                     rows.retain(|r| seen_ids.insert(r.id.clone()));
@@ -2386,6 +2328,11 @@ impl eframe::App for MacXtreamer {
                         } else { println!("💾 Cache erfolgreich gespeichert"); }
                     }
                     self.wisdom_gate_recommendations = Some(content);
+                }
+                Msg::LoadingError(err) => {
+                    self.loading_error = err;
+                    self.show_error_dialog = true;
+                    self.is_loading = false;
                 }
             } // end match msg
         } // end while let Ok(msg)
@@ -2662,8 +2609,11 @@ impl eframe::App for MacXtreamer {
                         
                         ui.add_enabled_ui(search_enabled, |ui| {
                             if ui.button("Search").clicked() {
+                                // Don't push Search view onto stack if already in Search view
                                 if let Some(cv) = &self.current_view {
-                                    self.view_stack.push(cv.clone());
+                                    if !matches!(cv, ViewState::Search { .. }) {
+                                        self.view_stack.push(cv.clone());
+                                    }
                                 }
                                 self.current_view = Some(ViewState::Search {
                                     query: self.search_text.clone(),
@@ -2693,6 +2643,56 @@ impl eframe::App for MacXtreamer {
                                 if ui.button("✖").on_hover_text("Suche löschen").clicked() {
                                     self.search_text.clear();
                                 }
+                            }
+                            
+                            // Language filter button
+                            let lang_button = ui.button("🌐").on_hover_text("Sprach-Filter");
+                            if lang_button.clicked() {
+                                self.show_language_filter = !self.show_language_filter;
+                            }
+                            
+                            // Show language filter popup
+                            if self.show_language_filter {
+                                // Define common_langs outside the window to avoid borrowing issues
+                                let common_langs = vec!["EN", "DE", "FR", "ES", "IT", "MULTI", "4K", "HD"];
+                                let all_langs: Vec<String> = common_langs.iter().map(|s| s.to_string()).collect();
+                                
+                                egui::Window::new("Sprach-Filter")
+                                    .anchor(egui::Align2::RIGHT_TOP, [-10.0, 40.0])
+                                    .collapsible(false)
+                                    .resizable(false)
+                                    .show(ui.ctx(), |ui| {
+                                        ui.set_min_width(200.0);
+                                        ui.label(RichText::new("Sprachen filtern:").strong());
+                                        ui.separator();
+                                        
+                                        // Common languages
+                                        for lang in &common_langs {
+                                            let mut selected = self.search_language_filter.contains(&lang.to_string());
+                                            if ui.checkbox(&mut selected, *lang).clicked() {
+                                                if selected {
+                                                    if !self.search_language_filter.contains(&lang.to_string()) {
+                                                        self.search_language_filter.push(lang.to_string());
+                                                    }
+                                                } else {
+                                                    self.search_language_filter.retain(|l| l != lang);
+                                                }
+                                            }
+                                        }
+                                        
+                                        ui.separator();
+                                        ui.horizontal(|ui| {
+                                            if ui.button("Alle").clicked() {
+                                                self.search_language_filter = all_langs.clone();
+                                            }
+                                            if ui.button("Keine").clicked() {
+                                                self.search_language_filter.clear();
+                                            }
+                                            if ui.button("Standard").clicked() {
+                                                self.search_language_filter = self.config.default_search_languages.clone();
+                                            }
+                                        });
+                                    });
                             }
                             
                             // History dropdown button
@@ -2738,8 +2738,11 @@ impl eframe::App for MacXtreamer {
                                             if let Some(query) = clicked_query {
                                                 self.search_text = query.clone();
                                                 self.show_search_history = false;
+                                                // Don't push Search view onto stack if already in Search view
                                                 if let Some(cv) = &self.current_view {
-                                                    self.view_stack.push(cv.clone());
+                                                    if !matches!(cv, ViewState::Search { .. }) {
+                                                        self.view_stack.push(cv.clone());
+                                                    }
                                                 }
                                                 self.current_view = Some(ViewState::Search { query });
                                                 self.start_search();
@@ -2760,8 +2763,11 @@ impl eframe::App for MacXtreamer {
                                 save_search_history(&self.search_history);
                                 self.show_search_history = false;
                                 
+                                // Don't push Search view onto stack if already in Search view
                                 if let Some(cv) = &self.current_view {
-                                    self.view_stack.push(cv.clone());
+                                    if !matches!(cv, ViewState::Search { .. }) {
+                                        self.view_stack.push(cv.clone());
+                                    }
                                 }
                                 self.current_view = Some(ViewState::Search { query });
                                 self.start_search();
@@ -2892,6 +2898,23 @@ impl eframe::App for MacXtreamer {
                     egui::ScrollArea::vertical()
                         .id_source("vod_list")
                         .show(&mut cols[1], |ui| {
+                            if self.vod_categories.is_empty() {
+                                if self.is_loading {
+                                    ui.weak("⏳ Laden...");
+                                } else if !self.config_is_complete() {
+                                    ui.weak("⚠️ Einstellungen erforderlich");
+                                } else {
+                                    ui.colored_label(egui::Color32::from_rgb(255, 150, 0), "⚠️ Keine VOD-Kategorien gefunden");
+                                    if let Some(ref err) = self.last_error {
+                                        ui.small(err);
+                                        if ui.small_button("🔄 Nochmal versuchen").clicked() {
+                                            self.clear_caches_and_reload();
+                                        }
+                                    } else {
+                                        ui.weak("Server liefert keine VOD-Kategorien.");
+                                    }
+                                }
+                            }
                             for (i, c) in self.vod_categories.clone().into_iter().enumerate() {
                                 if ui
                                     .selectable_label(self.selected_vod == Some(i), &c.name)
@@ -2920,6 +2943,23 @@ impl eframe::App for MacXtreamer {
                     egui::ScrollArea::vertical().id_source("series_list").show(
                         &mut cols[2],
                         |ui| {
+                            if self.series_categories.is_empty() {
+                                if self.is_loading {
+                                    ui.weak("⏳ Laden...");
+                                } else if !self.config_is_complete() {
+                                    ui.weak("⚠️ Einstellungen erforderlich");
+                                } else {
+                                    ui.colored_label(egui::Color32::from_rgb(255, 150, 0), "⚠️ Keine Serien-Kategorien gefunden");
+                                    if let Some(ref err) = self.last_error {
+                                        ui.small(err);
+                                        if ui.small_button("🔄 Nochmal versuchen").clicked() {
+                                            self.clear_caches_and_reload();
+                                        }
+                                    } else {
+                                        ui.weak("Server liefert keine Serien-Kategorien.");
+                                    }
+                                }
+                            }
                             for (i, c) in self.series_categories.clone().into_iter().enumerate() {
                                 if ui
                                     .selectable_label(self.selected_series == Some(i), &c.name)
@@ -3113,19 +3153,50 @@ impl eframe::App for MacXtreamer {
                                             let avg_speed_bps = st.avg_speed_bps;
                                             ui.horizontal(|ui| {
                                                 ui.label(name);
-                                                if let Some(sz)=size_opt { ui.weak(format_file_size(Some(sz))); }
+                                                if let Some(sz)=size_opt { ui.weak(format_file_size(sz)); }
                                                 if waiting { ui.weak("waiting"); }
                                                 else if finished {
                                                     if let Some(err)=error_opt.as_ref(){ ui.label(colored_text_by_type(&format!("error: {}",err),"error")); }
                                                     else { ui.label(colored_text_by_type("done","success")); }
                                                 } else {
+                                                    // Play button während des Downloads (wenn Pfad vorhanden)
+                                                    if let Some(p)=&path_opt {
+                                                        // Für .part Dateien absoluten Pfad verwenden statt file:// URI
+                                                        if ui.small_button("Play").on_hover_text("Play partially downloaded file").clicked(){
+                                                            let path_str = if p.ends_with(".part") {
+                                                                p.clone() // Absoluter Pfad für .part Dateien
+                                                            } else {
+                                                                file_path_to_uri(Path::new(p))
+                                                            };
+                                                            let _= start_player(self.effective_config(), &path_str);
+                                                        }
+                                                    }
                                                     let frac = total_opt.map(|t| (received as f32 / t as f32).min(1.0)).unwrap_or(0.0);
                                                     let pct_text = if total_opt.is_some(){ format!("{:.0}%", frac*100.0) } else { format!("{} KB", received/1024) };
                                                     // Geschwindigkeiten (aktuell & Durchschnitt)
                                                     let cur_speed = if cur_speed_bps > 0.0 { crate::downloads::format_speed(cur_speed_bps) } else { "-".into() };
                                                     let avg_speed = if avg_speed_bps > 0.0 { crate::downloads::format_speed(avg_speed_bps) } else { "-".into() };
-                                                    let bar_text = format!("{} | {} / avg {}", pct_text, cur_speed, avg_speed);
-                                                    ui.add(egui::ProgressBar::new(frac).desired_width(160.0).text(bar_text));
+                                                    // ETA berechnen
+                                                    let eta_text = if let Some(total) = total_opt {
+                                                        if avg_speed_bps > 0.0 && received < total {
+                                                            let remaining_bytes = total - received;
+                                                            let eta_seconds = (remaining_bytes as f64 / avg_speed_bps) as u64;
+                                                            if eta_seconds < 60 {
+                                                                format!("{}s", eta_seconds)
+                                                            } else if eta_seconds < 3600 {
+                                                                format!("{}m", eta_seconds / 60)
+                                                            } else {
+                                                                format!("{}h {}m", eta_seconds / 3600, (eta_seconds % 3600) / 60)
+                                                            }
+                                                        } else { String::new() }
+                                                    } else { String::new() };
+                                                    // ProgressBar ohne Text
+                                                    ui.add(egui::ProgressBar::new(frac).desired_width(100.0));
+                                                    // Text daneben anzeigen
+                                                    ui.label(format!("{} | {}/s (avg {}/s)", pct_text, cur_speed, avg_speed));
+                                                    if !eta_text.is_empty() {
+                                                        ui.weak(format!("ETA {}", eta_text));
+                                                    }
                                                     if let Some(flag)=&cancel_flag { if ui.small_button("Cancel").clicked(){ flag.store(true, std::sync::atomic::Ordering::Relaxed); } }
                                                 }
                                                 if is_done_ok {
@@ -3141,6 +3212,12 @@ impl eframe::App for MacXtreamer {
                                                                     self.last_error = Some(format!("Delete failed: {}", e));
                                                                 }
                                                                 Ok(_) => {
+                                                                    // Lösche auch die .json Sidecar-Datei
+                                                                    let p_path = Path::new(&p);
+                                                                    if let Some(ext) = p_path.extension().and_then(|e| e.to_str()) {
+                                                                        let sidecar = p_path.with_extension(format!("{}.json", ext));
+                                                                        let _ = std::fs::remove_file(&sidecar);
+                                                                    }
                                                                     // Sofortiges Entfernen aus internen Strukturen
                                                                     self.downloads.remove(&id);
                                                                     self.download_meta.remove(&id);
@@ -3321,6 +3398,15 @@ impl eframe::App for MacXtreamer {
                                 .cmp(&b.genre.clone().unwrap_or_default().to_lowercase())
                         });
                     }
+                    SortKey::Languages => {
+                        rows.sort_by(|a, b| {
+                            a.audio_languages
+                                .clone()
+                                .unwrap_or_default()
+                                .to_lowercase()
+                                .cmp(&b.audio_languages.clone().unwrap_or_default().to_lowercase())
+                        });
+                    }
                 }
                 if !self.sort_asc {
                     rows.reverse();
@@ -3333,8 +3419,8 @@ impl eframe::App for MacXtreamer {
                 .striped(true)
                 .resizable(true)
                 .vscroll(true)
-                // Leave some breathing room to avoid clipping against bottom panel border
-                .min_scrolled_height((avail_h - 8.0).max(50.0))
+                // Let egui calculate the available height automatically
+                .max_scroll_height(avail_h)
                 .column(egui_extras::Column::initial(cover_w + 16.0)) // Cover
                 .column(egui_extras::Column::initial(400.0).at_least(400.0)) // Name (min 400px, resizable)
                 .column(egui_extras::Column::initial(140.0)) // ID
@@ -3343,6 +3429,7 @@ impl eframe::App for MacXtreamer {
                 .column(egui_extras::Column::initial(100.0)) // Release Date
                 .column(egui_extras::Column::initial(80.0)) // Rating
                 .column(egui_extras::Column::initial(200.0)) // Genre (resizable)
+                .column(egui_extras::Column::initial(150.0)) // Languages
                 .column(egui_extras::Column::initial(220.0)) // Path
                 .column(egui_extras::Column::remainder().at_least(320.0)) // Aktion füllt Restbreite
                 .header(header_h, |mut header| {
@@ -3432,6 +3519,22 @@ impl eframe::App for MacXtreamer {
                                 self.sort_asc = !self.sort_asc;
                             } else {
                                 self.sort_key = Some(SortKey::Genre);
+                                self.sort_asc = true;
+                            }
+                        }
+                    });
+                    header.col(|ui| {
+                        let selected = self.sort_key == Some(SortKey::Languages);
+                        let label = if selected {
+                            format!("Languages {}", if self.sort_asc { "▲" } else { "▼" })
+                        } else {
+                            "Languages".to_string()
+                        };
+                        if ui.small_button(label).clicked() {
+                            if selected {
+                                self.sort_asc = !self.sort_asc;
+                            } else {
+                                self.sort_key = Some(SortKey::Languages);
                                 self.sort_asc = true;
                             }
                         }
@@ -3527,6 +3630,9 @@ impl eframe::App for MacXtreamer {
                         });
                         row.col(|ui| {
                             ui.label(r.genre.clone().unwrap_or_default());
+                        });
+                        row.col(|ui| {
+                            ui.label(r.audio_languages.clone().unwrap_or_default());
                         });
                         row.col(|ui| {
                             ui.label(r.path.clone().unwrap_or_default());
@@ -3877,6 +3983,29 @@ impl eframe::App for MacXtreamer {
                                 ui.horizontal(|ui| { ui.label("Max parallel:"); let mut mp = if draft.max_parallel_downloads==0 {1}else{draft.max_parallel_downloads} as f32; if ui.add(egui::Slider::new(&mut mp,1.0..=5.0).integer()).changed(){ draft.max_parallel_downloads=mp as u32; }});
                             });
                             
+                            ui.collapsing("🔍 Search Settings", |ui| {
+                                ui.label("Default Language Filter");
+                                ui.weak("Select languages to filter by default when searching");
+                                let common_langs = vec!["EN", "DE", "FR", "ES", "IT", "MULTI", "4K", "HD"];
+                                ui.horizontal_wrapped(|ui| {
+                                    for lang in common_langs {
+                                        let mut selected = draft.default_search_languages.contains(&lang.to_string());
+                                        if ui.checkbox(&mut selected, lang).clicked() {
+                                            if selected {
+                                                if !draft.default_search_languages.contains(&lang.to_string()) {
+                                                    draft.default_search_languages.push(lang.to_string());
+                                                }
+                                            } else {
+                                                draft.default_search_languages.retain(|l| l != lang);
+                                            }
+                                        }
+                                    }
+                                });
+                                if ui.button("Reset to Default (EN, DE, MULTI)").clicked() {
+                                    draft.default_search_languages = vec!["EN".to_string(), "DE".to_string(), "MULTI".to_string()];
+                                }
+                            });
+                            
                             ui.add_space(8.0);
                             ui.heading("🎬 Player Einstellungen");
                             ui.separator();
@@ -4146,6 +4275,9 @@ impl eframe::App for MacXtreamer {
                         ui.label("AI Provider:");
                         ui.radio_value(&mut draft.ai_provider, "wisdom-gate".to_string(), "🤖 Wisdom-Gate");
                         ui.radio_value(&mut draft.ai_provider, "perplexity".to_string(), "🔮 Perplexity");
+                        ui.radio_value(&mut draft.ai_provider, "cognora".to_string(), "🧠 Cognora");
+                        ui.radio_value(&mut draft.ai_provider, "gemini".to_string(), "💎 Gemini");
+                        ui.radio_value(&mut draft.ai_provider, "openai".to_string(), "🤖 OpenAI");
                     });
                     
                     ui.separator();
@@ -4235,6 +4367,120 @@ impl eframe::App for MacXtreamer {
                                 draft.wisdom_gate_prompt = crate::models::default_wisdom_gate_prompt();
                             }
                             ui.weak("Tipp: Perplexity hat Zugriff auf aktuelle Informationen");
+                        });
+                    } else if draft.ai_provider == "cognora" {
+                        ui.label("🧠 Cognora Toolkit");
+                        ui.horizontal(|ui| {
+                            ui.label("API Key:");
+                            ui.add(
+                                egui::TextEdit::singleline(&mut draft.cognora_api_key)
+                                    .password(true)
+                                    .hint_text("cog-xxx...")
+                            );
+                        });
+                        if draft.cognora_api_key.trim().is_empty() {
+                            ui.weak("API Key erforderlich für Cognora-Empfehlungen");
+                        }
+                        
+                        ui.horizontal(|ui| {
+                            ui.label("Model:");
+                            egui::ComboBox::from_label("")
+                                .selected_text(&draft.cognora_model)
+                                .show_ui(ui, |ui| {
+                                    ui.selectable_value(&mut draft.cognora_model, "cognora-3".to_string(), "🧠 Cognora-3 (Empfohlen)");
+                                    ui.selectable_value(&mut draft.cognora_model, "cognora-4".to_string(), "💎 Cognora-4 (Premium)");
+                                });
+                        });
+                        
+                        ui.label("Prompt für Empfehlungen:");
+                        ui.add(
+                            egui::TextEdit::multiline(&mut draft.wisdom_gate_prompt)
+                                .desired_rows(3)
+                                .hint_text("Was sind die besten Streaming-Empfehlungen für heute?")
+                        );
+                        
+                        ui.horizontal(|ui| {
+                            if ui.button("Standard Prompt").clicked() {
+                                draft.wisdom_gate_prompt = crate::models::default_wisdom_gate_prompt();
+                            }
+                            ui.weak("Tipp: Cognora bietet spezialisierte Empfehlungen");
+                        });
+                    } else if draft.ai_provider == "gemini" {
+                        ui.label("💎 Google Gemini");
+                        ui.horizontal(|ui| {
+                            ui.label("API Key:");
+                            ui.add(
+                                egui::TextEdit::singleline(&mut draft.gemini_api_key)
+                                    .password(true)
+                                    .hint_text("AIza...")
+                            );
+                        });
+                        if draft.gemini_api_key.trim().is_empty() {
+                            ui.weak("API Key erforderlich für Gemini-Empfehlungen");
+                        }
+                        
+                        ui.horizontal(|ui| {
+                            ui.label("Model:");
+                            egui::ComboBox::from_label("")
+                                .selected_text(&draft.gemini_model)
+                                .show_ui(ui, |ui| {
+                                    ui.selectable_value(&mut draft.gemini_model, "gemini-2.0-flash-exp".to_string(), "⚡ Gemini 2.0 Flash (Empfohlen)");
+                                    ui.selectable_value(&mut draft.gemini_model, "gemini-1.5-pro".to_string(), "🧠 Gemini 1.5 Pro");
+                                    ui.selectable_value(&mut draft.gemini_model, "gemini-1.5-flash".to_string(), "💨 Gemini 1.5 Flash");
+                                });
+                        });
+                        
+                        ui.label("Prompt für Empfehlungen:");
+                        ui.add(
+                            egui::TextEdit::multiline(&mut draft.wisdom_gate_prompt)
+                                .desired_rows(3)
+                                .hint_text("Was sind die besten Streaming-Empfehlungen für heute?")
+                        );
+                        
+                        ui.horizontal(|ui| {
+                            if ui.button("Standard Prompt").clicked() {
+                                draft.wisdom_gate_prompt = crate::models::default_wisdom_gate_prompt();
+                            }
+                            ui.weak("Tipp: Gemini bietet multimodale Fähigkeiten");
+                        });
+                    } else if draft.ai_provider == "openai" {
+                        ui.label("🤖 OpenAI");
+                        ui.horizontal(|ui| {
+                            ui.label("API Key:");
+                            ui.add(
+                                egui::TextEdit::singleline(&mut draft.openai_api_key)
+                                    .password(true)
+                                    .hint_text("sk-...")
+                            );
+                        });
+                        if draft.openai_api_key.trim().is_empty() {
+                            ui.weak("API Key erforderlich für OpenAI-Empfehlungen");
+                        }
+                        
+                        ui.horizontal(|ui| {
+                            ui.label("Model:");
+                            egui::ComboBox::from_label("")
+                                .selected_text(&draft.openai_model)
+                                .show_ui(ui, |ui| {
+                                    ui.selectable_value(&mut draft.openai_model, "gpt-4o".to_string(), "🚀 GPT-4o (Empfohlen)");
+                                    ui.selectable_value(&mut draft.openai_model, "gpt-4o-mini".to_string(), "⚡ GPT-4o Mini");
+                                    ui.selectable_value(&mut draft.openai_model, "gpt-4-turbo".to_string(), "🧠 GPT-4 Turbo");
+                                    ui.selectable_value(&mut draft.openai_model, "gpt-3.5-turbo".to_string(), "💨 GPT-3.5 Turbo");
+                                });
+                        });
+                        
+                        ui.label("Prompt für Empfehlungen:");
+                        ui.add(
+                            egui::TextEdit::multiline(&mut draft.wisdom_gate_prompt)
+                                .desired_rows(3)
+                                .hint_text("Was sind die besten Streaming-Empfehlungen für heute?")
+                        );
+                        
+                        ui.horizontal(|ui| {
+                            if ui.button("Standard Prompt").clicked() {
+                                draft.wisdom_gate_prompt = crate::models::default_wisdom_gate_prompt();
+                            }
+                            ui.weak("Tipp: OpenAI bietet leistungsstarke Modelle");
                         });
                     }
                     });
@@ -4430,12 +4676,63 @@ impl eframe::App for MacXtreamer {
             self.show_log = open;
         }
 
+        // Error dialog window
+        if self.show_error_dialog {
+            let mut open = self.show_error_dialog;
+            egui::Window::new("❌ Fehler beim Laden")
+                .collapsible(false)
+                .resizable(true)
+                .default_width(500.0)
+                .default_height(250.0)
+                .max_width(800.0)
+                .max_height(600.0)
+                .anchor(egui::Align2::CENTER_CENTER, egui::vec2(0.0, 0.0))
+                .open(&mut open)
+                .show(ctx, |ui| {
+                    // Show message if not empty, otherwise show placeholder
+                    if !self.loading_error.is_empty() {
+                        egui::ScrollArea::vertical()
+                            .max_height(400.0)
+                            .auto_shrink([false, true])
+                            .show(ui, |ui| {
+                                ui.style_mut().wrap = Some(true);
+                                ui.label(&self.loading_error);
+                            });
+                    } else {
+                        ui.label("Ein unbekannter Fehler ist aufgetreten.");
+                    }
+                    
+                    ui.add_space(8.0);
+                    ui.separator();
+                    ui.add_space(4.0);
+                    
+                    ui.horizontal(|ui| {
+                        if !self.loading_error.is_empty() && ui.button("📋 Kopieren").clicked() {
+                            ui.output_mut(|o| o.copied_text = self.loading_error.clone());
+                        }
+                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                            if ui.button("OK").clicked() {
+                                self.show_error_dialog = false;
+                            }
+                        });
+                    });
+                });
+            self.show_error_dialog = open;
+        }
+
         // (Bottom panel already rendered above CentralPanel)
 
         // Handle deferred save to avoid mutable borrow inside Window closure
         if self.pending_save_config {
+            // Check if server changed before saving
+            let old_address = self.config.address.clone();
+            let old_username = self.config.username.clone();
+            
             // Sync active profile to legacy fields before saving
             self.config.sync_active_profile();
+            
+            let server_changed = old_address != self.config.address || old_username != self.config.username;
+            
             let _ = save_config(&self.config);
             // Übernehme neue Parallelität sofort
             let permits = if self.config.cover_parallel == 0 {
@@ -4464,6 +4761,15 @@ impl eframe::App for MacXtreamer {
                 if self.initial_config_pending {
                     self.spawn_preload_all();
                     self.initial_config_pending = false;
+                }
+                // Rebuild index if server changed
+                if server_changed {
+                    println!("🔄 Server geändert, baue Index neu auf...");
+                    self.all_movies.clear();
+                    self.all_series.clear();
+                    self.all_channels.clear();
+                    self.index_paths.clear();
+                    self.spawn_build_index();
                 }
             }
             self.show_config = false;

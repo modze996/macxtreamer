@@ -101,6 +101,12 @@ pub fn read_config() -> Result<Config, io::Error> {
                 "ai_provider" => cfg.ai_provider = v.trim().to_string(),
                 "perplexity_api_key" => cfg.perplexity_api_key = v.trim().to_string(),
                 "perplexity_model" => cfg.perplexity_model = v.trim().to_string(),
+                "cognora_api_key" => cfg.cognora_api_key = v.trim().to_string(),
+                "cognora_model" => cfg.cognora_model = v.trim().to_string(),
+                "gemini_api_key" => cfg.gemini_api_key = v.trim().to_string(),
+                "gemini_model" => cfg.gemini_model = v.trim().to_string(),
+                "openai_api_key" => cfg.openai_api_key = v.trim().to_string(),
+                "openai_model" => cfg.openai_model = v.trim().to_string(),
                 "vlc_diag_history" => cfg.vlc_diag_history = v.trim().to_string(),
                 "low_cpu_mode" => cfg.low_cpu_mode = v.trim().parse::<u8>().map(|n| n!=0).unwrap_or(false),
                 "ultra_low_flicker_mode" => cfg.ultra_low_flicker_mode = v.trim().parse::<u8>().map(|n| n!=0).unwrap_or(false),
@@ -267,6 +273,12 @@ pub fn save_config(cfg: &Config) -> Result<(), io::Error> {
     if !cfg.ai_provider.is_empty() { writeln!(f, "ai_provider={}", cfg.ai_provider)?; }
     if !cfg.perplexity_api_key.is_empty() { writeln!(f, "perplexity_api_key={}", cfg.perplexity_api_key)?; }
     if !cfg.perplexity_model.is_empty() { writeln!(f, "perplexity_model={}", cfg.perplexity_model)?; }
+    if !cfg.cognora_api_key.is_empty() { writeln!(f, "cognora_api_key={}", cfg.cognora_api_key)?; }
+    if !cfg.cognora_model.is_empty() { writeln!(f, "cognora_model={}", cfg.cognora_model)?; }
+    if !cfg.gemini_api_key.is_empty() { writeln!(f, "gemini_api_key={}", cfg.gemini_api_key)?; }
+    if !cfg.gemini_model.is_empty() { writeln!(f, "gemini_model={}", cfg.gemini_model)?; }
+    if !cfg.openai_api_key.is_empty() { writeln!(f, "openai_api_key={}", cfg.openai_api_key)?; }
+    if !cfg.openai_model.is_empty() { writeln!(f, "openai_model={}", cfg.openai_model)?; }
     
     if !cfg.vlc_diag_history.trim().is_empty() { writeln!(f, "vlc_diag_history={}", cfg.vlc_diag_history)?; }
     writeln!(f, "low_cpu_mode={}", if cfg.low_cpu_mode {1} else {0})?;

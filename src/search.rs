@@ -39,15 +39,20 @@ fn score_item(item: &Item, query: &str) -> f64 {
     name_score.max(plot_score)
 }
 
-/// Fuzzy + substring search across movies and series.
-/// Returns sorted results (best score first) and filters out low quality matches.
-pub fn search_items(movies: &Vec<Item>, series: &Vec<Item>, channels: &Vec<Item>, text: &str) -> Vec<SearchItem> {
+/// Search with language filter support
+pub fn search_items_with_language_filter(
+    movies: &Vec<Item>, 
+    series: &Vec<Item>, 
+    channels: &Vec<Item>, 
+    text: &str,
+    language_filter: &[String]
+) -> Vec<SearchItem> {
     let query = text.trim();
     if query.is_empty() { return Vec::new(); }
     
     // Für sehr kurze Queries (<=2 Zeichen) nur einfache substring Suche (Performance + Erwartung)
     if query.len() <= 2 { 
-        return legacy_substring(movies, series, channels, query); 
+        return legacy_substring_with_filter(movies, series, channels, query, language_filter); 
     }
     
     // Use HashMap to deduplicate by ID and keep best score
@@ -90,28 +95,61 @@ pub fn search_items(movies: &Vec<Item>, series: &Vec<Item>, channels: &Vec<Item>
     scored.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal));
     scored.truncate(500);
     
-    // Convert to SearchItems
-    scored.into_iter().map(|(_sc, it, kind)| SearchItem {
-        id: it.id.clone(),
-        name: it.name.clone(),
-        info: kind.into(),
-        container_extension: it.container_extension.clone(),
-        cover: it.cover.clone(),
-        year: it.year.clone(),
-        release_date: it.release_date.clone(),
-        rating_5based: it.rating_5based,
-        genre: it.genre.clone(),
-    }).collect()
+    // Convert to SearchItems, apply language filter
+    let results: Vec<SearchItem> = scored.into_iter()
+        .map(|(_sc, it, kind)| SearchItem {
+            id: it.id.clone(),
+            name: it.name.clone(),
+            info: kind.into(),
+            container_extension: it.container_extension.clone(),
+            cover: it.cover.clone(),
+            year: it.year.clone(),
+            release_date: it.release_date.clone(),
+            rating_5based: it.rating_5based,
+            genre: it.genre.clone(),
+        })
+        .filter(|item| {
+            if language_filter.is_empty() {
+                true
+            } else {
+                // Check if item language matches any selected filter
+                if let Some(lang) = crate::helpers::extract_language_from_name(&item.name) {
+                    language_filter.contains(&lang)
+                } else {
+                    // Exclude items without detectable language when filter is active
+                    false
+                }
+            }
+        })
+        .collect();
+    
+    results
 }
 
 fn legacy_substring(movies: &Vec<Item>, series: &Vec<Item>, channels: &Vec<Item>, q: &str) -> Vec<SearchItem> {
+    legacy_substring_with_filter(movies, series, channels, q, &[])
+}
+
+fn legacy_substring_with_filter(movies: &Vec<Item>, series: &Vec<Item>, channels: &Vec<Item>, q: &str, language_filter: &[String]) -> Vec<SearchItem> {
     let t = q.to_lowercase();
     let mut seen_ids: std::collections::HashSet<String> = std::collections::HashSet::new();
     let mut out = Vec::new();
     
+    let matches_filter = |item: &Item| {
+        if language_filter.is_empty() {
+            true
+        } else {
+            if let Some(lang) = crate::helpers::extract_language_from_name(&item.name) {
+                language_filter.contains(&lang)
+            } else {
+                false // Exclude items without detectable language when filter is active
+            }
+        }
+    };
+    
     for m in movies {
         if (m.name.to_lowercase().contains(&t) || m.plot.to_lowercase().contains(&t)) 
-            && seen_ids.insert(m.id.clone()) {
+            && seen_ids.insert(m.id.clone()) && matches_filter(m) {
             out.push(SearchItem { 
                 id: m.id.clone(), 
                 name: m.name.clone(), 
@@ -127,7 +165,7 @@ fn legacy_substring(movies: &Vec<Item>, series: &Vec<Item>, channels: &Vec<Item>
     }
     for s in series {
         if (s.name.to_lowercase().contains(&t) || s.plot.to_lowercase().contains(&t))
-            && seen_ids.insert(s.id.clone()) {
+            && seen_ids.insert(s.id.clone()) && matches_filter(s) {
             out.push(SearchItem { 
                 id: s.id.clone(), 
                 name: s.name.clone(), 
@@ -143,7 +181,7 @@ fn legacy_substring(movies: &Vec<Item>, series: &Vec<Item>, channels: &Vec<Item>
     }
     for c in channels {
         if (c.name.to_lowercase().contains(&t) || c.plot.to_lowercase().contains(&t))
-            && seen_ids.insert(c.id.clone()) {
+            && seen_ids.insert(c.id.clone()) && matches_filter(c) {
             out.push(SearchItem { 
                 id: c.id.clone(), 
                 name: c.name.clone(), 

@@ -119,11 +119,23 @@ pub struct Config {
     #[serde(default)]
     pub wisdom_gate_cache_timestamp: u64,   // Timestamp when cache was created (Unix timestamp)
     #[serde(default)]
-    pub ai_provider: String,          // AI provider selection: "wisdom-gate" or "perplexity"
+    pub ai_provider: String,          // AI provider selection: "wisdom-gate", "perplexity", "cognora", "gemini", "openai"
     #[serde(default)]
     pub perplexity_api_key: String,   // API key for Perplexity
     #[serde(default)]
     pub perplexity_model: String,     // Model selection for Perplexity
+    #[serde(default)]
+    pub cognora_api_key: String,      // API key for Cognora Toolkit
+    #[serde(default)]
+    pub cognora_model: String,        // Model selection for Cognora
+    #[serde(default)]
+    pub gemini_api_key: String,       // API key for Gemini
+    #[serde(default)]
+    pub gemini_model: String,         // Model selection for Gemini
+    #[serde(default)]
+    pub openai_api_key: String,       // API key for OpenAI
+    #[serde(default)]
+    pub openai_model: String,         // Model selection for OpenAI
     #[serde(default)]
     pub vlc_diag_history: String, // Semikolon-separierte Liste angewandter Vorschläge: ts:net:live:file;...
     #[serde(default)]
@@ -138,6 +150,8 @@ pub struct Config {
     pub download_retry_max: u32, // maximale Versuche für einen Download (Resume)
     #[serde(default)]
     pub download_retry_delay_ms: u32, // Wartezeit zwischen Versuchen
+    #[serde(default)]
+    pub default_search_languages: Vec<String>, // Default-Sprachen für Suchfilter (z.B. ["EN", "DE", "MULTI"])
 }
 
 impl Default for Config {
@@ -193,6 +207,12 @@ impl Default for Config {
             ai_provider: "wisdom-gate".to_string(),
             perplexity_api_key: String::new(),
             perplexity_model: "sonar".to_string(),
+            cognora_api_key: String::new(),
+            cognora_model: "cognora-3".to_string(),
+            gemini_api_key: String::new(),
+            gemini_model: "gemini-2.0-flash-exp".to_string(),
+            openai_api_key: String::new(),
+            openai_model: "gpt-4o".to_string(),
             vlc_diag_history: String::new(),
             low_cpu_mode: false,
             ultra_low_flicker_mode: false,
@@ -200,6 +220,7 @@ impl Default for Config {
             left_panel_width: 300.0,
             download_retry_max: 3,
             download_retry_delay_ms: 1000,
+            default_search_languages: vec!["EN".to_string(), "DE".to_string(), "MULTI".to_string()],
         }
     }
 }
@@ -337,6 +358,8 @@ pub struct Item {
     pub director: Option<String>,
     #[serde(default)]
     pub cast: Option<String>,
+    #[serde(default)]
+    pub audio_languages: Option<String>,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -406,6 +429,7 @@ pub struct Row {
     pub rating_5based: Option<f32>,
     pub genre: Option<String>,
     pub path: Option<String>,
+    pub audio_languages: Option<String>,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]

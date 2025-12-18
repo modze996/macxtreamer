@@ -105,6 +105,13 @@ pub async fn fetch_items(cfg: &Config, kind: &str, category_id: &str) -> Result<
                 if let Some(genre) = v.get("genre").and_then(|x| x.as_str()) { item.genre = Some(genre.to_string()); }
                 if let Some(dir) = v.get("director").and_then(|x| x.as_str()) { item.director = Some(dir.to_string()); }
                 if let Some(cast) = v.get("cast").and_then(|x| x.as_str()) { item.cast = Some(cast.to_string()); }
+                // Extract language from name if not provided by API
+                if let Some(audio_langs) = v.get("audio_languages").and_then(|x| x.as_str()) { 
+                    item.audio_languages = Some(audio_langs.to_string()); 
+                } else {
+                    // Fallback: extract from name (e.g., "EN - Movie Name" -> "EN")
+                    item.audio_languages = crate::helpers::extract_language_from_name(&item.name);
+                }
                 out.push(item);
             }
         }
@@ -485,13 +492,13 @@ pub async fn fetch_perplexity_recommendations_safe(api_key: &str, prompt: &str, 
     // Try Perplexity with the selected model
     println!("🔮 Starte Perplexity API-Anfrage...");
     
-    match fetch_perplexity_recommendations(api_key, prompt, model).await {
+    match fetch_perplexity_recommendations(api_key, prompt, model).await.map_err(|e| e.to_string()) {
         Ok(content) => {
             println!("✅ Perplexity Empfehlungen erfolgreich abgerufen");
             content
         }
-        Err(e) => {
-            println!("❌ Perplexity Fehler: {}", e);
+        Err(error_msg) => {
+            println!("❌ Perplexity Fehler: {}", error_msg);
             
             // Try with fallback model
             let fallback_model = "sonar";
@@ -503,7 +510,318 @@ pub async fn fetch_perplexity_recommendations_safe(api_key: &str, prompt: &str, 
                 }
             }
             
-            format!("⚠️ Perplexity API nicht verfügbar: {}\n\n{}", e, get_demo_recommendations())
+            format!("⚠️ Perplexity API nicht verfügbar: {}\n\n{}", error_msg, get_demo_recommendations())
+        }
+    }
+}
+
+// Cognora Toolkit API
+pub async fn fetch_cognora_recommendations(api_key: &str, prompt: &str, model: &str) -> Result<String, Box<dyn std::error::Error>> {
+    use std::time::{SystemTime, UNIX_EPOCH};
+    use std::collections::hash_map::DefaultHasher;
+    use std::hash::{Hash, Hasher};
+    
+    // Create cache key
+    let mut hasher = DefaultHasher::new();
+    model.hash(&mut hasher);
+    prompt.hash(&mut hasher);
+    let hash = hasher.finish();
+    let cache_file = format!("/tmp/cognora_cache_{}_{:x}.json", model, hash);
+    
+    // Load cache if exists
+    if let Ok(cache_content) = std::fs::read_to_string(&cache_file) {
+        if let Ok(cache_data) = serde_json::from_str::<serde_json::Value>(&cache_content) {
+            if let Some(cached_result) = cache_data.get("result").and_then(|v| v.as_str()) {
+                println!("📦 Cognora aus Cache: {}", model);
+                return Ok(cached_result.to_string());
+            }
+        }
+    }
+
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(30))
+        .connect_timeout(std::time::Duration::from_secs(10))
+        .build()?;
+    
+    println!("🧠 Verwende Cognora API mit Modell: {}", model);
+    
+    let request_body = serde_json::json!({
+        "model": model,
+        "messages": [{
+            "role": "user",
+            "content": prompt
+        }],
+        "temperature": 0.2,
+        "max_tokens": 2048
+    });
+    
+    let response = client
+        .post("https://api.cognora-toolkit.com/v1/chat/completions")
+        .header("Content-Type", "application/json")
+        .header("Authorization", format!("Bearer {}", api_key))
+        .json(&request_body)
+        .send()
+        .await?;
+    
+    let status = response.status();
+    let response_text = response.text().await?;
+    
+    if !status.is_success() {
+        println!("❌ Cognora API Error: Status {}", status);
+        return Err(format!("Cognora API error: {} - {}", status, response_text).into());
+    }
+    
+    let json: serde_json::Value = serde_json::from_str(&response_text)?;
+    let content = json
+        .get("choices")
+        .and_then(|c| c.get(0))
+        .and_then(|c| c.get("message"))
+        .and_then(|m| m.get("content"))
+        .and_then(|c| c.as_str())
+        .unwrap_or("");
+    
+    if content.is_empty() {
+        return Err("Leere Antwort von Cognora".into());
+    }
+    
+    // Cache the result
+    let cache_data = serde_json::json!({
+        "result": content,
+        "timestamp": SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs()
+    });
+    let _ = std::fs::write(&cache_file, serde_json::to_string_pretty(&cache_data).unwrap_or_default());
+    
+    Ok(content.to_string())
+}
+
+pub async fn fetch_cognora_recommendations_safe(api_key: &str, prompt: &str, model: &str) -> String {
+    println!("🧠 Starte Cognora API-Anfrage...");
+    
+    match fetch_cognora_recommendations(api_key, prompt, model).await.map_err(|e| e.to_string()) {
+        Ok(content) => {
+            println!("✅ Cognora Empfehlungen erfolgreich abgerufen");
+            content
+        }
+        Err(error_msg) => {
+            println!("❌ Cognora Fehler: {}", error_msg);
+            
+            let fallback_model = "cognora-3";
+            if model != fallback_model {
+                println!("🔄 Versuche Fallback-Modell: {}", fallback_model);
+                if let Ok(content) = fetch_cognora_recommendations(api_key, prompt, fallback_model).await {
+                    println!("✅ Fallback erfolgreich!");
+                    return content;
+                }
+            }
+            
+            format!("⚠️ Cognora API nicht verfügbar: {}\n\n{}", error_msg, get_demo_recommendations())
+        }
+    }
+}
+
+// Google Gemini API
+pub async fn fetch_gemini_recommendations(api_key: &str, prompt: &str, model: &str) -> Result<String, Box<dyn std::error::Error>> {
+    use std::time::{SystemTime, UNIX_EPOCH};
+    use std::collections::hash_map::DefaultHasher;
+    use std::hash::{Hash, Hasher};
+    
+    let mut hasher = DefaultHasher::new();
+    model.hash(&mut hasher);
+    prompt.hash(&mut hasher);
+    let hash = hasher.finish();
+    let cache_file = format!("/tmp/gemini_cache_{}_{:x}.json", model, hash);
+    
+    if let Ok(cache_content) = std::fs::read_to_string(&cache_file) {
+        if let Ok(cache_data) = serde_json::from_str::<serde_json::Value>(&cache_content) {
+            if let Some(cached_result) = cache_data.get("result").and_then(|v| v.as_str()) {
+                println!("📦 Gemini aus Cache: {}", model);
+                return Ok(cached_result.to_string());
+            }
+        }
+    }
+
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(30))
+        .connect_timeout(std::time::Duration::from_secs(10))
+        .build()?;
+    
+    println!("💎 Verwende Gemini API mit Modell: {}", model);
+    
+    let request_body = serde_json::json!({
+        "contents": [{
+            "parts": [{
+                "text": prompt
+            }]
+        }],
+        "generationConfig": {
+            "temperature": 0.2,
+            "maxOutputTokens": 2048
+        }
+    });
+    
+    let url = format!("https://generativelanguage.googleapis.com/v1beta/models/{}:generateContent?key={}", model, api_key);
+    
+    let response = client
+        .post(&url)
+        .header("Content-Type", "application/json")
+        .json(&request_body)
+        .send()
+        .await?;
+    
+    let status = response.status();
+    let response_text = response.text().await?;
+    
+    if !status.is_success() {
+        println!("❌ Gemini API Error: Status {}", status);
+        return Err(format!("Gemini API error: {} - {}", status, response_text).into());
+    }
+    
+    let json: serde_json::Value = serde_json::from_str(&response_text)?;
+    let content = json
+        .get("candidates")
+        .and_then(|c| c.get(0))
+        .and_then(|c| c.get("content"))
+        .and_then(|c| c.get("parts"))
+        .and_then(|p| p.get(0))
+        .and_then(|p| p.get("text"))
+        .and_then(|t| t.as_str())
+        .unwrap_or("");
+    
+    if content.is_empty() {
+        return Err("Leere Antwort von Gemini".into());
+    }
+    
+    let cache_data = serde_json::json!({
+        "result": content,
+        "timestamp": SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs()
+    });
+    let _ = std::fs::write(&cache_file, serde_json::to_string_pretty(&cache_data).unwrap_or_default());
+    
+    Ok(content.to_string())
+}
+
+pub async fn fetch_gemini_recommendations_safe(api_key: &str, prompt: &str, model: &str) -> String {
+    println!("💎 Starte Gemini API-Anfrage...");
+    
+    match fetch_gemini_recommendations(api_key, prompt, model).await.map_err(|e| e.to_string()) {
+        Ok(content) => {
+            println!("✅ Gemini Empfehlungen erfolgreich abgerufen");
+            content
+        }
+        Err(error_msg) => {
+            println!("❌ Gemini Fehler: {}", error_msg);
+            
+            let fallback_model = "gemini-1.5-flash";
+            if model != fallback_model {
+                println!("🔄 Versuche Fallback-Modell: {}", fallback_model);
+                if let Ok(content) = fetch_gemini_recommendations(api_key, prompt, fallback_model).await {
+                    println!("✅ Fallback erfolgreich!");
+                    return content;
+                }
+            }
+            
+            format!("⚠️ Gemini API nicht verfügbar: {}\n\n{}", error_msg, get_demo_recommendations())
+        }
+    }
+}
+
+// OpenAI API
+pub async fn fetch_openai_recommendations(api_key: &str, prompt: &str, model: &str) -> Result<String, Box<dyn std::error::Error>> {
+    use std::time::{SystemTime, UNIX_EPOCH};
+    use std::collections::hash_map::DefaultHasher;
+    use std::hash::{Hash, Hasher};
+    
+    let mut hasher = DefaultHasher::new();
+    model.hash(&mut hasher);
+    prompt.hash(&mut hasher);
+    let hash = hasher.finish();
+    let cache_file = format!("/tmp/openai_cache_{}_{:x}.json", model, hash);
+    
+    if let Ok(cache_content) = std::fs::read_to_string(&cache_file) {
+        if let Ok(cache_data) = serde_json::from_str::<serde_json::Value>(&cache_content) {
+            if let Some(cached_result) = cache_data.get("result").and_then(|v| v.as_str()) {
+                println!("📦 OpenAI aus Cache: {}", model);
+                return Ok(cached_result.to_string());
+            }
+        }
+    }
+
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(30))
+        .connect_timeout(std::time::Duration::from_secs(10))
+        .build()?;
+    
+    println!("🤖 Verwende OpenAI API mit Modell: {}", model);
+    
+    let request_body = serde_json::json!({
+        "model": model,
+        "messages": [{
+            "role": "user",
+            "content": prompt
+        }],
+        "temperature": 0.2,
+        "max_tokens": 2048
+    });
+    
+    let response = client
+        .post("https://api.openai.com/v1/chat/completions")
+        .header("Content-Type", "application/json")
+        .header("Authorization", format!("Bearer {}", api_key))
+        .json(&request_body)
+        .send()
+        .await?;
+    
+    let status = response.status();
+    let response_text = response.text().await?;
+    
+    if !status.is_success() {
+        println!("❌ OpenAI API Error: Status {}", status);
+        return Err(format!("OpenAI API error: {} - {}", status, response_text).into());
+    }
+    
+    let json: serde_json::Value = serde_json::from_str(&response_text)?;
+    let content = json
+        .get("choices")
+        .and_then(|c| c.get(0))
+        .and_then(|c| c.get("message"))
+        .and_then(|m| m.get("content"))
+        .and_then(|c| c.as_str())
+        .unwrap_or("");
+    
+    if content.is_empty() {
+        return Err("Leere Antwort von OpenAI".into());
+    }
+    
+    let cache_data = serde_json::json!({
+        "result": content,
+        "timestamp": SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs()
+    });
+    let _ = std::fs::write(&cache_file, serde_json::to_string_pretty(&cache_data).unwrap_or_default());
+    
+    Ok(content.to_string())
+}
+
+pub async fn fetch_openai_recommendations_safe(api_key: &str, prompt: &str, model: &str) -> String {
+    println!("🤖 Starte OpenAI API-Anfrage...");
+    
+    match fetch_openai_recommendations(api_key, prompt, model).await.map_err(|e| e.to_string()) {
+        Ok(content) => {
+            println!("✅ OpenAI Empfehlungen erfolgreich abgerufen");
+            content
+        }
+        Err(error_msg) => {
+            println!("❌ OpenAI Fehler: {}", error_msg);
+            
+            let fallback_model = "gpt-3.5-turbo";
+            if model != fallback_model {
+                println!("🔄 Versuche Fallback-Modell: {}", fallback_model);
+                if let Ok(content) = fetch_openai_recommendations(api_key, prompt, fallback_model).await {
+                    println!("✅ Fallback erfolgreich!");
+                    return content;
+                }
+            }
+            
+            format!("⚠️ OpenAI API nicht verfügbar: {}\n\n{}", error_msg, get_demo_recommendations())
         }
     }
 }

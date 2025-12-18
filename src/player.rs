@@ -160,16 +160,16 @@ pub fn start_player(cfg: &Config, url: &str) -> Result<(), String> {
         let (net_ms, live_ms, _file_ms) = apply_bias(cfg);
         let cache_secs = if cfg.mpv_cache_secs_override != 0 { cfg.mpv_cache_secs_override } else { (net_ms / 1000).max(1) };
         let readahead_secs = if cfg.mpv_readahead_secs_override != 0 { cfg.mpv_readahead_secs_override } else { (live_ms / 1000).max(1) };
-        let mut base_args: Vec<String> = vec!["--fullscreen".into(), "--no-terminal".into(), "--force-window=yes".into(), "--video-paused=no".into()];
-        // Moderne mpv Cache Optionen – fallback falls nicht unterstützt:
+        let mut base_args: Vec<String> = vec!["--fullscreen".into(), "--no-terminal".into(), "--force-window=yes".into()];
+        // Moderne mpv Cache Optionen
         base_args.push(format!("--cache-secs={}", cache_secs));
         base_args.push(format!("--demuxer-readahead-secs={}", readahead_secs));
         base_args.push("--cache=yes".into());
         if cfg.mpv_keep_open { base_args.push("--keep-open=yes".into()); }
         if matches!(st, StreamType::Live) { base_args.push("--idle=yes".into()); }
-        // Reconnect Optionen nur hinzufügen, wenn mpv sie kennt (prüfen später via list-options)
-        base_args.push("--reconnect-on-eof=yes".into());
+        // Reconnect Optionen (moderne mpv Versionen unterstützen stream-lavf-o)
         base_args.push("--demuxer-lavf-o=reconnect_streamed=1".into());
+        base_args.push("--demuxer-lavf-o=reconnect_at_eof=1".into());
         if cfg.mpv_verbose { base_args.push("-v".into()); }
         if !cfg.mpv_extra_args.trim().is_empty() { for part in cfg.mpv_extra_args.split_whitespace() { base_args.push(part.to_string()); } }
         base_args.push(url.to_string());

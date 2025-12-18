@@ -16,6 +16,7 @@ pub enum SortKey {
     ReleaseDate,
     Rating,
     Genre,
+    Languages,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -121,6 +122,7 @@ pub enum Msg {
     PlayerSpawnFailed { player: String, error: String },
     StopDiagnostics,
     DiagnosticsStopped,
+    LoadingError(String), // Error during loading operations
 }
 
 #[derive(Debug, Clone)]
@@ -391,6 +393,7 @@ impl AppState {
                     SortKey::ReleaseDate => a.year.as_deref().unwrap_or("").cmp(b.year.as_deref().unwrap_or("")), // Fallback to year for now
                     SortKey::Rating => a.rating_5based.unwrap_or(0.0).partial_cmp(&b.rating_5based.unwrap_or(0.0)).unwrap_or(std::cmp::Ordering::Equal),
                     SortKey::Genre => a.genre.as_deref().unwrap_or("").cmp(b.genre.as_deref().unwrap_or("")),
+                    SortKey::Languages => a.audio_languages.as_deref().unwrap_or("").cmp(b.audio_languages.as_deref().unwrap_or("")),
                 };
                 
                 if self.sort_ascending {

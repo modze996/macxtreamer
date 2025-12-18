@@ -1,7 +1,9 @@
 use std::fs;
 use std::io::Read;
 use std::path::PathBuf;
-use crate::models::{FavItem, RecentItem};
+use crate::models::{FavItem, RecentItem, Item};
+use std::collections::hash_map::DefaultHasher;
+use std::hash::{Hash, Hasher};
 
 fn data_dir() -> PathBuf {
     // macOS: ~/Library/Application Support/MacXtreamer
@@ -11,6 +13,8 @@ fn data_dir() -> PathBuf {
 fn recently_file() -> PathBuf { let d = data_dir(); let _ = fs::create_dir_all(&d); d.join("recently_played.json") }
 fn favorites_file() -> PathBuf { let d = data_dir(); let _ = fs::create_dir_all(&d); d.join("favorites.json") }
 fn search_history_file() -> PathBuf { let d = data_dir(); let _ = fs::create_dir_all(&d); d.join("search_history.json") }
+fn search_index_file() -> PathBuf { let d = data_dir(); let _ = fs::create_dir_all(&d); d.join("search_index.json") }
+fn search_index_meta_file() -> PathBuf { let d = data_dir(); let _ = fs::create_dir_all(&d); d.join("search_index_meta.json") }
 
 pub fn load_recently_played() -> Vec<RecentItem> {
     let p = recently_file();
@@ -80,4 +84,111 @@ pub fn load_search_history() -> Vec<String> {
 
 pub fn save_search_history(history: &Vec<String>) {
     let _ = fs::write(search_history_file(), serde_json::to_string_pretty(history).unwrap_or("[]".into()));
+}
+
+#[derive(serde::Serialize, serde::Deserialize)]
+struct SearchIndexData {
+    movies: Vec<Item>,
+    series: Vec<Item>,
+    channels: Vec<Item>,
+    paths: std::collections::HashMap<String, String>,
+}
+
+#[derive(serde::Serialize, serde::Deserialize)]
+struct SearchIndexMeta {
+    server_hash: u64,
+    timestamp: u64,
+}
+
+/// Calculate a hash for the current server config to detect changes
+fn calculate_server_hash(address: &str, username: &str) -> u64 {
+    let mut hasher = DefaultHasher::new();
+    address.hash(&mut hasher);
+    username.hash(&mut hasher);
+    hasher.finish()
+}
+
+/// Save search index to disk
+pub fn save_search_index(
+    movies: &Vec<Item>,
+    series: &Vec<Item>,
+    channels: &Vec<Item>,
+    paths: &std::collections::HashMap<String, String>,
+    address: &str,
+    username: &str,
+) {
+    let data = SearchIndexData {
+        movies: movies.clone(),
+        series: series.clone(),
+        channels: channels.clone(),
+        paths: paths.clone(),
+    };
+    
+    let meta = SearchIndexMeta {
+        server_hash: calculate_server_hash(address, username),
+        timestamp: std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs(),
+    };
+    
+    if let Ok(data_json) = serde_json::to_string(&data) {
+        let _ = fs::write(search_index_file(), data_json);
+    }
+    
+    if let Ok(meta_json) = serde_json::to_string(&meta) {
+        let _ = fs::write(search_index_meta_file(), meta_json);
+    }
+    
+    println!("💾 Suchindex gespeichert: {} Movies, {} Series, {} Channels", 
+             movies.len(), series.len(), channels.len());
+}
+
+/// Load search index from disk if valid
+pub fn load_search_index(
+    address: &str,
+    username: &str,
+) -> Option<(Vec<Item>, Vec<Item>, Vec<Item>, std::collections::HashMap<String, String>)> {
+    // Check if meta file exists and is valid
+    let meta_path = search_index_meta_file();
+    if let Ok(mut f) = fs::File::open(&meta_path) {
+        let mut s = String::new();
+        if f.read_to_string(&mut s).is_ok() {
+            if let Ok(meta) = serde_json::from_str::<SearchIndexMeta>(&s) {
+                let current_hash = calculate_server_hash(address, username);
+                
+                // Check if server changed
+                if meta.server_hash != current_hash {
+                    println!("🔄 Server geändert, Index ungültig");
+                    return None;
+                }
+                
+                // Check if index is older than 24 hours
+                let now = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_secs();
+                    
+                if now - meta.timestamp > 24 * 60 * 60 {
+                    println!("⏰ Index älter als 24h, wird neu erstellt");
+                    return None;
+                }
+                
+                // Try to load data
+                let data_path = search_index_file();
+                if let Ok(mut f) = fs::File::open(&data_path) {
+                    let mut s = String::new();
+                    if f.read_to_string(&mut s).is_ok() {
+                        if let Ok(data) = serde_json::from_str::<SearchIndexData>(&s) {
+                            println!("📂 Suchindex geladen: {} Movies, {} Series, {} Channels",
+                                     data.movies.len(), data.series.len(), data.channels.len());
+                            return Some((data.movies, data.series, data.channels, data.paths));
+                        }
+                    }
+                }
+            }
+        }
+    }
+    
+    None
 }
