@@ -205,19 +205,20 @@ struct MacXtreamer {
     indexing: bool,
     sort_key: Option<SortKey>,
     sort_asc: bool,
+    // Neue Checkboxen für Sprachfilterung pro Kategorie
+    filter_live_language: bool,
+    filter_vod_language: bool,
+    filter_series_language: bool,
 
     // Async messaging
     tx: Sender<Msg>,
     rx: Receiver<Msg>,
-    show_log: bool,
-    log_text: String,
     show_error_dialog: bool,
     loading_error: String,
     initial_config_pending: bool,
     downloads: HashMap<String, DownloadState>,
     download_order: Vec<String>,
     download_meta: HashMap<String, DownloadMeta>,
-    show_downloads: bool,
     // Map item-id -> category path for displaying in search results
     index_paths: HashMap<String, String>,
     confirm_bulk: Option<(String, String)>,
@@ -278,8 +279,12 @@ impl MacXtreamer {
         
         let (tx, rx) = mpsc::channel();
     let _ = GLOBAL_TX.set(tx.clone());
+    // Capture persisted per-category filter flags before moving `config` into the struct
+    let persisted_filter_live = config.filter_live_language;
+    let persisted_filter_vod = config.filter_vod_language;
+    let persisted_filter_series = config.filter_series_language;
     let default_search_langs = config.default_search_languages.clone();
-    let mut app = Self {
+        let mut app = Self {
             config,
             config_draft: None,
             playlists: vec![],
@@ -291,6 +296,10 @@ impl MacXtreamer {
             all_channels: vec![],
             recently: load_recently_played(),
             favorites: load_favorites(),
+            // Initialize per-category filter flags from persisted config
+            filter_live_language: persisted_filter_live,
+            filter_vod_language: persisted_filter_vod,
+            filter_series_language: persisted_filter_series,
 
 
             textures: HashMap::new(),
@@ -330,15 +339,12 @@ impl MacXtreamer {
             sort_asc: true,
             tx,
             rx,
-            show_log: false,
-            log_text: String::new(),
             show_error_dialog: false,
             loading_error: String::new(),
             initial_config_pending: false,
             downloads: HashMap::new(),
             download_order: Vec::new(),
             download_meta: HashMap::new(),
-            show_downloads: false,
             index_paths: HashMap::new(),
             confirm_bulk: None,
             bulk_opts_draft: BulkOptions { only_not_downloaded: true, season: None, max_count: 0 },
@@ -1497,6 +1503,9 @@ impl eframe::App for MacXtreamer {
         let time_since_forced: u64 = now.duration_since(self.last_forced_repaint).as_millis() as u64;
         // Exponentielles Glätten
         if self.avg_frame_ms == 0.0 { self.avg_frame_ms = dt; } else { self.avg_frame_ms = self.avg_frame_ms * 0.9 + dt * 0.1; }
+
+        // Debug-Ausgabe: Zeige die aktuell konfigurierten Sprachen
+        println!("[MacXtreamer] Spracheinstellungen: {:?}", self.config.default_search_languages);
         // Theme anwenden (einmalig oder bei Wechsel)
         if !self.theme_applied {
             match self.current_theme.as_str() {
@@ -1823,6 +1832,28 @@ impl eframe::App for MacXtreamer {
                                         "series" => "Series",
                                         _ => "Item",
                                     };
+                                    
+                                    // Apply language filter if enabled
+                                    let should_include = if self.config.filter_by_language && !self.config.default_search_languages.is_empty() {
+                                        if let Some(langs) = &it.audio_languages {
+                                            let langs_upper = langs.to_uppercase();
+                                            // Check if any configured language appears in item's languages
+                                            self.config.default_search_languages.iter().any(|filter_lang| {
+                                                langs_upper.contains(&filter_lang.to_uppercase())
+                                            })
+                                        } else {
+                                            // Keep items without language info (channels, series, etc.)
+                                            info == "Channel" || info == "Series"
+                                        }
+                                    } else {
+                                        // Filter disabled, include all
+                                        true
+                                    };
+                                    
+                                    if !should_include {
+                                        continue;
+                                    }
+                                    
                                     self.content_rows.push(Row {
                                         name: it.name.clone(),
                                         id: it.id,
@@ -2190,7 +2221,6 @@ impl eframe::App for MacXtreamer {
                                     break;
                                 }
                             }
-                            self.show_downloads = true;
                         }
                         Err(e) => {
                             self.last_error = Some(format!("Failed to fetch episodes: {}", e));
@@ -2465,14 +2495,26 @@ impl eframe::App for MacXtreamer {
                         ui.label(colored_text_by_type("Please complete settings to start", "warning"));
                     }
                     if ui.button("Open Log").clicked() {
-                        // Read log file and open viewer
+                        // Open log file directly in editor
                         let path = crate::logger::log_path();
-                        self.log_text =
-                            std::fs::read_to_string(path).unwrap_or_else(|_| "(no log)".into());
-                        self.show_log = true;
-                    }
-                    if self.config.enable_downloads && ui.button("Downloads").clicked() {
-                        self.show_downloads = true;
+                        #[cfg(target_os = "macos")]
+                        {
+                            let _ = std::process::Command::new("open")
+                                .arg(&path)
+                                .spawn();
+                        }
+                        #[cfg(target_os = "linux")]
+                        {
+                            let _ = std::process::Command::new("xdg-open")
+                                .arg(&path)
+                                .spawn();
+                        }
+                        #[cfg(target_os = "windows")]
+                        {
+                            let _ = std::process::Command::new("notepad")
+                                .arg(&path)
+                                .spawn();
+                        }
                     }
                     // Reuse VLC toggle
                     let mut reuse = self.config.reuse_vlc;
@@ -2589,6 +2631,11 @@ impl eframe::App for MacXtreamer {
                             self.font_scale_applied = false;
                             self.pending_save_config = true;
                         }
+                        
+                        ui.separator();
+                        
+                        // Note: Per-category "Filter by Language" toggles are available in the Live / VOD / Series headers.
+                        ui.label("Per-list 'Filter by Language' toggles control filtering behavior.");
                     });
                     if self.is_loading {
                         let pct = if self.loading_total > 0 {
@@ -2836,30 +2883,99 @@ impl eframe::App for MacXtreamer {
 
                 // Drei Listen im oberen Bereich (Live, VOD, Serien)
                 ui.columns(3, |cols| {
-                    cols[0].label(RichText::new("Live").strong());
+                    // Strikte Filterung: Nur Kategorien mit Sprach-Prefix ODER |XX| Tag aus den Einstellungen
+                    let filter_langs: Vec<String> = self.config.default_search_languages.iter().map(|l| l.to_uppercase()).collect();
+                    fn has_lang_tag(name: &str, langs: &[String]) -> bool {
+                        for lang in langs {
+                            let prefix = format!("{} ", lang);
+                            let tag = format!("|{}|", lang);
+                            let name_up = name.to_uppercase();
+                            if name_up.starts_with(&prefix) || name_up.contains(&tag) {
+                                return true;
+                            }
+                        }
+                        false
+                    }
+                    // Mapping für LiveTV: EN -> UK, US, CA; DE -> DE, AT, CH
+                    fn live_lang_match(name: &str, langs: &[String]) -> bool {
+                        let name_up = name.to_uppercase();
+                        for lang in langs {
+                            match lang.as_str() {
+                                "EN" => {
+                                    let countries = ["UK", "US", "CA"];
+                                    for c in countries.iter() {
+                                        let prefix = format!("{} ", c);
+                                        let tag = format!("|{}|", c);
+                                        if name_up.starts_with(&prefix) || name_up.contains(&tag) {
+                                            return true;
+                                        }
+                                    }
+                                }
+                                "DE" => {
+                                    let countries = ["DE", "AT", "CH"];
+                                    for c in countries.iter() {
+                                        let prefix = format!("{} ", c);
+                                        let tag = format!("|{}|", c);
+                                        if name_up.starts_with(&prefix) || name_up.contains(&tag) {
+                                            return true;
+                                        }
+                                    }
+                                }
+                                _ => {
+                                    let prefix = format!("{} ", lang);
+                                    let tag = format!("|{}|", lang);
+                                    if name_up.starts_with(&prefix) || name_up.contains(&tag) {
+                                        return true;
+                                    }
+                                }
+                            }
+                        }
+                        false
+                    }
+                    let filtered_playlists: Vec<(usize, Category)> = self.playlists.iter().enumerate()
+                        .filter(|(_, c)| {
+                            if self.filter_live_language && !filter_langs.is_empty() {
+                                live_lang_match(&c.name, &filter_langs)
+                            } else {
+                                true
+                            }
+                        })
+                        .map(|(i, c)| (i, c.clone()))
+                        .collect();
+                        println!("[MacXtreamer] Gefilterte Live-Kategorien (per-column): {} von {}", filtered_playlists.len(), self.playlists.len());
+                    
+                    cols[0].horizontal(|ui| {
+                        ui.label(RichText::new("Live").strong());
+                        if ui.checkbox(&mut self.filter_live_language, "Filter by Language").changed() {
+                            // Persist change
+                            self.config.filter_live_language = self.filter_live_language;
+                            let _ = crate::config::save_config(&self.config);
+                        }
+                    });
                     egui::ScrollArea::vertical()
                         .id_source("live_list")
                         .show(&mut cols[0], |ui| {
-                            for (i, c) in self.playlists.clone().into_iter().enumerate() {
-                                let response = ui.selectable_label(self.selected_playlist == Some(i), &c.name);
+                            for (i, c) in filtered_playlists.iter() {
+                                let response = ui.selectable_label(self.selected_playlist == Some(*i), &c.name);
                                 
                                 // Left click - load category
                                 if response.clicked() {
+                                    let cat_id = c.id.clone();
                                     if let Some(cv) = &self.current_view {
                                         self.view_stack.push(cv.clone());
                                     }
                                     self.current_view = Some(ViewState::Items {
                                         kind: "subplaylist".into(),
-                                        category_id: c.id.clone(),
+                                        category_id: cat_id.clone(),
                                     });
-                                    self.selected_playlist = Some(i);
+                                    self.selected_playlist = Some(*i);
                                     self.selected_vod = None;
                                     self.selected_series = None;
                                     self.is_loading = true;
                                     self.loading_total = 1;
                                     self.loading_done = 0;
-                                    self.last_live_cat_id = Some(c.id.clone());
-                                    self.spawn_load_items("subplaylist", c.id.clone());
+                                    self.last_live_cat_id = Some(cat_id.clone());
+                                    self.spawn_load_items("subplaylist", cat_id);
                                 }
                                 
                                 // Right click - show context menu
@@ -2869,8 +2985,8 @@ impl eframe::App for MacXtreamer {
                                     
                                     if ui.button("▶ Play All").clicked() {
                                         // First load the items if not loaded
-                                        if self.selected_playlist != Some(i) {
-                                            self.selected_playlist = Some(i);
+                                        if self.selected_playlist != Some(*i) {
+                                            self.selected_playlist = Some(*i);
                                             self.spawn_load_items("subplaylist", cat_id.clone());
                                             // Give it a moment to load
                                             std::thread::sleep(std::time::Duration::from_millis(500));
@@ -2894,7 +3010,29 @@ impl eframe::App for MacXtreamer {
                             }
                         });
 
-                    cols[1].label(RichText::new("VOD").strong());
+                    // Filter VOD categories
+                    let filtered_vod: Vec<(usize, Category)> = self.vod_categories.iter().enumerate()
+                        .filter(|(_, c)| {
+                            if self.filter_vod_language && !filter_langs.is_empty() {
+                                has_lang_tag(&c.name, &filter_langs)
+                            } else {
+                                true
+                            }
+                        })
+                        .map(|(i, c)| (i, c.clone()))
+                        .collect();
+                        println!("[MacXtreamer] Gefilterte VOD-Kategorien (per-column): {} von {}", filtered_vod.len(), self.vod_categories.len());
+                        if let Some(cat) = self.vod_categories.get(0) {
+                            println!("[MacXtreamer] Beispiel VOD-Kategorie: {}", cat.name);
+                        }
+
+                    cols[1].horizontal(|ui| {
+                        ui.label(RichText::new("VOD").strong());
+                        if ui.checkbox(&mut self.filter_vod_language, "Filter by Language").changed() {
+                            self.config.filter_vod_language = self.filter_vod_language;
+                            let _ = crate::config::save_config(&self.config);
+                        }
+                    });
                     egui::ScrollArea::vertical()
                         .id_source("vod_list")
                         .show(&mut cols[1], |ui| {
@@ -2915,9 +3053,11 @@ impl eframe::App for MacXtreamer {
                                     }
                                 }
                             }
-                            for (i, c) in self.vod_categories.clone().into_iter().enumerate() {
+                            for (i, c) in filtered_vod.iter() {
+                                let cat_id = c.id.clone();
+                                let _cat_name = c.name.clone();
                                 if ui
-                                    .selectable_label(self.selected_vod == Some(i), &c.name)
+                                    .selectable_label(self.selected_vod == Some(*i), &c.name)
                                     .clicked()
                                 {
                                     if let Some(cv) = &self.current_view {
@@ -2925,21 +3065,43 @@ impl eframe::App for MacXtreamer {
                                     }
                                     self.current_view = Some(ViewState::Items {
                                         kind: "vod".into(),
-                                        category_id: c.id.clone(),
+                                        category_id: cat_id.clone(),
                                     });
-                                    self.selected_vod = Some(i);
+                                    self.selected_vod = Some(*i);
                                     self.selected_playlist = None;
                                     self.selected_series = None;
                                     self.is_loading = true;
                                     self.loading_total = 1;
                                     self.loading_done = 0;
-                                    self.last_vod_cat_id = Some(c.id.clone());
-                                    self.spawn_load_items("vod", c.id);
+                                    self.last_vod_cat_id = Some(cat_id.clone());
+                                    self.spawn_load_items("vod", cat_id);
                                 }
                             }
                         });
 
-                    cols[2].label(RichText::new("Series").strong());
+                    // Filter Series categories
+                    let filtered_series: Vec<(usize, Category)> = self.series_categories.iter().enumerate()
+                        .filter(|(_, c)| {
+                            if self.filter_series_language && !filter_langs.is_empty() {
+                                has_lang_tag(&c.name, &filter_langs)
+                            } else {
+                                true
+                            }
+                        })
+                        .map(|(i, c)| (i, c.clone()))
+                        .collect();
+                        println!("[MacXtreamer] Gefilterte Serien-Kategorien (per-column): {} von {}", filtered_series.len(), self.series_categories.len());
+                        if let Some(cat) = self.series_categories.get(0) {
+                            println!("[MacXtreamer] Beispiel Serien-Kategorie: {}", cat.name);
+                        }
+
+                    cols[2].horizontal(|ui| {
+                        ui.label(RichText::new("Series").strong());
+                        if ui.checkbox(&mut self.filter_series_language, "Filter by Language").changed() {
+                            self.config.filter_series_language = self.filter_series_language;
+                            let _ = crate::config::save_config(&self.config);
+                        }
+                    });
                     egui::ScrollArea::vertical().id_source("series_list").show(
                         &mut cols[2],
                         |ui| {
@@ -2960,9 +3122,10 @@ impl eframe::App for MacXtreamer {
                                     }
                                 }
                             }
-                            for (i, c) in self.series_categories.clone().into_iter().enumerate() {
+                            for (i, c) in filtered_series.iter() {
+                                let cat_id = c.id.clone();
                                 if ui
-                                    .selectable_label(self.selected_series == Some(i), &c.name)
+                                    .selectable_label(self.selected_series == Some(*i), &c.name)
                                     .clicked()
                                 {
                                     if let Some(cv) = &self.current_view {
@@ -2970,16 +3133,16 @@ impl eframe::App for MacXtreamer {
                                     }
                                     self.current_view = Some(ViewState::Items {
                                         kind: "series".into(),
-                                        category_id: c.id.clone(),
+                                        category_id: cat_id.clone(),
                                     });
-                                    self.selected_series = Some(i);
+                                    self.selected_series = Some(*i);
                                     self.selected_playlist = None;
                                     self.selected_vod = None;
                                     self.is_loading = true;
                                     self.loading_total = 1;
                                     self.loading_done = 0;
-                                    self.last_series_cat_id = Some(c.id.clone());
-                                    self.spawn_load_items("series", c.id);
+                                    self.last_series_cat_id = Some(cat_id.clone());
+                                    self.spawn_load_items("series", cat_id);
                                 }
                             }
                         },
@@ -3360,6 +3523,24 @@ impl eframe::App for MacXtreamer {
             }
             
             let mut rows = self.content_rows.clone();
+            
+            // Apply language filter if enabled
+            if self.config.filter_by_language && !self.config.default_search_languages.is_empty() {
+                rows.retain(|row| {
+                    // If no audio_languages info, keep the item (could be a channel or missing metadata)
+                    if let Some(langs) = &row.audio_languages {
+                        let langs_upper = langs.to_uppercase();
+                        // Check if any of the configured languages appear in the item's languages
+                        self.config.default_search_languages.iter().any(|filter_lang| {
+                            langs_upper.contains(&filter_lang.to_uppercase())
+                        })
+                    } else {
+                        // Keep items without language info (channels, etc.)
+                        true
+                    }
+                });
+            }
+            
             // Apply sorting if active
             if let Some(key) = self.sort_key {
                 match key {
@@ -4587,19 +4768,29 @@ impl eframe::App for MacXtreamer {
                             ui.heading("Add New Profile");
                             ui.separator();
                             
+                            // Clone new_profile_name to avoid borrow issues
+                            let mut profile_name = self.new_profile_name.clone();
+                            
                             ui.horizontal(|ui| {
                                 ui.label("Name:");
-                                ui.add(egui::TextEdit::singleline(&mut self.new_profile_name)
+                                ui.add(egui::TextEdit::singleline(&mut profile_name)
                                     .hint_text("e.g., Main Server, Test Server")
                                     .desired_width(200.0));
                             });
                             
+                            // Update the original if changed
+                            if profile_name != self.new_profile_name {
+                                self.new_profile_name = profile_name.clone();
+                            }
+                            
+                            let mut should_cancel = false;
+                            
                             ui.horizontal(|ui| {
                                 if ui.button("➕ Add Profile").clicked() {
-                                    let name = if self.new_profile_name.trim().is_empty() {
+                                    let name = if profile_name.trim().is_empty() {
                                         format!("Server {}", draft.server_profiles.len() + 1)
                                     } else {
-                                        self.new_profile_name.trim().to_string()
+                                        profile_name.trim().to_string()
                                     };
                                     
                                     draft.server_profiles.push(crate::models::ServerProfile {
@@ -4612,68 +4803,19 @@ impl eframe::App for MacXtreamer {
                                     self.new_profile_name.clear();
                                 }
                                 
-                                if ui.button("Close").clicked() {
-                                    self.show_server_manager = false;
+                                if ui.button("Revert changes and Cancel").clicked() {
+                                    should_cancel = true;
                                 }
                             });
+                            
+                            if should_cancel {
+                                self.config_draft = None;
+                                self.show_server_manager = false;
+                            }
                         });
                 });
             
             self.show_server_manager = open;
-        }
-
-
-
-        // Log viewer window
-        if self.show_log {
-            let mut open = self.show_log;
-            egui::Window::new("Application Log")
-                .default_width(840.0)
-                .default_height(420.0)
-                .open(&mut open)
-                .show(ctx, |ui| {
-                    ui.horizontal(|ui| {
-                        if ui.small_button("Refresh").clicked() {
-                            let path = crate::logger::log_path();
-                            self.log_text =
-                                std::fs::read_to_string(path).unwrap_or_else(|_| "(no log)".into());
-                        }
-                        if ui.small_button("Clear").clicked() {
-                            let path = crate::logger::log_path();
-                            let _ = std::fs::write(path, "");
-                            self.log_text.clear();
-                        }
-                        if ui.small_button("Open in Editor").clicked() {
-                            let path = crate::logger::log_path();
-                            #[cfg(target_os = "macos")]
-                            {
-                                let _ = std::process::Command::new("open")
-                                    .arg(&path)
-                                    .spawn();
-                            }
-                            #[cfg(target_os = "linux")]
-                            {
-                                let _ = std::process::Command::new("xdg-open")
-                                    .arg(&path)
-                                    .spawn();
-                            }
-                            #[cfg(target_os = "windows")]
-                            {
-                                let _ = std::process::Command::new("notepad")
-                                    .arg(&path)
-                                    .spawn();
-                            }
-                        }
-                        ui.separator();
-                        ui.label("📄 Log-Datei: ~/.macxtreamer/app.log");
-                    });
-                    egui::ScrollArea::vertical()
-                        .stick_to_bottom(true)
-                        .show(ui, |ui| {
-                            ui.monospace(&self.log_text);
-                        });
-                });
-            self.show_log = open;
         }
 
         // Error dialog window
@@ -4776,9 +4918,6 @@ impl eframe::App for MacXtreamer {
             self.pending_save_config = false;
             self.config_draft = None;
         }
-
-        // Separate Downloads Fenster entfällt durch Inline-Spalte; Flag wird ignoriert
-        self.show_downloads = false;
 
         // Confirmation window for bulk series download
         if let Some((series_id, series_name)) = self.confirm_bulk.clone() {

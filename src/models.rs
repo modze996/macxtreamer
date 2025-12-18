@@ -152,6 +152,14 @@ pub struct Config {
     pub download_retry_delay_ms: u32, // Wartezeit zwischen Versuchen
     #[serde(default)]
     pub default_search_languages: Vec<String>, // Default-Sprachen für Suchfilter (z.B. ["EN", "DE", "MULTI"])
+    #[serde(default)]
+    pub filter_by_language: bool, // Legacy: Filter content by language in main view (kept for backward compatibility)
+    #[serde(default)]
+    pub filter_live_language: bool, // Persistiert: LiveTV Sprachfilter aktiv
+    #[serde(default)]
+    pub filter_vod_language: bool,  // Persistiert: VOD Sprachfilter aktiv
+    #[serde(default)]
+    pub filter_series_language: bool, // Persistiert: Serien Sprachfilter aktiv
 }
 
 impl Default for Config {
@@ -221,6 +229,10 @@ impl Default for Config {
             download_retry_max: 3,
             download_retry_delay_ms: 1000,
             default_search_languages: vec!["EN".to_string(), "DE".to_string(), "MULTI".to_string()],
+            filter_by_language: true,
+            filter_live_language: false,
+            filter_vod_language: false,
+            filter_series_language: false,
         }
     }
 }

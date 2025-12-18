@@ -110,6 +110,9 @@ pub fn read_config() -> Result<Config, io::Error> {
                 "vlc_diag_history" => cfg.vlc_diag_history = v.trim().to_string(),
                 "low_cpu_mode" => cfg.low_cpu_mode = v.trim().parse::<u8>().map(|n| n!=0).unwrap_or(false),
                 "ultra_low_flicker_mode" => cfg.ultra_low_flicker_mode = v.trim().parse::<u8>().map(|n| n!=0).unwrap_or(false),
+                "filter_live_language" => cfg.filter_live_language = v.trim().parse::<u8>().map(|n| n!=0).unwrap_or(false),
+                "filter_vod_language" => cfg.filter_vod_language = v.trim().parse::<u8>().map(|n| n!=0).unwrap_or(false),
+                "filter_series_language" => cfg.filter_series_language = v.trim().parse::<u8>().map(|n| n!=0).unwrap_or(false),
                 "bottom_panel_height" => cfg.bottom_panel_height = v.trim().parse::<f32>().unwrap_or(0.0),
                 "left_panel_width" => cfg.left_panel_width = v.trim().parse::<f32>().unwrap_or(0.0),
                 "active_profile_index" => cfg.active_profile_index = v.trim().parse::<usize>().unwrap_or(0),
@@ -283,6 +286,10 @@ pub fn save_config(cfg: &Config) -> Result<(), io::Error> {
     if !cfg.vlc_diag_history.trim().is_empty() { writeln!(f, "vlc_diag_history={}", cfg.vlc_diag_history)?; }
     writeln!(f, "low_cpu_mode={}", if cfg.low_cpu_mode {1} else {0})?;
     writeln!(f, "ultra_low_flicker_mode={}", if cfg.ultra_low_flicker_mode {1} else {0})?; // Duplikat entfernt
+    // Persist per-category language filter toggles
+    writeln!(f, "filter_live_language={}", if cfg.filter_live_language {1} else {0})?;
+    writeln!(f, "filter_vod_language={}", if cfg.filter_vod_language {1} else {0})?;
+    writeln!(f, "filter_series_language={}", if cfg.filter_series_language {1} else {0})?;
     if cfg.bottom_panel_height > 0.0 { writeln!(f, "bottom_panel_height={:.1}", cfg.bottom_panel_height)?; }
     if cfg.left_panel_width > 0.0 { writeln!(f, "left_panel_width={:.1}", cfg.left_panel_width)?; }
     
