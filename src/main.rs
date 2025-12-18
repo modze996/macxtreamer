@@ -2886,11 +2886,25 @@ impl eframe::App for MacXtreamer {
                     // Strikte Filterung: Nur Kategorien mit Sprach-Prefix ODER |XX| Tag aus den Einstellungen
                     let filter_langs: Vec<String> = self.config.default_search_languages.iter().map(|l| l.to_uppercase()).collect();
                     fn has_lang_tag(name: &str, langs: &[String]) -> bool {
+                        let name_up = name.to_uppercase();
                         for lang in langs {
-                            let prefix = format!("{} ", lang);
-                            let tag = format!("|{}|", lang);
-                            let name_up = name.to_uppercase();
-                            if name_up.starts_with(&prefix) || name_up.contains(&tag) {
+                            // common separators/prefixes encountered in feeds: "XX ", "XX|", "XX-", "XX:", "XX/", and pipe-tags like "|XX|" or "|XX ".
+                            let s_space = format!("{} ", lang);
+                            let s_pipe = format!("{}|", lang);
+                            let s_dash = format!("{}-", lang);
+                            let s_colon = format!("{}:", lang);
+                            let s_slash = format!("{}/", lang);
+                            let tag_pipe = format!("|{}|", lang);
+                            let tag_pipe_space = format!("|{} ", lang);
+
+                            if name_up.starts_with(&s_space)
+                                || name_up.starts_with(&s_pipe)
+                                || name_up.starts_with(&s_dash)
+                                || name_up.starts_with(&s_colon)
+                                || name_up.starts_with(&s_slash)
+                                || name_up.contains(&tag_pipe)
+                                || name_up.contains(&tag_pipe_space)
+                            {
                                 return true;
                             }
                         }
@@ -2904,9 +2918,22 @@ impl eframe::App for MacXtreamer {
                                 "EN" => {
                                     let countries = ["UK", "US", "CA"];
                                     for c in countries.iter() {
-                                        let prefix = format!("{} ", c);
-                                        let tag = format!("|{}|", c);
-                                        if name_up.starts_with(&prefix) || name_up.contains(&tag) {
+                                        // reuse same separator logic as has_lang_tag
+                                        let s_space = format!("{} ", c);
+                                        let s_pipe = format!("{}|", c);
+                                        let s_dash = format!("{}-", c);
+                                        let s_colon = format!("{}:", c);
+                                        let s_slash = format!("{}/", c);
+                                        let tag_pipe = format!("|{}|", c);
+                                        let tag_pipe_space = format!("|{} ", c);
+                                        if name_up.starts_with(&s_space)
+                                            || name_up.starts_with(&s_pipe)
+                                            || name_up.starts_with(&s_dash)
+                                            || name_up.starts_with(&s_colon)
+                                            || name_up.starts_with(&s_slash)
+                                            || name_up.contains(&tag_pipe)
+                                            || name_up.contains(&tag_pipe_space)
+                                        {
                                             return true;
                                         }
                                     }
@@ -2914,17 +2941,41 @@ impl eframe::App for MacXtreamer {
                                 "DE" => {
                                     let countries = ["DE", "AT", "CH"];
                                     for c in countries.iter() {
-                                        let prefix = format!("{} ", c);
-                                        let tag = format!("|{}|", c);
-                                        if name_up.starts_with(&prefix) || name_up.contains(&tag) {
+                                        let s_space = format!("{} ", c);
+                                        let s_pipe = format!("{}|", c);
+                                        let s_dash = format!("{}-", c);
+                                        let s_colon = format!("{}:", c);
+                                        let s_slash = format!("{}/", c);
+                                        let tag_pipe = format!("|{}|", c);
+                                        let tag_pipe_space = format!("|{} ", c);
+                                        if name_up.starts_with(&s_space)
+                                            || name_up.starts_with(&s_pipe)
+                                            || name_up.starts_with(&s_dash)
+                                            || name_up.starts_with(&s_colon)
+                                            || name_up.starts_with(&s_slash)
+                                            || name_up.contains(&tag_pipe)
+                                            || name_up.contains(&tag_pipe_space)
+                                        {
                                             return true;
                                         }
                                     }
                                 }
                                 _ => {
-                                    let prefix = format!("{} ", lang);
-                                    let tag = format!("|{}|", lang);
-                                    if name_up.starts_with(&prefix) || name_up.contains(&tag) {
+                                    let s_space = format!("{} ", lang);
+                                    let s_pipe = format!("{}|", lang);
+                                    let s_dash = format!("{}-", lang);
+                                    let s_colon = format!("{}:", lang);
+                                    let s_slash = format!("{}/", lang);
+                                    let tag_pipe = format!("|{}|", lang);
+                                    let tag_pipe_space = format!("|{} ", lang);
+                                    if name_up.starts_with(&s_space)
+                                        || name_up.starts_with(&s_pipe)
+                                        || name_up.starts_with(&s_dash)
+                                        || name_up.starts_with(&s_colon)
+                                        || name_up.starts_with(&s_slash)
+                                        || name_up.contains(&tag_pipe)
+                                        || name_up.contains(&tag_pipe_space)
+                                    {
                                         return true;
                                     }
                                 }
