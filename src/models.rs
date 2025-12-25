@@ -21,6 +21,8 @@ impl Default for ServerProfile {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Config {
+        #[serde(default)]
+        pub column_config_serialized: Option<String>, // CSV-Liste der ColumnKeys für Persistenz
     // Legacy fields for backward compatibility (will be migrated to profiles)
     #[serde(default)]
     pub address: String,
@@ -165,6 +167,7 @@ pub struct Config {
 impl Default for Config {
     fn default() -> Self {
         Self {
+            column_config_serialized: None,
             address: String::new(),
             username: String::new(),
             password: String::new(),

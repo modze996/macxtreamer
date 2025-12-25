@@ -1,5 +1,8 @@
+
 use eframe::egui::{self, Color32, RichText};
 use egui_extras::TableBuilder;
+
+// Hilfsfunktion: Spalten-Konfiguration als CSV speichern
 use image::GenericImageView;
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::{Path, PathBuf};
@@ -9,6 +12,21 @@ use std::sync::mpsc::{self, Receiver, Sender};
 use std::time::{Duration, Instant};
 // removed unused AsyncReadExt import after refactor
 use tokio::sync::Semaphore;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum ColumnKey {
+    Cover,
+    Name,
+    ID,
+    Info,
+    Year,
+    ReleaseDate,
+    Rating,
+    Genre,
+    Languages,
+    Path,
+    Actions,
+}
 
 mod ai_panel;
 mod api;
@@ -38,6 +56,39 @@ use helpers::{file_path_to_uri, format_file_size};
 use logger::log_line;
 use models::{Category, Config, FavItem, Item, RecentItem, Row};
 use ui_helpers::{colored_text_by_type, render_loading_spinner};
+impl ColumnKey {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            ColumnKey::Cover => "cover",
+            ColumnKey::Name => "name",
+            ColumnKey::ID => "id",
+            ColumnKey::Info => "info",
+            ColumnKey::Year => "year",
+            ColumnKey::ReleaseDate => "release_date",
+            ColumnKey::Rating => "rating",
+            ColumnKey::Genre => "genre",
+            ColumnKey::Languages => "languages",
+            ColumnKey::Path => "path",
+            ColumnKey::Actions => "actions",
+        }
+    }
+    pub fn from_str(s: &str) -> Option<ColumnKey> {
+        match s {
+            "cover" => Some(ColumnKey::Cover),
+            "name" => Some(ColumnKey::Name),
+            "id" => Some(ColumnKey::ID),
+            "info" => Some(ColumnKey::Info),
+            "year" => Some(ColumnKey::Year),
+            "release_date" => Some(ColumnKey::ReleaseDate),
+            "rating" => Some(ColumnKey::Rating),
+            "genre" => Some(ColumnKey::Genre),
+            "languages" => Some(ColumnKey::Languages),
+            "path" => Some(ColumnKey::Path),
+            "actions" => Some(ColumnKey::Actions),
+            _ => None,
+        }
+    }
+}
 use player::{build_url_by_type, start_player};
 use once_cell::sync::OnceCell;
 static GLOBAL_TX: OnceCell<Sender<Msg>> = OnceCell::new();
@@ -151,6 +202,8 @@ fn setup_custom_fonts(ctx: &egui::Context) {
 }
 
 struct MacXtreamer {
+        // Sichtbare und sortierte Spalten
+        column_config: Vec<ColumnKey>,
     // Config/State
     config: Config,
     config_draft: Option<Config>,
@@ -285,6 +338,15 @@ impl MacXtreamer {
     let persisted_filter_series = config.filter_series_language;
     let default_search_langs = config.default_search_languages.clone();
         let mut app = Self {
+                        column_config: vec![
+                            ColumnKey::Cover,
+                            ColumnKey::Name,
+                            ColumnKey::ReleaseDate,
+                            ColumnKey::Rating,
+                            ColumnKey::Genre,
+                            ColumnKey::Languages,
+                            ColumnKey::Actions,
+                        ],
             config,
             config_draft: None,
             playlists: vec![],
@@ -3573,7 +3635,59 @@ impl eframe::App for MacXtreamer {
                 }
             }
             
-            let mut rows = self.content_rows.clone();
+            let rows = self.content_rows.clone();
+            // Workaround für Borrow-Checker: Spalten- und Zeilen-Konfiguration kopieren
+            let columns = self.column_config.clone();
+            let mut rows = rows.clone();
+
+                        // Spalten-Konfigurations-UI
+                        let mut show_column_popup = false;
+                        ui.horizontal(|ui| {
+                            let anchor = ui.button("⚙️ Spalten konfigurieren");
+                            if anchor.clicked() {
+                                show_column_popup = true;
+                            }
+                        });
+                        if show_column_popup {
+                            ui.memory_mut(|mem| mem.open_popup(egui::Id::new("column_config_popup")));
+                        }
+                        let anchor = ui.button("");
+                        egui::popup::popup_below_widget(ui, egui::Id::new("column_config_popup"), &anchor, |ui| {
+                            ui.label("Spalten ein-/ausblenden und sortieren:");
+                            let all_columns = [
+                                ColumnKey::Cover, ColumnKey::Name, ColumnKey::ID, ColumnKey::Info, ColumnKey::Year,
+                                ColumnKey::ReleaseDate, ColumnKey::Rating, ColumnKey::Genre, ColumnKey::Languages, ColumnKey::Path, ColumnKey::Actions
+                            ];
+                            // Sichtbarkeit togglen
+                            for col in &all_columns {
+                                let mut visible = self.column_config.contains(col);
+                                let label = format!("{:?}", col);
+                                if ui.checkbox(&mut visible, label).changed() {
+                                    if visible && !self.column_config.contains(col) {
+                                        self.column_config.push(*col);
+                                        self.save_column_config();
+                                    } else if !visible {
+                                        self.column_config.retain(|c| c != col);
+                                        self.save_column_config();
+                                    }
+                                }
+                            }
+                            ui.separator();
+                            ui.label("Reihenfolge ändern (Drag & Drop):");
+                            for col in self.column_config.iter() {
+                                // TODO: Drag-and-drop für Spaltenreihenfolge mit egui unterstützen
+                                // Derzeit deaktiviert, da die API nicht existiert (start_drag, dragged_item, stop_drag)
+                                let (rect, _response) = ui.allocate_exact_size(egui::vec2(ui.available_width(), 24.0), egui::Sense::click());
+                                ui.painter().text(rect.center(), egui::Align2::CENTER_CENTER, format!("{:?}", col), egui::TextStyle::Button.resolve(ui.style()), Color32::BLACK);
+                            }
+                            // Drag-and-drop für Spaltenreihenfolge ist aktuell deaktiviert
+                            if ui.button("Schließen").clicked() {
+                                ui.memory_mut(|mem| mem.close_popup());
+                            }
+                        });
+
+                        // Hilfsfunktion: Spalten-Konfiguration speichern
+                        // (column_config_to_csv als freie Funktion weiter unten)
             
             // Apply language filter if enabled
             if self.config.filter_by_language && !self.config.default_search_languages.is_empty() {
@@ -3607,12 +3721,22 @@ impl eframe::App for MacXtreamer {
                         rows.sort_by(|a, b| parse_year(&a.year).cmp(&parse_year(&b.year)));
                     }
                     SortKey::ReleaseDate => {
-                        fn parse_year(y: &Option<String>) -> i32 {
-                            y.as_deref()
-                                .and_then(|s| s.parse::<i32>().ok())
-                                .unwrap_or(0)
+                        use chrono::NaiveDate;
+                        fn parse_date(s: &Option<String>) -> NaiveDate {
+                            if let Some(s) = s {
+                                // Versuche yyyy-mm-dd
+                                if let Ok(d) = NaiveDate::parse_from_str(s, "%Y-%m-%d") {
+                                    return d;
+                                }
+                                // Versuche nur yyyy
+                                if let Ok(y) = s.parse::<i32>() {
+                                    return NaiveDate::from_ymd_opt(y, 1, 1).unwrap_or(NaiveDate::from_ymd_opt(1970, 1, 1).unwrap());
+                                }
+                            }
+                            // Fallback: sehr altes Datum
+                            NaiveDate::from_ymd_opt(1970, 1, 1).unwrap()
                         }
-                        rows.sort_by(|a, b| parse_year(&a.release_date).cmp(&parse_year(&b.release_date)));
+                        rows.sort_by(|a, b| parse_date(&a.release_date).cmp(&parse_date(&b.release_date)));
                     }
                     SortKey::Rating => {
                         rows.sort_by(|a, b| {
@@ -3647,442 +3771,202 @@ impl eframe::App for MacXtreamer {
             let cover_w = self.cover_height * (2.0 / 3.0);
             let row_h = (self.cover_height + 8.0).max(28.0);
             let header_h = 22.0;
-            TableBuilder::new(ui)
+            let mut table = TableBuilder::new(ui)
                 .striped(true)
                 .resizable(true)
                 .vscroll(true)
-                // Let egui calculate the available height automatically
-                .max_scroll_height(avail_h)
-                .column(egui_extras::Column::initial(cover_w + 16.0)) // Cover
-                .column(egui_extras::Column::initial(400.0).at_least(400.0)) // Name (min 400px, resizable)
-                .column(egui_extras::Column::initial(140.0)) // ID
-                .column(egui_extras::Column::initial(120.0)) // Info
-                .column(egui_extras::Column::initial(80.0)) // Year
-                .column(egui_extras::Column::initial(100.0)) // Release Date
-                .column(egui_extras::Column::initial(80.0)) // Rating
-                .column(egui_extras::Column::initial(200.0)) // Genre (resizable)
-                .column(egui_extras::Column::initial(150.0)) // Languages
-                .column(egui_extras::Column::initial(220.0)) // Path
-                .column(egui_extras::Column::remainder().at_least(320.0)) // Aktion füllt Restbreite
-                .header(header_h, |mut header| {
-                    header.col(|ui| {
-                        ui.strong("Cover");
-                    });
-                    header.col(|ui| {
-                        let selected = self.sort_key == Some(SortKey::Name);
-                        let label = if selected {
-                            format!("Name {}", if self.sort_asc { "▲" } else { "▼" })
-                        } else {
-                            "Name".to_string()
-                        };
-                        if ui.small_button(label).clicked() {
-                            if selected {
-                                self.sort_asc = !self.sort_asc;
-                            } else {
-                                self.sort_key = Some(SortKey::Name);
-                                self.sort_asc = true;
+                .max_scroll_height(avail_h);
+            for col in &columns {
+                match col {
+                    ColumnKey::Cover => table = table.column(egui_extras::Column::initial(cover_w + 16.0)),
+                    ColumnKey::Name => table = table.column(egui_extras::Column::initial(400.0).at_least(400.0)),
+                    ColumnKey::ID => table = table.column(egui_extras::Column::initial(140.0)),
+                    ColumnKey::Info => table = table.column(egui_extras::Column::initial(120.0)),
+                    ColumnKey::Year => table = table.column(egui_extras::Column::initial(80.0)),
+                    ColumnKey::ReleaseDate => table = table.column(egui_extras::Column::initial(100.0)),
+                    ColumnKey::Rating => table = table.column(egui_extras::Column::initial(80.0)),
+                    ColumnKey::Genre => table = table.column(egui_extras::Column::initial(200.0)),
+                    ColumnKey::Languages => table = table.column(egui_extras::Column::initial(150.0)),
+                    ColumnKey::Path => table = table.column(egui_extras::Column::initial(220.0)),
+                    ColumnKey::Actions => table = table.column(egui_extras::Column::remainder().at_least(320.0)),
+                }
+            }
+            table.header(header_h, |mut header| {
+                for col in &columns {
+                    match col {
+                        ColumnKey::Cover => { header.col(|ui| { ui.strong("Cover"); }); },
+                        ColumnKey::Name => { header.col(|ui| {
+                            let selected = self.sort_key == Some(SortKey::Name);
+                            let label = if selected {
+                                format!("Name {}", if self.sort_asc { "▲" } else { "▼" })
+                            } else { "Name".to_string() };
+                            if ui.small_button(label).clicked() {
+                                if selected { self.sort_asc = !self.sort_asc; } else { self.sort_key = Some(SortKey::Name); self.sort_asc = true; }
                             }
-                        }
-                    });
-                    header.col(|ui| {
-                        ui.strong("ID");
-                    });
-                    header.col(|ui| {
-                        ui.strong("Info");
-                    });
-                    header.col(|ui| {
-                        let selected = self.sort_key == Some(SortKey::Year);
-                        let label = if selected {
-                            format!("Year {}", if self.sort_asc { "▲" } else { "▼" })
-                        } else {
-                            "Year".to_string()
-                        };
-                        if ui.small_button(label).clicked() {
-                            if selected {
-                                self.sort_asc = !self.sort_asc;
-                            } else {
-                                self.sort_key = Some(SortKey::Year);
-                                self.sort_asc = true;
+                        }); },
+                        ColumnKey::ID => { header.col(|ui| { ui.strong("ID"); }); },
+                        ColumnKey::Info => { header.col(|ui| { ui.strong("Info"); }); },
+                        ColumnKey::Year => { header.col(|ui| {
+                            let selected = self.sort_key == Some(SortKey::Year);
+                            let label = if selected {
+                                format!("Year {}", if self.sort_asc { "▲" } else { "▼" })
+                            } else { "Year".to_string() };
+                            if ui.small_button(label).clicked() {
+                                if selected { self.sort_asc = !self.sort_asc; } else { self.sort_key = Some(SortKey::Year); self.sort_asc = true; }
                             }
-                        }
-                    });
-                    header.col(|ui| {
-                        let selected = self.sort_key == Some(SortKey::ReleaseDate);
-                        let label = if selected {
-                            format!("Release Date {}", if self.sort_asc { "▲" } else { "▼" })
-                        } else {
-                            "Release Date".to_string()
-                        };
-                        if ui.small_button(label).clicked() {
-                            if selected {
-                                self.sort_asc = !self.sort_asc;
-                            } else {
-                                self.sort_key = Some(SortKey::ReleaseDate);
-                                self.sort_asc = true;
+                        }); },
+                        ColumnKey::ReleaseDate => { header.col(|ui| {
+                            let selected = self.sort_key == Some(SortKey::ReleaseDate);
+                            let label = if selected {
+                                format!("Release Date {}", if self.sort_asc { "▲" } else { "▼" })
+                            } else { "Release Date".to_string() };
+                            if ui.small_button(label).clicked() {
+                                if selected { self.sort_asc = !self.sort_asc; } else { self.sort_key = Some(SortKey::ReleaseDate); self.sort_asc = true; }
                             }
-                        }
-                    });
-                    header.col(|ui| {
-                        let selected = self.sort_key == Some(SortKey::Rating);
-                        // Default for first click on Rating: descending (highest first)
-                        let label = if selected {
-                            format!("Rating {}", if self.sort_asc { "▲" } else { "▼" })
-                        } else {
-                            "Rating".to_string()
-                        };
-                        if ui.small_button(label).clicked() {
-                            if selected {
-                                self.sort_asc = !self.sort_asc;
-                            } else {
-                                self.sort_key = Some(SortKey::Rating);
-                                self.sort_asc = false;
+                        }); },
+                        ColumnKey::Rating => { header.col(|ui| {
+                            let selected = self.sort_key == Some(SortKey::Rating);
+                            let label = if selected {
+                                format!("Rating {}", if self.sort_asc { "▲" } else { "▼" })
+                            } else { "Rating".to_string() };
+                            if ui.small_button(label).clicked() {
+                                if selected { self.sort_asc = !self.sort_asc; } else { self.sort_key = Some(SortKey::Rating); self.sort_asc = false; }
                             }
-                        }
-                    });
-                    header.col(|ui| {
-                        let selected = self.sort_key == Some(SortKey::Genre);
-                        let label = if selected {
-                            format!("Genre {}", if self.sort_asc { "▲" } else { "▼" })
-                        } else {
-                            "Genre".to_string()
-                        };
-                        if ui.small_button(label).clicked() {
-                            if selected {
-                                self.sort_asc = !self.sort_asc;
-                            } else {
-                                self.sort_key = Some(SortKey::Genre);
-                                self.sort_asc = true;
+                        }); },
+                        ColumnKey::Genre => { header.col(|ui| {
+                            let selected = self.sort_key == Some(SortKey::Genre);
+                            let label = if selected {
+                                format!("Genre {}", if self.sort_asc { "▲" } else { "▼" })
+                            } else { "Genre".to_string() };
+                            if ui.small_button(label).clicked() {
+                                if selected { self.sort_asc = !self.sort_asc; } else { self.sort_key = Some(SortKey::Genre); self.sort_asc = true; }
                             }
-                        }
-                    });
-                    header.col(|ui| {
-                        let selected = self.sort_key == Some(SortKey::Languages);
-                        let label = if selected {
-                            format!("Languages {}", if self.sort_asc { "▲" } else { "▼" })
-                        } else {
-                            "Languages".to_string()
-                        };
-                        if ui.small_button(label).clicked() {
-                            if selected {
-                                self.sort_asc = !self.sort_asc;
-                            } else {
-                                self.sort_key = Some(SortKey::Languages);
-                                self.sort_asc = true;
+                        }); },
+                        ColumnKey::Languages => { header.col(|ui| {
+                            let selected = self.sort_key == Some(SortKey::Languages);
+                            let label = if selected {
+                                format!("Languages {}", if self.sort_asc { "▲" } else { "▼" })
+                            } else { "Languages".to_string() };
+                            if ui.small_button(label).clicked() {
+                                if selected { self.sort_asc = !self.sort_asc; } else { self.sort_key = Some(SortKey::Languages); self.sort_asc = true; }
                             }
-                        }
-                    });
-                    header.col(|ui| {
-                        ui.strong("Path");
-                    });
-                    header.col(|ui| {
-                        ui.strong("Action");
-                    });
-                })
-                .body(|body| {
-                    let row_count = rows.len();
-                    body.rows(row_h, row_count, |i, mut row| {
-                        let r = &rows[i];
-                        let url = if r.info == "SeriesEpisode" {
-                            // For episodes, always construct URL: base + /series/user/pass/id.ext
-                            build_url_by_type(
-                                &self.config,
-                                &r.id,
-                                &r.info,
-                                r.container_extension.as_deref(),
-                            )
-                        } else {
-                            // For movies/live, prefer API provided URL, fallback to builder
-                            r.stream_url.clone().unwrap_or_else(|| {
-                                build_url_by_type(
-                                    &self.config,
-                                    &r.id,
-                                    &r.info,
-                                    r.container_extension.as_deref(),
-                                )
-                            })
-                        };
-                        // Cover column (lazy: nur für sichtbare Zeilen wird diese Closure aufgerufen)
-                        row.col(|ui| {
-                            if let Some(cu) = &r.cover_url {
-                                if let Some(tex) = self.textures.get(cu) {
-                                    ui.add(
-                                        egui::Image::new(tex).fit_to_exact_size(egui::vec2(
-                                            cover_w,
-                                            self.cover_height,
-                                        )),
-                                    );
-                                } else {
-                                    // Platzhalter zeichnen und lazy load anstoßen
-                                    let (rect, _resp) = ui.allocate_exact_size(
-                                        egui::vec2(cover_w, self.cover_height),
-                                        egui::Sense::hover(),
-                                    );
-                                    ui.painter().rect_filled(rect, 4.0, Color32::from_gray(60));
-                                    self.spawn_fetch_cover(cu);
-                                }
-                            }
-                        });
-                        // Name column
-                        row.col(|ui| {
-                            if r.info == "Series" {
-                                if ui.link(&r.name).clicked() {
-                                    if let Some(cv) = &self.current_view {
-                                        self.view_stack.push(cv.clone());
-                                    }
-                                    self.current_view = Some(ViewState::Episodes {
-                                        series_id: r.id.clone(),
-                                    });
-                                    self.is_loading = true;
-                                    self.loading_total = 1;
-                                    self.loading_done = 0;
-                                    self.spawn_load_episodes(r.id.clone());
-                                }
-                            } else {
-                                ui.label(&r.name);
-                            }
-                        });
-                        row.col(|ui| {
-                            ui.label(&r.id);
-                        });
-                        row.col(|ui| {
-                            ui.label(&r.info);
-                        });
-                        row.col(|ui| {
-                            ui.label(r.year.clone().unwrap_or_default());
-                        });
-                        row.col(|ui| {
-                            ui.label(r.release_date.clone().unwrap_or_default());
-                        });
-                        row.col(|ui| {
-                            ui.label(
-                                r.rating_5based
-                                    .map(|v| format!("{:.1}", v))
-                                    .unwrap_or_default(),
-                            );
-                        });
-                        row.col(|ui| {
-                            ui.label(r.genre.clone().unwrap_or_default());
-                        });
-                        row.col(|ui| {
-                            ui.label(r.audio_languages.clone().unwrap_or_default());
-                        });
-                        row.col(|ui| {
-                            ui.label(r.path.clone().unwrap_or_default());
-                        });
-                        row.col(|ui| {
-                            ui.horizontal_wrapped(|ui| {
+                        }); },
+                        ColumnKey::Path => { header.col(|ui| { ui.strong("Path"); }); },
+                        ColumnKey::Actions => { header.col(|ui| { ui.strong("Action"); }); },
+                    }
+                }
+            })
+            .body(|body| {
+                let row_count = rows.len();
+                body.rows(row_h, row_count, |i, mut row| {
+                    let r = &rows[i];
+                    let url = if r.info == "SeriesEpisode" {
+                        build_url_by_type(&self.config, &r.id, &r.info, r.container_extension.as_deref())
+                    } else {
+                        r.stream_url.clone().unwrap_or_else(|| build_url_by_type(&self.config, &r.id, &r.info, r.container_extension.as_deref()))
+                    };
+                    for col in &columns {
+                        match col {
+                                    ColumnKey::Cover => { row.col(|ui| {
+                                        if let Some(cu) = &r.cover_url {
+                                            if let Some(tex) = self.textures.get(cu) {
+                                                ui.add(egui::Image::new(tex).fit_to_exact_size(egui::vec2(cover_w, self.cover_height)));
+                                            } else {
+                                                let rect = ui.allocate_exact_size(egui::vec2(cover_w, self.cover_height), egui::Sense::hover()).0;
+                                                ui.painter().rect_filled(rect, 4.0, Color32::from_gray(60));
+                                                self.spawn_fetch_cover(cu);
+                                            }
+                                        }
+                                    }); },
+                            ColumnKey::Name => { row.col(|ui| {
                                 if r.info == "Series" {
-                                    if ui.small_button("Episodes").clicked() {
+                                    if ui.link(&r.name).clicked() {
                                         if let Some(cv) = &self.current_view {
                                             self.view_stack.push(cv.clone());
                                         }
-                                        self.current_view = Some(ViewState::Episodes {
-                                            series_id: r.id.clone(),
-                                        });
+                                        self.current_view = Some(ViewState::Episodes { series_id: r.id.clone() });
                                         self.is_loading = true;
                                         self.loading_total = 1;
                                         self.loading_done = 0;
                                         self.spawn_load_episodes(r.id.clone());
                                     }
-                                    // Favoriten-Button für Series
-                                    let is_fav = is_favorite(&r.id, &r.info, "Series");
-                                    let fav_text = if is_fav { "★" } else { "☆" };
-                                    if ui.small_button(fav_text).on_hover_text("Zu Favoriten hinzufügen/entfernen").clicked() {
-                                        toggle_favorite(&FavItem {
-                                            id: r.id.clone(),
-                                            info: r.info.clone(),
-                                            name: r.name.clone(),
-                                            item_type: "Series".to_string(),
-                                            stream_url: None,
-                                            container_extension: None,
-                                            cover: r.cover_url.clone(),
-                                            series_id: None,
-                                        });
-                                        self.favorites = load_favorites();
-                                    }
-                                    // Für Series kein direktes File, aber wir bieten Download (öffnet Episoden zum Downloaden)
-                                    if self.config.enable_downloads
-                                        && ui
-                                            .small_button("Download all")
-                                            .on_hover_text("Queue all episodes for download")
-                                            .clicked()
-                                    {
-                                        self.confirm_bulk = Some((r.id.clone(), r.name.clone()));
-                                    }
                                 } else {
-                                    if ui.small_button("Play").clicked() {
-                                        if self.config.address.is_empty()
-                                            || self.config.username.is_empty()
-                                            || self.config.password.is_empty()
-                                        {
-                                            self.last_error = Some(
-                                                "Please set address/username/password in Settings"
-                                                    .into(),
-                                            );
-                                        } else {
-                                            let play_url = self.resolve_play_url(r);
-                                            let _ = start_player(self.effective_config(), &play_url);
+                                    ui.label(&r.name);
+                                }
+                            }); },
+                            ColumnKey::ID => { row.col(|ui| { ui.label(&r.id); }); },
+                            ColumnKey::Info => { row.col(|ui| { ui.label(&r.info); }); },
+                            ColumnKey::Year => { row.col(|ui| { ui.label(r.year.clone().unwrap_or_default()); }); },
+                            ColumnKey::ReleaseDate => { row.col(|ui| { ui.label(r.release_date.clone().unwrap_or_default()); }); },
+                            ColumnKey::Rating => { row.col(|ui| { ui.label(r.rating_5based.map(|v| format!("{:.1}", v)).unwrap_or_default()); }); },
+                            ColumnKey::Genre => { row.col(|ui| { ui.label(r.genre.clone().unwrap_or_default()); }); },
+                            ColumnKey::Languages => { row.col(|ui| { ui.label(r.audio_languages.clone().unwrap_or_default()); }); },
+                            ColumnKey::Path => { row.col(|ui| { ui.label(r.path.clone().unwrap_or_default()); }); },
+                            ColumnKey::Actions => { row.col(|ui| {
+                                ui.horizontal_wrapped(|ui| {
+                                    if r.info == "Series" {
+                                        if ui.small_button("Episodes").clicked() {
+                                            if let Some(cv) = &self.current_view {
+                                                self.view_stack.push(cv.clone());
+                                            }
+                                            self.current_view = Some(ViewState::Episodes { series_id: r.id.clone() });
+                                            self.is_loading = true;
+                                            self.loading_total = 1;
+                                            self.loading_done = 0;
+                                            self.spawn_load_episodes(r.id.clone());
                                         }
-                                        let rec = RecentItem {
-                                            id: r.id.clone(),
-                                            name: r.name.clone(),
-                                            info: r.info.clone(),
-                                            stream_url: build_url_by_type(
-                                                &self.config,
-                                                &r.id,
-                                                &r.info,
-                                                r.container_extension.as_deref(),
-                                            ),
-                                            container_extension: r.container_extension.clone(),
-                                        };
-                                        add_to_recently(&rec);
-                                        self.recently = load_recently_played();
-                                    }
-                                    if ui.small_button("Copy").clicked() {
-                                        ui.output_mut(|o| o.copied_text = url.clone());
-                                    }
-                                    if r.info == "Movie"
-                                        || r.info == "SeriesEpisode"
-                                        || r.info == "Series"
-                                        || r.info == "VOD"
-                                    {
-                                        let st_opt = self.downloads.get(&r.id).cloned();
-                                        let existing = self.local_file_exists(
-                                            &r.id,
-                                            &r.name,
-                                            r.container_extension.as_deref(),
-                                        );
-                                        if let Some(st) = st_opt {
-                                            if st.finished
-                                                && st.error.is_none()
-                                                && existing.is_some()
-                                            {
-                                                ui.weak("✔ downloaded");
-                                                if let Some(p) = existing.clone() {
-                                                    if ui
-                                                        .small_button("Delete")
-                                                        .on_hover_text("Remove local file")
-                                                        .clicked()
-                                                    {
-                                                        if let Err(e) = std::fs::remove_file(&p) {
-                                                            self.last_error = Some(format!(
-                                                                "Failed to delete: {}",
-                                                                e
-                                                            ));
-                                                        } else {
-                                                            // Keep download state but file is gone; allow re-download
-                                                            if let Some(ds) =
-                                                                self.downloads.get_mut(&r.id)
-                                                            {
-                                                                ds.finished = false;
-                                                                ds.total = None;
-                                                                ds.received = 0;
-                                                                ds.path = None;
-                                                                ds.error = None;
-                                                                ds.waiting = false;
-                                                            }
-                                                        }
-                                                    }
-                                                }
-                                            } else if let Some(error) = &st.error {
-                                                ui.label(colored_text_by_type(&format!("Download failed: {}", error), "error"));
-                                                if ui.small_button("Retry").clicked() {
-                                                    self.downloads.remove(&r.id);
+                                        let is_fav = is_favorite(&r.id, &r.info, "Series");
+                                        let fav_text = if is_fav { "★" } else { "☆" };
+                                        if ui.small_button(fav_text).on_hover_text("Zu Favoriten hinzufügen/entfernen").clicked() {
+                                            toggle_favorite(&FavItem {
+                                                id: r.id.clone(),
+                                                info: r.info.clone(),
+                                                name: r.name.clone(),
+                                                item_type: "Series".to_string(),
+                                                stream_url: None,
+                                                container_extension: None,
+                                                cover: r.cover_url.clone(),
+                                                series_id: None,
+                                            });
+                                            self.favorites = load_favorites();
+                                        }
+                                        if self.config.enable_downloads && ui.small_button("Download all").on_hover_text("Queue all episodes for download").clicked() {
+                                            self.confirm_bulk = Some((r.id.clone(), r.name.clone()));
+                                        }
+                                    } else {
+                                        if ui.small_button("Play").clicked() {
+                                            if self.config.address.is_empty() || self.config.username.is_empty() || self.config.password.is_empty() {
+                                                self.last_error = Some("Please set address/username/password in Settings".into());
+                                            } else {
+                                                let play_url = self.resolve_play_url(r);
+                                                let _ = start_player(self.effective_config(), &play_url);
+                                            }
+                                            let rec = RecentItem {
+                                                id: r.id.clone(),
+                                                name: r.name.clone(),
+                                                info: r.info.clone(),
+                                                stream_url: build_url_by_type(&self.config, &r.id, &r.info, r.container_extension.as_deref()),
+                                                container_extension: r.container_extension.clone(),
+                                            };
+                                            add_to_recently(&rec);
+                                            self.recently = load_recently_played();
+                                        }
+                                        if ui.small_button("Copy").clicked() {
+                                            ui.output_mut(|o| o.copied_text = url.clone());
+                                        }
+                                        if r.info == "Movie" || r.info == "SeriesEpisode" || r.info == "Channel" {
+                                                if self.config.enable_downloads && ui.small_button("Download").on_hover_text("Download this item").clicked() {
                                                     self.spawn_download(r);
                                                 }
-                                            } else {
-                                                // In progress
-                                                let frac = st
-                                                    .total
-                                                    .map(|t| {
-                                                        (st.received as f32 / t as f32).min(1.0)
-                                                    })
-                                                    .unwrap_or(0.0);
-                                                let pct = if st.total.is_some() {
-                                                    format!("{:.0}%", frac * 100.0)
-                                                } else {
-                                                    format!("{} KB", st.received / 1024)
-                                                };
-                                                ui.add(
-                                                    egui::ProgressBar::new(frac)
-                                                        .show_percentage()
-                                                        .text(pct),
-                                                );
-                                                if let Some(flag) = &st.cancel_flag {
-                                                    if ui.small_button("Cancel").clicked() {
-                                                        flag.store(true, Ordering::Relaxed);
-                                                    }
-                                                }
-                                            }
-                                        } else if existing.is_some() {
-                                            ui.weak("✔ downloaded");
-                                            if let Some(p) = existing.clone() {
-                                                if ui
-                                                    .small_button("Delete")
-                                                    .on_hover_text("Remove local file")
-                                                    .clicked()
-                                                {
-                                                    if let Err(e) = std::fs::remove_file(&p) {
-                                                        self.last_error = Some(format!(
-                                                            "Failed to delete: {}",
-                                                            e
-                                                        ));
-                                                    } else {
-                                                        // Remove any stale state
-                                                        self.downloads.remove(&r.id);
-                                                    }
-                                                }
-                                            }
-                                        } else {
-                                            if self.config.enable_downloads
-                                                && ui.small_button("Download").clicked()
-                                            {
-                                                self.spawn_download(r);
-                                            }
                                         }
                                     }
-                                    if r.info == "SeriesEpisode" {
-                                        if ui.small_button("binge watch since here").clicked() {
-                                            // Build playlist from the currently visible/sorted rows starting at i
-                                            let mut entries: Vec<(String, String)> = Vec::new();
-                                            for rr in rows.iter().skip(i) {
-                                                if rr.info == "SeriesEpisode" {
-                                                    let url = build_url_by_type(
-                                                        &self.config,
-                                                        &rr.id,
-                                                        &rr.info,
-                                                        rr.container_extension.as_deref(),
-                                                    );
-                                                    entries.push((rr.name.clone(), url));
-                                                }
-                                            }
-                                            if let Err(e) = self.create_and_play_m3u(&entries) {
-                                                self.last_error = Some(e);
-                                            }
-                                        }
-                                    }
-                                    if ui.small_button("Fav").clicked() {
-                                        let item_type = r.info.clone(); // "Movie", "Channel", "Episode"
-                                        toggle_favorite(&FavItem {
-                                            id: r.id.clone(),
-                                            info: r.info.clone(),
-                                            name: r.name.clone(),
-                                            item_type,
-                                            stream_url: Some(url.clone()),
-                                            container_extension: r.container_extension.clone(),
-                                            cover: r.cover_url.clone(),
-                                            series_id: None,
-                                        });
-                                        self.favorites = load_favorites();
-                                    }
-                                }
-                            });
-                        });
-                    });
+                                });
+                            }); },
+                        }
+                    }
                 });
-            // Small spacer so last row isn't flush with panel edge
-            ui.add_space(4.0);
-        });
+            });
+                });
 
         if self.show_config {
             let mut open = self.show_config;
@@ -5061,4 +4945,17 @@ fn extract_year_from_title(title: &str) -> Option<String> {
         }
     }
     None
+}
+
+// Die Hilfsfunktion column_config_from_csv bleibt als freie Funktion.
+
+fn column_config_to_csv(cols: &[ColumnKey]) -> String {
+    cols.iter().map(|c| c.as_str()).collect::<Vec<_>>().join(",")
+}
+
+impl MacXtreamer {
+    pub fn save_column_config(&mut self) {
+        self.config.column_config_serialized = Some(column_config_to_csv(&self.column_config));
+        let _ = save_config(&self.config);
+    }
 }
