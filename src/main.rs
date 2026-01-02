@@ -54,7 +54,6 @@ use config::{read_config, save_config};
 use download_utils::{DownloadMeta, DownloadState, ScannedDownload, expand_download_dir};
 use downloads::{BulkOptions, sanitize_filename};
 use helpers::{file_path_to_uri, format_file_size};
-use i18n::t;
 use logger::log_line;
 use models::{Category, Config, FavItem, Item, Language, RecentItem, Row};
 use ui_helpers::{colored_text_by_type, render_loading_spinner};
