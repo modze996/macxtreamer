@@ -1,5 +1,33 @@
 use serde::{Deserialize, Serialize};
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum Language {
+    English,
+    German,
+}
+
+impl Default for Language {
+    fn default() -> Self {
+        Language::English
+    }
+}
+
+impl Language {
+    pub fn code(&self) -> &'static str {
+        match self {
+            Language::English => "en",
+            Language::German => "de",
+        }
+    }
+    
+    pub fn name(&self) -> &'static str {
+        match self {
+            Language::English => "English",
+            Language::German => "Deutsch",
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ServerProfile {
     pub name: String,
@@ -162,6 +190,10 @@ pub struct Config {
     pub filter_vod_language: bool,  // Persistiert: VOD Sprachfilter aktiv
     #[serde(default)]
     pub filter_series_language: bool, // Persistiert: Serien Sprachfilter aktiv
+    #[serde(default)]
+    pub ai_panel_tab: String, // Persistiert: Aktuell ausgewählter Tab in AI Panel ("recommendations" | "recently_added")
+    #[serde(default)]
+    pub language: Language, // UI Language (English | German)
 }
 
 impl Default for Config {
@@ -225,7 +257,7 @@ impl Default for Config {
             openai_api_key: String::new(),
             openai_model: "gpt-4o".to_string(),
             vlc_diag_history: String::new(),
-            low_cpu_mode: false,
+            low_cpu_mode: true,
             ultra_low_flicker_mode: false,
             bottom_panel_height: 200.0,
             left_panel_width: 300.0,
@@ -236,6 +268,8 @@ impl Default for Config {
             filter_live_language: false,
             filter_vod_language: false,
             filter_series_language: false,
+            ai_panel_tab: "recommendations".to_string(),
+            language: Language::English,
         }
     }
 }

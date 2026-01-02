@@ -1,4 +1,5 @@
 use crate::models::{Item, SearchItem};
+use rayon::prelude::*;
 
 /// Score a candidate string against the query.
 /// Higher is better. Only substring matches are allowed - no fuzzy matching.
@@ -58,31 +59,45 @@ pub fn search_items_with_language_filter(
     // Use HashMap to deduplicate by ID and keep best score
     let mut best_scores: std::collections::HashMap<String, (f64, &Item, &'static str)> = std::collections::HashMap::new();
     
-    // Score all items and keep best score per ID
-    // Only items with score > 0 (substring match) are included
-    for m in movies {
-        let sc = score_item(m, query);
-        if sc > 0.0 {
-            best_scores.entry(m.id.clone())
-                .and_modify(|e| { if sc > e.0 { *e = (sc, m, "Movie"); } })
-                .or_insert((sc, m, "Movie"));
-        }
-    }
-    for s in series {
-        let sc = score_item(s, query);
-        if sc > 0.0 {
-            best_scores.entry(s.id.clone())
-                .and_modify(|e| { if sc > e.0 { *e = (sc, s, "Series"); } })
-                .or_insert((sc, s, "Series"));
-        }
-    }
-    for c in channels {
-        let sc = score_item(c, query);
-        if sc > 0.0 {
-            best_scores.entry(c.id.clone())
-                .and_modify(|e| { if sc > e.0 { *e = (sc, c, "Channel"); } })
-                .or_insert((sc, c, "Channel"));
-        }
+    // Parallelisiere das Scoring mit Rayon
+    let movie_scores: Vec<(String, (f64, &Item, &'static str))> = movies.par_iter()
+        .filter_map(|m| {
+            let sc = score_item(m, query);
+            if sc > 0.0 {
+                Some((m.id.clone(), (sc, m, "Movie")))
+            } else {
+                None
+            }
+        })
+        .collect();
+
+    let series_scores: Vec<(String, (f64, &Item, &'static str))> = series.par_iter()
+        .filter_map(|s| {
+            let sc = score_item(s, query);
+            if sc > 0.0 {
+                Some((s.id.clone(), (sc, s, "Series")))
+            } else {
+                None
+            }
+        })
+        .collect();
+
+    let channel_scores: Vec<(String, (f64, &Item, &'static str))> = channels.par_iter()
+        .filter_map(|c| {
+            let sc = score_item(c, query);
+            if sc > 0.0 {
+                Some((c.id.clone(), (sc, c, "Channel")))
+            } else {
+                None
+            }
+        })
+        .collect();
+
+    // Kombiniere alle Scores und dedupliziere nach bester Bewertung
+    for (id, (sc, item, kind)) in movie_scores.into_iter().chain(series_scores).chain(channel_scores) {
+        best_scores.entry(id)
+            .and_modify(|e| { if sc > e.0 { *e = (sc, item, kind); } })
+            .or_insert((sc, item, kind));
     }
     
     if best_scores.is_empty() {

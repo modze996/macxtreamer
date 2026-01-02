@@ -44,6 +44,7 @@ mod player;
 mod search;
 mod storage;
 mod ui_helpers;
+mod i18n;
 
 use ai_panel::render_ai_panel;
 use api::{fetch_categories, fetch_items, fetch_series_episodes};
@@ -53,8 +54,9 @@ use config::{read_config, save_config};
 use download_utils::{DownloadMeta, DownloadState, ScannedDownload, expand_download_dir};
 use downloads::{BulkOptions, sanitize_filename};
 use helpers::{file_path_to_uri, format_file_size};
+use i18n::t;
 use logger::log_line;
-use models::{Category, Config, FavItem, Item, RecentItem, Row};
+use models::{Category, Config, FavItem, Item, Language, RecentItem, Row};
 use ui_helpers::{colored_text_by_type, render_loading_spinner};
 impl ColumnKey {
     pub fn as_str(&self) -> &'static str {
@@ -286,6 +288,8 @@ struct MacXtreamer {
     view_stack: Vec<ViewState>,
     wisdom_gate_recommendations: Option<String>,
     _wisdom_gate_last_fetch: Option<std::time::Instant>,
+    ai_panel_tab: String,
+    recently_added_items: Vec<Item>,
     vlc_diag_lines: VecDeque<String>,
     vlc_diag_suggestion: Option<(u32,u32,u32)>,
     has_vlc: bool,
@@ -337,6 +341,7 @@ impl MacXtreamer {
     let persisted_filter_vod = config.filter_vod_language;
     let persisted_filter_series = config.filter_series_language;
     let default_search_langs = config.default_search_languages.clone();
+    let persisted_ai_panel_tab = config.ai_panel_tab.clone();
         let mut app = Self {
                         column_config: vec![
                             ColumnKey::Cover,
@@ -430,6 +435,8 @@ impl MacXtreamer {
             view_stack: Vec::new(),
             wisdom_gate_recommendations: cached_recommendations,
             _wisdom_gate_last_fetch: None,
+            ai_panel_tab: persisted_ai_panel_tab,
+            recently_added_items: Vec::new(),
             vlc_diag_lines: VecDeque::with_capacity(128),
             vlc_diag_suggestion: None,
             has_vlc: false,
@@ -1489,6 +1496,10 @@ impl MacXtreamer {
             if let Ok(mut rd) = tokio::fs::read_dir(&dir).await {
                 while let Ok(Some(entry)) = rd.next_entry().await {
                     let path = entry.path();
+                    let filename = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
+                    if filename == ".DS_Store" {
+                        continue;
+                    }
                     let ext = path.extension().and_then(|e| e.to_str());
                     if ext == Some("part") || ext == Some("json") {
                         continue;
@@ -1551,7 +1562,26 @@ impl MacXtreamer {
 
 impl MacXtreamer {
     fn render_wisdom_gate_panel(&mut self, ui: &mut egui::Ui) {
-        render_ai_panel(ui, &self.config, &self.wisdom_gate_recommendations, &self.tx);
+        let previous_tab = self.ai_panel_tab.clone();
+        
+        // Load recently added items when switching to that tab
+        if self.ai_panel_tab == "recently_added" && self.recently_added_items.is_empty() {
+            let cfg = self.config.clone();
+            let tx = self.tx.clone();
+            tokio::spawn(async move {
+                if let Ok(items) = crate::api::fetch_recently_added(&cfg).await {
+                    let _ = tx.send(Msg::RecentlyAddedItems(items));
+                }
+            });
+        }
+        
+        render_ai_panel(ui, &self.config, &self.wisdom_gate_recommendations, &self.recently_added_items, &mut self.ai_panel_tab, &self.tx);
+        
+        // Save preference if tab changed
+        if self.ai_panel_tab != previous_tab {
+            self.config.ai_panel_tab = self.ai_panel_tab.clone();
+            self.pending_save_config = true;
+        }
     }
 }
 
@@ -1566,8 +1596,6 @@ impl eframe::App for MacXtreamer {
         // Exponentielles Glätten
         if self.avg_frame_ms == 0.0 { self.avg_frame_ms = dt; } else { self.avg_frame_ms = self.avg_frame_ms * 0.9 + dt * 0.1; }
 
-        // Debug-Ausgabe: Zeige die aktuell konfigurierten Sprachen
-        println!("[MacXtreamer] Spracheinstellungen: {:?}", self.config.default_search_languages);
         // Theme anwenden (einmalig oder bei Wechsel)
         if !self.theme_applied {
             match self.current_theme.as_str() {
@@ -2421,6 +2449,9 @@ impl eframe::App for MacXtreamer {
                     }
                     self.wisdom_gate_recommendations = Some(content);
                 }
+                Msg::RecentlyAddedItems(items) => {
+                    self.recently_added_items = items;
+                }
                 Msg::LoadingError(err) => {
                     self.loading_error = err;
                     self.show_error_dialog = true;
@@ -3055,7 +3086,6 @@ impl eframe::App for MacXtreamer {
                         })
                         .map(|(i, c)| (i, c.clone()))
                         .collect();
-                        println!("[MacXtreamer] Gefilterte Live-Kategorien (per-column): {} von {}", filtered_playlists.len(), self.playlists.len());
                     
                     cols[0].horizontal(|ui| {
                         ui.label(RichText::new("Live").strong());
@@ -3134,10 +3164,6 @@ impl eframe::App for MacXtreamer {
                         })
                         .map(|(i, c)| (i, c.clone()))
                         .collect();
-                        println!("[MacXtreamer] Gefilterte VOD-Kategorien (per-column): {} von {}", filtered_vod.len(), self.vod_categories.len());
-                        if let Some(cat) = self.vod_categories.get(0) {
-                            println!("[MacXtreamer] Beispiel VOD-Kategorie: {}", cat.name);
-                        }
 
                     cols[1].horizontal(|ui| {
                         ui.label(RichText::new("VOD").strong());
@@ -3203,10 +3229,6 @@ impl eframe::App for MacXtreamer {
                         })
                         .map(|(i, c)| (i, c.clone()))
                         .collect();
-                        println!("[MacXtreamer] Gefilterte Serien-Kategorien (per-column): {} von {}", filtered_series.len(), self.series_categories.len());
-                        if let Some(cat) = self.series_categories.get(0) {
-                            println!("[MacXtreamer] Beispiel Serien-Kategorie: {}", cat.name);
-                        }
 
                     cols[2].horizontal(|ui| {
                         ui.label(RichText::new("Series").strong());
@@ -4345,6 +4367,15 @@ impl eframe::App for MacXtreamer {
                         {
                             draft.cover_height = ch;
                         }
+                    });
+                    ui.horizontal(|ui| {
+                        ui.label("UI Language");
+                        egui::ComboBox::from_id_source("language_selector")
+                            .selected_text(draft.language.name())
+                            .show_ui(ui, |ui| {
+                                ui.selectable_value(&mut draft.language, Language::English, Language::English.name());
+                                ui.selectable_value(&mut draft.language, Language::German, Language::German.name());
+                            });
                     });
                     ui.horizontal(|ui| {
                         ui.label("Text size scale");

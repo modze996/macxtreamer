@@ -1,6 +1,6 @@
 [package]
 name = "macxtreamer"
-version = "0.1.5"
+version = "0.1.6"
 edition = "2024"
 default-run = "macxtreamer"
 
@@ -23,6 +23,7 @@ once_cell = "1.19"
 arboard = "3.4"
 rfd = "0.14"
 chrono = "0.4.42"
+rayon = "1.8"
 
 [package.metadata.bundle]
 name = "macxtreamer"

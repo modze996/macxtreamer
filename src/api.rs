@@ -826,3 +826,45 @@ pub async fn fetch_openai_recommendations_safe(api_key: &str, prompt: &str, mode
     }
 }
 
+/// Fetch recent VOD/Series items (first 10 from each category, sorted by release date)
+pub async fn fetch_recently_added(cfg: &Config) -> Result<Vec<Item>, String> {
+    let mut all_items = Vec::new();
+    
+    // Fetch VOD categories
+    let vod_cats = fetch_categories(cfg, "get_vod_categories")
+        .await
+        .map_err(|e| e.to_string())?;
+    
+    // Take first 2 VOD categories and get first 10 items from each
+    for cat in vod_cats.iter().take(2) {
+        if let Ok(items) = fetch_items(cfg, "vod", &cat.id).await {
+            all_items.extend(items.into_iter().take(10));
+        }
+    }
+    
+    // Fetch Series categories  
+    let series_cats = fetch_categories(cfg, "get_series_categories")
+        .await
+        .map_err(|e| e.to_string())?;
+    
+    // Take first 2 Series categories and get first 10 items from each
+    for cat in series_cats.iter().take(2) {
+        if let Ok(items) = fetch_items(cfg, "series", &cat.id).await {
+            all_items.extend(items.into_iter().take(10));
+        }
+    }
+    
+    // Sort by release_date (newest first) - handle missing dates
+    all_items.sort_by(|a, b| {
+        match (&b.release_date, &a.release_date) {
+            (Some(date_b), Some(date_a)) => date_b.cmp(date_a),
+            (Some(_), None) => std::cmp::Ordering::Less,
+            (None, Some(_)) => std::cmp::Ordering::Greater,
+            (None, None) => std::cmp::Ordering::Equal,
+        }
+    });
+    
+    // Return first 20 items
+    Ok(all_items.into_iter().take(20).collect())
+}
+

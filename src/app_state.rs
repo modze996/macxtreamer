@@ -116,6 +116,7 @@ pub enum Msg {
     },
 
     WisdomGateRecommendations(String), // AI recommendations content
+    RecentlyAddedItems(Vec<Item>), // Recently added VOD/Series items
     VlcDiagnostics(String), // Captured VLC diagnostic output (truncated)
     VlcDiagUpdate { lines: Vec<String>, suggestion: Option<(u32,u32,u32)> },
     PlayerDetection { has_vlc: bool, has_mpv: bool, vlc_version: Option<String>, mpv_version: Option<String>, vlc_path: Option<String>, mpv_path: Option<String> },

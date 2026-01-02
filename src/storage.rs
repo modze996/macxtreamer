@@ -139,9 +139,6 @@ pub fn save_search_index(
     if let Ok(meta_json) = serde_json::to_string(&meta) {
         let _ = fs::write(search_index_meta_file(), meta_json);
     }
-    
-    println!("💾 Suchindex gespeichert: {} Movies, {} Series, {} Channels", 
-             movies.len(), series.len(), channels.len());
 }
 
 /// Load search index from disk if valid
@@ -159,7 +156,6 @@ pub fn load_search_index(
                 
                 // Check if server changed
                 if meta.server_hash != current_hash {
-                    println!("🔄 Server geändert, Index ungültig");
                     return None;
                 }
                 
@@ -170,7 +166,6 @@ pub fn load_search_index(
                     .as_secs();
                     
                 if now - meta.timestamp > 24 * 60 * 60 {
-                    println!("⏰ Index älter als 24h, wird neu erstellt");
                     return None;
                 }
                 
@@ -180,8 +175,6 @@ pub fn load_search_index(
                     let mut s = String::new();
                     if f.read_to_string(&mut s).is_ok() {
                         if let Ok(data) = serde_json::from_str::<SearchIndexData>(&s) {
-                            println!("📂 Suchindex geladen: {} Movies, {} Series, {} Channels",
-                                     data.movies.len(), data.series.len(), data.channels.len());
                             return Some((data.movies, data.series, data.channels, data.paths));
                         }
                     }

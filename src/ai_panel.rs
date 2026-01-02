@@ -1,18 +1,97 @@
 use eframe::egui;
 use crate::app_state::Msg;
-use crate::models::Config;
+use crate::models::{Config, Item, Language};
+use crate::i18n::t;
 use std::sync::mpsc::Sender;
 
-/// Render the AI recommendations panel (Wisdom-Gate, Perplexity, Cognora, Gemini, OpenAI)
+/// Render the AI recommendations panel with tabs (Wisdom-Gate, Perplexity, Cognora, Gemini, OpenAI) and Recently Added
 pub fn render_ai_panel(
+    ui: &mut egui::Ui,
+    config: &Config,
+    wisdom_gate_recommendations: &Option<String>,
+    recently_added_items: &[Item],
+    ai_panel_tab: &mut String,
+    tx: &Sender<Msg>,
+) {
+    let lang = config.language;
+    ui.heading(t("sidebar_title", lang));
+    ui.add_space(5.0);
+
+    // Tab selection
+    ui.horizontal(|ui| {
+        if ui.selectable_label(*ai_panel_tab == "recommendations", t("recommendations", lang)).clicked() {
+            *ai_panel_tab = "recommendations".to_string();
+        }
+        if ui.selectable_label(*ai_panel_tab == "recently_added", t("recently_added", lang)).clicked() {
+            *ai_panel_tab = "recently_added".to_string();
+        }
+    });
+    ui.separator();
+    ui.add_space(5.0);
+
+    match ai_panel_tab.as_str() {
+        "recently_added" => {
+            // Render recently added items
+            render_recently_added_tab(ui, recently_added_items, lang, tx);
+        }
+        _ => {
+            // Render AI recommendations (default)
+            render_recommendations_tab(ui, config, wisdom_gate_recommendations, tx);
+        }
+    }
+}
+
+fn render_recently_added_tab(ui: &mut egui::Ui, recently_added_items: &[Item], lang: Language, _tx: &Sender<Msg>) {
+    if recently_added_items.is_empty() {
+        ui.colored_label(egui::Color32::GRAY, t("loading_content", lang));
+        ui.label(t("loading_newest", lang));
+        
+        // Trigger loading (this will be called from main.rs)
+        return;
+    }
+
+    ui.label(egui::RichText::new(t("newly_added", lang))
+        .strong()
+        .size(16.0));
+    ui.add_space(8.0);
+
+    egui::ScrollArea::vertical()
+        .auto_shrink([false; 2])
+        .show(ui, |ui| {
+            for item in recently_added_items.iter().take(20) {
+                ui.horizontal(|ui| {
+                    ui.vertical(|ui| {
+                        ui.label(egui::RichText::new(&item.name)
+                            .strong()
+                            .size(13.0));
+                        if !item.plot.is_empty() {
+                            let truncated = if item.plot.len() > 80 {
+                                format!("{}...", &item.plot[..80])
+                            } else {
+                                item.plot.clone()
+                            };
+                            ui.label(egui::RichText::new(truncated)
+                                .size(11.0)
+                                .color(egui::Color32::GRAY));
+                        }
+                        if let Some(year) = &item.year {
+                            ui.label(egui::RichText::new(format!("📅 {}", year))
+                                .size(10.0)
+                                .color(egui::Color32::DARK_GRAY));
+                        }
+                    });
+                });
+                ui.separator();
+            }
+        });
+}
+
+fn render_recommendations_tab(
     ui: &mut egui::Ui,
     config: &Config,
     wisdom_gate_recommendations: &Option<String>,
     tx: &Sender<Msg>,
 ) {
-    ui.heading("🧠 AI Empfehlungen");
-    ui.add_space(5.0);
-
     // Check API Key based on selected provider
     let has_api_key = match config.ai_provider.as_str() {
         "perplexity" => !config.perplexity_api_key.is_empty(),
@@ -73,7 +152,6 @@ pub fn render_ai_panel(
             tokio::spawn(async move {
                 let content = match provider.as_str() {
                     "perplexity" => {
-                        println!("🔮 Lade neue Empfehlungen von Perplexity...");
                         crate::api::fetch_perplexity_recommendations_safe(
                             &perplexity_api_key,
                             &prompt,
@@ -81,7 +159,6 @@ pub fn render_ai_panel(
                         ).await
                     }
                     "cognora" => {
-                        println!("🧠 Lade neue Empfehlungen von Cognora...");
                         crate::api::fetch_cognora_recommendations_safe(
                             &cognora_api_key,
                             &prompt,
@@ -89,7 +166,6 @@ pub fn render_ai_panel(
                         ).await
                     }
                     "gemini" => {
-                        println!("💎 Lade neue Empfehlungen von Gemini...");
                         crate::api::fetch_gemini_recommendations_safe(
                             &gemini_api_key,
                             &prompt,
@@ -97,7 +173,6 @@ pub fn render_ai_panel(
                         ).await
                     }
                     "openai" => {
-                        println!("🤖 Lade neue Empfehlungen von OpenAI...");
                         crate::api::fetch_openai_recommendations_safe(
                             &openai_api_key,
                             &prompt,
@@ -105,7 +180,6 @@ pub fn render_ai_panel(
                         ).await
                     }
                     _ => {
-                        println!("🌐 Lade neue Empfehlungen von Wisdom-Gate...");
                         crate::api::fetch_wisdom_gate_recommendations_safe(
                             &wisdom_gate_api_key,
                             &prompt,
