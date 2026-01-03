@@ -45,8 +45,10 @@ mod search;
 mod storage;
 mod ui_helpers;
 mod i18n;
+mod updater;
 
 use ai_panel::render_ai_panel;
+use i18n::t;
 use api::{fetch_categories, fetch_items, fetch_series_episodes};
 use app_state::{Msg, SearchStatus, SortKey, ViewState};
 use cache::{clear_all_caches};
@@ -306,6 +308,11 @@ struct MacXtreamer {
     last_forced_repaint: std::time::Instant,
     pending_repaint_due_to_msg: bool,
     pending_player_redetect: bool,
+    
+    // Update system
+    show_update_dialog: bool,
+    available_update: Option<updater::UpdateInfo>,
+    checking_for_updates: bool,
 }
 
 impl MacXtreamer {
@@ -453,6 +460,11 @@ impl MacXtreamer {
             last_forced_repaint: std::time::Instant::now(),
             pending_repaint_due_to_msg: false,
             pending_player_redetect: false,
+            
+            // Update system  
+            show_update_dialog: false,
+            available_update: None,
+            checking_for_updates: false,
         };
 
         // Konfig prüfen – falls unvollständig, Config Dialog anzeigen
@@ -481,7 +493,22 @@ impl MacXtreamer {
             });
         }
 
+        // Auto-check for updates on startup (if enabled and not checked recently)
+        if app.config.check_for_updates && app.should_check_for_updates() {
+            app.check_for_updates();
+        }
+
         app
+    }
+    
+    fn should_check_for_updates(&self) -> bool {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+        
+        // Check once per day (86400 seconds)
+        now - self.config.last_update_check > 86400
     }
 
     fn reload_categories(&mut self) {
@@ -558,6 +585,49 @@ impl MacXtreamer {
             && !self.config.password.trim().is_empty()
     }
 
+    fn check_for_updates(&mut self) {
+        if !self.checking_for_updates {
+            self.checking_for_updates = true;
+            
+            // Update last check timestamp
+            let now = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_secs();
+            self.config.last_update_check = now;
+            self.pending_save_config = true;
+            
+            let tx = self.tx.clone();
+            
+            tokio::spawn(async move {
+                // Use current app version for comparison
+                let current_version = env!("CARGO_PKG_VERSION");
+                match updater::check_for_updates(current_version).await {
+                    Ok(update_info) => {
+                        if update_info.update_available {
+                            let _ = tx.send(Msg::UpdateAvailable(update_info));
+                        } else {
+                            let _ = tx.send(Msg::NoUpdateAvailable);
+                        }
+                    }
+                    Err(e) => {
+                        let _ = tx.send(Msg::UpdateError(format!("Update check failed: {}", e)));
+                    }
+                }
+            });
+        }
+    }
+    
+    fn install_update(&self, update_info: &updater::UpdateInfo) {
+        if let Some(ref download_url) = update_info.download_url {
+            if let Err(e) = updater::install_update(download_url) {
+                eprintln!("Failed to install update: {}", e);
+            }
+        } else {
+            eprintln!("No download URL available for update");
+        }
+    }
+
     fn effective_config(&self) -> &Config {
         if let Some(d) = self.config_draft.as_ref() { d } else { &self.config }
     }
@@ -594,7 +664,8 @@ impl MacXtreamer {
             writeln!(file, "#EXTM3U").ok();
             for (title, url) in entries { 
                 println!("[DEBUG] Adding episode: {} -> {}", title, url);
-                writeln!(file, "#EXTINF:-1,{}", title).ok();
+                // Use proper M3U format with EXTINF duration
+                writeln!(file, "#EXTINF:3600,{}", title).ok();
                 writeln!(file, "{}", url).map_err(|e| e.to_string())?; 
             }
             // Explicitly flush and close the file
@@ -609,7 +680,37 @@ impl MacXtreamer {
             println!("[DEBUG] M3U Content:\n{}", content);
         }
         
-        start_player(self.effective_config(), &path_str).map_err(|e| e)
+        // Try to play the first episode directly if M3U fails
+        if let Some((first_title, first_url)) = entries.first() {
+            println!("[DEBUG] VLC M3U fallback: Starting with first episode: {}", first_title);
+            
+            // First try the M3U playlist
+            println!("[DEBUG] Attempting to start M3U playlist with VLC...");
+            match start_player(self.effective_config(), &path_str) {
+                Ok(_) => {
+                    println!("[DEBUG] ✅ M3U playlist started successfully");
+                    Ok(())
+                }
+                Err(e) => {
+                    println!("[DEBUG] ❌ M3U playlist failed: {}", e);
+                    println!("[DEBUG] Trying direct URL fallback...");
+                    // Fallback to direct URL
+                    match start_player(self.effective_config(), first_url) {
+                        Ok(_) => {
+                            println!("[DEBUG] ✅ Direct URL playback started successfully");
+                            Ok(())
+                        }
+                        Err(e2) => {
+                            let error = format!("Both M3U playlist and direct URL failed: M3U={}, Direct={}", e, e2);
+                            println!("[DEBUG] ❌ {}", error);
+                            Err(error)
+                        }
+                    }
+                }
+            }
+        } else {
+            Err("No episodes to play".to_string())
+        }
     }
 
     fn generate_m3u_content(&self, _category_id: &str) -> String {
@@ -2473,6 +2574,19 @@ impl eframe::App for MacXtreamer {
                     self.show_error_dialog = true;
                     self.is_loading = false;
                 }
+                Msg::UpdateAvailable(update_info) => {
+                    self.available_update = Some(update_info);
+                    self.show_update_dialog = true;
+                    self.checking_for_updates = false;
+                }
+                Msg::NoUpdateAvailable => {
+                    self.checking_for_updates = false;
+                    // Optional: Show a brief notification that no update is available
+                }
+                Msg::UpdateError(error) => {
+                    self.checking_for_updates = false;
+                    self.last_error = Some(error);
+                }
             } // end match msg
         } // end while let Ok(msg)
     // Ultra Flicker Guard erhöht Intervall und erzwingt ausschließlich Event-basierte Repaints
@@ -2679,6 +2793,15 @@ impl eframe::App for MacXtreamer {
                     if ui.button("Settings").clicked() {
                         self.config_draft = Some(self.config.clone());
                         self.show_config = true;
+                    }
+                    
+                    // Update check button
+                    if self.checking_for_updates {
+                        ui.add_enabled(false, egui::Button::new(&t("checking_updates", self.config.language)));
+                    } else {
+                        if ui.button(&t("check_updates", self.config.language)).clicked() {
+                            self.check_for_updates();
+                        }
                     }
                     // Short hint about player URL placeholder
                     ui.add_space(6.0);
@@ -4676,6 +4799,30 @@ impl eframe::App for MacXtreamer {
                     }
                     });
                     
+                    ui.add_space(8.0);
+                    ui.heading(&t("update_settings", self.config.language));
+                    ui.separator();
+                    ui.checkbox(&mut draft.check_for_updates, &t("auto_check_updates", self.config.language))
+                        .on_hover_text(&t("auto_check_tooltip", self.config.language));
+                    
+                    ui.horizontal(|ui| {
+                        if ui.button(&t("check_now", self.config.language)).clicked() && !self.checking_for_updates {
+                            // Close config dialog and check for updates
+                            if let Some(d) = &self.config_draft {
+                                self.config = d.clone();
+                                self.pending_save_config = true;
+                            }
+                            self.config_draft = None;
+                            self.show_config = false;
+                            self.check_for_updates();
+                        }
+                        
+                        if self.checking_for_updates {
+                            ui.spinner();
+                            ui.label("Checking...");
+                        }
+                    });
+                    
                     ui.horizontal(|ui| {
                         if ui.button("Save").clicked() {
                             if let Some(d) = &self.config_draft {
@@ -4870,6 +5017,54 @@ impl eframe::App for MacXtreamer {
                     });
                 });
             self.show_error_dialog = open;
+        }
+
+        // Update dialog window
+        if self.show_update_dialog {
+            let mut open = self.show_update_dialog;
+            egui::Window::new(&t("update_available", self.config.language))
+                .collapsible(false)
+                .resizable(true)
+                .default_width(500.0)
+                .default_height(300.0)
+                .max_width(800.0)
+                .max_height(600.0)
+                .anchor(egui::Align2::CENTER_CENTER, egui::vec2(0.0, 0.0))
+                .open(&mut open)
+                .show(ctx, |ui| {
+                    if let Some(update) = self.available_update.clone() {
+                        ui.heading(format!("{} {}", t("new_version", self.config.language), update.latest_version));
+                        ui.add_space(8.0);
+                        
+                        if !update.release_notes.is_empty() {
+                            ui.label(format!("{}", t("release_notes", self.config.language)));
+                            egui::ScrollArea::vertical()
+                                .max_height(200.0)
+                                .auto_shrink([false, true])
+                                .show(ui, |ui| {
+                                    ui.style_mut().wrap = Some(true);
+                                    ui.label(&update.release_notes);
+                                });
+                            ui.add_space(8.0);
+                        }
+                        
+                        ui.separator();
+                        ui.add_space(4.0);
+                        
+                        ui.horizontal(|ui| {
+                            if ui.button(&t("download_update", self.config.language)).clicked() {
+                                self.install_update(&update);
+                                self.show_update_dialog = false;
+                            }
+                            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                                if ui.button(&t("later", self.config.language)).clicked() {
+                                    self.show_update_dialog = false;
+                                }
+                            });
+                        });
+                    }
+                });
+            self.show_update_dialog = open;
         }
 
         // (Bottom panel already rendered above CentralPanel)

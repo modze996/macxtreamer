@@ -51,6 +51,30 @@ pub fn t(key: &str, lang: Language) -> String {
         ("enable_downloads_hint", Language::English) => "Enable downloads in settings to use this feature.",
         ("enable_downloads_hint", Language::German) => "Aktiviere Downloads in den Einstellungen um diese Funktion zu nutzen.",
         
+        // Updates
+        ("update_available", Language::English) => "🔄 Update Available",
+        ("update_available", Language::German) => "🔄 Update verfügbar",
+        ("new_version", Language::English) => "New Version:",
+        ("new_version", Language::German) => "Neue Version:",
+        ("release_notes", Language::English) => "Release Notes:",
+        ("release_notes", Language::German) => "Versionshinweise:",
+        ("download_update", Language::English) => "📥 Download Update",
+        ("download_update", Language::German) => "📥 Update herunterladen",
+        ("later", Language::English) => "Later",
+        ("later", Language::German) => "Später",
+        ("check_updates", Language::English) => "🔄 Updates",
+        ("check_updates", Language::German) => "🔄 Updates",
+        ("checking_updates", Language::English) => "🔄 Checking...",
+        ("checking_updates", Language::German) => "🔄 Prüfe...",
+        ("update_settings", Language::English) => "🔄 Update Settings",
+        ("update_settings", Language::German) => "🔄 Update Einstellungen",
+        ("auto_check_updates", Language::English) => "Automatically check for updates",
+        ("auto_check_updates", Language::German) => "Automatisch nach Updates suchen",
+        ("auto_check_tooltip", Language::English) => "Checks for new versions at startup",
+        ("auto_check_tooltip", Language::German) => "Prüft beim Start auf neue Versionen",
+        ("check_now", Language::English) => "🔄 Check for Updates Now",
+        ("check_now", Language::German) => "🔄 Jetzt nach Updates suchen",
+        
         // Fallback
         _ => key,
     }.to_string()

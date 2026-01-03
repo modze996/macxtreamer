@@ -195,6 +195,10 @@ pub struct Config {
     pub ai_panel_tab: String, // Persistiert: Aktuell ausgewählter Tab in AI Panel ("recommendations" | "recently_added")
     #[serde(default)]
     pub language: Language, // UI Language (English | German)
+    #[serde(default)]
+    pub check_for_updates: bool, // Auto-check for updates on startup
+    #[serde(default)]
+    pub last_update_check: u64, // Unix timestamp of last update check
 }
 
 impl Default for Config {
@@ -271,6 +275,8 @@ impl Default for Config {
             filter_series_language: false,
             ai_panel_tab: "recommendations".to_string(),
             language: Language::English,
+            check_for_updates: true,
+            last_update_check: 0,
         }
     }
 }

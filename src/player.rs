@@ -510,7 +510,8 @@ fn check_player_availability(player: &str) -> bool {
             "/usr/local/bin/vlc",
             "/opt/homebrew/bin/vlc",
             "/usr/bin/vlc",
-            "/Applications/VLC.app/Contents/MacOS/VLC"
+            "/Applications/VLC.app/Contents/MacOS/VLC",
+            "/System/Applications/VLC.app/Contents/MacOS/VLC"
         ],
         _ => vec![]
     };
@@ -549,6 +550,8 @@ fn resolve_player_path(player: &str) -> Option<String> {
             "/usr/local/bin/vlc",
             "/usr/bin/vlc",
             "/Applications/VLC.app/Contents/MacOS/VLC",
+            "/System/Applications/VLC.app/Contents/MacOS/VLC",
+            "/Applications/VLC.app/Contents/MacOS/VLC",
         ],
         _ => vec![],
     };
@@ -571,16 +574,51 @@ fn build_player_command(player: &str) -> Command {
 }
 
 fn spawn_player(player: &str, args: &[String]) -> std::io::Result<std::process::Child> {
+    // First try direct path
     if let Some(path) = resolve_player_path(player) {
-        Command::new(path).args(args).stdout(Stdio::null()).stderr(Stdio::null()).spawn()
-    } else {
-        let app_name = if player.eq_ignore_ascii_case("vlc") { "VLC" } else { "mpv" };
-        // open -a App --args <args...>
-        let mut parts: Vec<String> = Vec::new();
-        parts.push("-a".into()); parts.push(app_name.into()); parts.push("--args".into());
-        parts.extend(args.iter().cloned());
-        Command::new("open").args(&parts).stdout(Stdio::null()).stderr(Stdio::null()).spawn()
+        log_line(&format!("[DEBUG] Starting {} with direct path: {}", player, path));
+        return Command::new(path).args(args).stdout(Stdio::null()).stderr(Stdio::null()).spawn();
     }
+    
+    // For VLC on macOS, try different approaches
+    if player.eq_ignore_ascii_case("vlc") {
+        // Check if we're dealing with a file (like M3U)
+        let has_file = args.iter().any(|arg| {
+            std::path::Path::new(arg).exists() || arg.ends_with(".m3u") || arg.ends_with(".m3u8")
+        });
+        
+        if has_file {
+            log_line("[DEBUG] VLC with file detected, using 'open' command for better compatibility");
+            // Use 'open' with the file directly
+            if let Some(file_arg) = args.iter().find(|arg| std::path::Path::new(arg).exists()) {
+                return Command::new("open")
+                    .arg("-a")
+                    .arg("VLC")
+                    .arg(file_arg)
+                    .stdout(Stdio::null())
+                    .stderr(Stdio::null())
+                    .spawn();
+            }
+        }
+        
+        // Fallback to regular open -a approach
+        log_line("[DEBUG] VLC fallback to open -a with args");
+        let mut parts: Vec<String> = Vec::new();
+        parts.push("-a".into());
+        parts.push("VLC".into());
+        parts.push("--args".into());
+        parts.extend(args.iter().cloned());
+        return Command::new("open").args(&parts).stdout(Stdio::null()).stderr(Stdio::null()).spawn();
+    }
+    
+    // For mpv, use standard open approach
+    let app_name = if player.eq_ignore_ascii_case("vlc") { "VLC" } else { "mpv" };
+    let mut parts: Vec<String> = Vec::new();
+    parts.push("-a".into()); 
+    parts.push(app_name.into()); 
+    parts.push("--args".into());
+    parts.extend(args.iter().cloned());
+    Command::new("open").args(&parts).stdout(Stdio::null()).stderr(Stdio::null()).spawn()
 }
 
 fn spawn_player_capture(player: &str, args: &[&str]) -> std::io::Result<std::process::Output> {

@@ -124,6 +124,11 @@ pub enum Msg {
     StopDiagnostics,
     DiagnosticsStopped,
     LoadingError(String), // Error during loading operations
+    
+    // Update system
+    UpdateAvailable(crate::updater::UpdateInfo),
+    NoUpdateAvailable,
+    UpdateError(String),
 }
 
 #[derive(Debug, Clone)]
