@@ -585,13 +585,30 @@ impl MacXtreamer {
         use std::io::Write;
         let ts = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_else(|_| std::time::Duration::from_secs(0)).as_secs();
         let path = std::env::temp_dir().join(format!("macxtreamer_playlist_{}.m3u", ts));
-        let mut file = std::fs::File::create(&path).map_err(|e| e.to_string())?;
-        writeln!(file, "#EXTM3U").ok();
-        for (title, url) in entries { 
-            writeln!(file, "#EXTINF:-1,{}", title).ok();
-            writeln!(file, "{}", url).map_err(|e| e.to_string())?; 
-        }
+        
+        // Debug: Log playlist creation
+        println!("[DEBUG] Creating binge watch playlist with {} episodes", entries.len());
+        
+        {
+            let mut file = std::fs::File::create(&path).map_err(|e| e.to_string())?;
+            writeln!(file, "#EXTM3U").ok();
+            for (title, url) in entries { 
+                println!("[DEBUG] Adding episode: {} -> {}", title, url);
+                writeln!(file, "#EXTINF:-1,{}", title).ok();
+                writeln!(file, "{}", url).map_err(|e| e.to_string())?; 
+            }
+            // Explicitly flush and close the file
+            file.flush().map_err(|e| e.to_string())?;
+        } // File is dropped and closed here
+        
         let path_str = path.to_string_lossy().to_string();
+        println!("[DEBUG] Playing M3U playlist: {}", path_str);
+        
+        // Verify file exists and has content
+        if let Ok(content) = std::fs::read_to_string(&path) {
+            println!("[DEBUG] M3U Content:\n{}", content);
+        }
+        
         start_player(self.effective_config(), &path_str).map_err(|e| e)
     }
 
