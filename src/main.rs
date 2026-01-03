@@ -3959,8 +3959,36 @@ impl eframe::App for MacXtreamer {
                                             if self.config.address.is_empty() || self.config.username.is_empty() || self.config.password.is_empty() {
                                                 self.last_error = Some("Please set address/username/password in Settings".into());
                                             } else {
-                                                let play_url = self.resolve_play_url(r);
-                                                let _ = start_player(self.effective_config(), &play_url);
+                                                // Binge Watch: For Series Episodes, create playlist from current episode onwards
+                                                if r.info == "SeriesEpisode" {
+                                                    let current_idx = rows.iter().position(|row| row.id == r.id);
+                                                    if let Some(idx) = current_idx {
+                                                        // Create playlist from current episode onwards
+                                                        let playlist_entries: Vec<(String, String)> = rows[idx..]
+                                                            .iter()
+                                                            .filter(|row| row.info == "SeriesEpisode")
+                                                            .map(|row| {
+                                                                let url = build_url_by_type(&self.config, &row.id, &row.info, row.container_extension.as_deref());
+                                                                (row.name.clone(), url)
+                                                            })
+                                                            .collect();
+                                                        
+                                                        if playlist_entries.len() > 1 {
+                                                            // Play as playlist (binge watch)
+                                                            if let Err(e) = self.create_and_play_m3u(&playlist_entries) {
+                                                                self.last_error = Some(format!("Failed to create binge watch playlist: {}", e));
+                                                            }
+                                                        } else {
+                                                            // Single episode
+                                                            let play_url = self.resolve_play_url(r);
+                                                            let _ = start_player(self.effective_config(), &play_url);
+                                                        }
+                                                    }
+                                                } else {
+                                                    // Regular single play for movies/channels
+                                                    let play_url = self.resolve_play_url(r);
+                                                    let _ = start_player(self.effective_config(), &play_url);
+                                                }
                                             }
                                             let rec = RecentItem {
                                                 id: r.id.clone(),
