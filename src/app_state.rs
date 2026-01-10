@@ -129,6 +129,12 @@ pub enum Msg {
     UpdateAvailable(crate::updater::UpdateInfo),
     NoUpdateAvailable,
     UpdateError(String),
+    
+    // EPG data
+    EpgLoaded {
+        stream_id: String,
+        program: Option<String>,
+    },
 }
 
 #[derive(Debug, Clone)]

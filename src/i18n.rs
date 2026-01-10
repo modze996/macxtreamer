@@ -50,6 +50,14 @@ pub fn t(key: &str, lang: Language) -> String {
         ("no_downloads", Language::German) => "📭 Keine Downloads",
         ("enable_downloads_hint", Language::English) => "Enable downloads in settings to use this feature.",
         ("enable_downloads_hint", Language::German) => "Aktiviere Downloads in den Einstellungen um diese Funktion zu nutzen.",
+        ("download", Language::English) => "Download",
+        ("download", Language::German) => "Download",
+        ("download_from_here", Language::English) => "Download from here",
+        ("download_from_here", Language::German) => "Von hier downloaden",
+        ("download_from_here_tooltip", Language::English) => "Download all episodes starting from this one",
+        ("download_from_here_tooltip", Language::German) => "Alle Episoden ab hier herunterladen",
+        ("episodes_queued", Language::English) => "episodes queued for download starting from",
+        ("episodes_queued", Language::German) => "Episoden zum Download ab",
         
         // Updates
         ("update_available", Language::English) => "🔄 Update Available",
@@ -74,6 +82,16 @@ pub fn t(key: &str, lang: Language) -> String {
         ("auto_check_tooltip", Language::German) => "Prüft beim Start auf neue Versionen",
         ("check_now", Language::English) => "🔄 Check for Updates Now",
         ("check_now", Language::German) => "🔄 Jetzt nach Updates suchen",
+        
+        // VPN/Download errors  
+        ("vpn_error_458", Language::English) => "VPN/Proxy detected by server. Try disconnecting VPN or using different server location.",
+        ("vpn_error_458", Language::German) => "VPN/Proxy vom Server erkannt. Versuche VPN zu trennen oder anderen Server zu verwenden.",
+        ("vpn_error_403", Language::English) => "Access forbidden. Server may be blocking VPN traffic.",
+        ("vpn_error_403", Language::German) => "Zugriff verweigert. Server blockiert möglicherweise VPN-Traffic.",
+        ("vpn_error_429", Language::English) => "Too many requests. Server may be rate limiting VPN traffic.",
+        ("vpn_error_429", Language::German) => "Zu viele Anfragen. Server begrenzt möglicherweise VPN-Traffic.",
+        ("vpn_network_error", Language::English) => "Network timeout - try disconnecting VPN if using one.",
+        ("vpn_network_error", Language::German) => "Netzwerk-Timeout - versuche VPN zu trennen falls verwendet.",
         
         // Fallback
         _ => key,

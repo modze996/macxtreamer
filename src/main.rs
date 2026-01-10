@@ -25,6 +25,7 @@ pub enum ColumnKey {
     Genre,
     Languages,
     Path,
+    CurrentProgram,
     Actions,
 }
 
@@ -72,6 +73,7 @@ impl ColumnKey {
             ColumnKey::Genre => "genre",
             ColumnKey::Languages => "languages",
             ColumnKey::Path => "path",
+            ColumnKey::CurrentProgram => "current_program",
             ColumnKey::Actions => "actions",
         }
     }
@@ -87,6 +89,7 @@ impl ColumnKey {
             "genre" => Some(ColumnKey::Genre),
             "languages" => Some(ColumnKey::Languages),
             "path" => Some(ColumnKey::Path),
+            "current_program" => Some(ColumnKey::CurrentProgram),
             "actions" => Some(ColumnKey::Actions),
             _ => None,
         }
@@ -309,6 +312,10 @@ struct MacXtreamer {
     pending_repaint_due_to_msg: bool,
     pending_player_redetect: bool,
     
+    // EPG data: stream_id -> current program info
+    epg_data: HashMap<String, String>,
+    epg_loading: HashSet<String>, // Track which channels are loading EPG
+    
     // Update system
     show_update_dialog: bool,
     available_update: Option<updater::UpdateInfo>,
@@ -356,6 +363,7 @@ impl MacXtreamer {
                             ColumnKey::Rating,
                             ColumnKey::Genre,
                             ColumnKey::Languages,
+                            ColumnKey::CurrentProgram,
                             ColumnKey::Actions,
                         ],
             config,
@@ -430,8 +438,9 @@ impl MacXtreamer {
                 .tcp_keepalive(Some(Duration::from_secs(60)))
                 .timeout(Duration::from_secs(7200))
                 .connect_timeout(Duration::from_secs(30))
-                .user_agent("MacXtreamer/1.0")
+                .user_agent("VLC/3.0.18 LibVLC/3.0.18")
                 .danger_accept_invalid_certs(true)
+                .redirect(reqwest::redirect::Policy::limited(5))
                 .build()
                 .unwrap_or_else(|_| reqwest::Client::new()),
             last_download_scan: None,
@@ -460,6 +469,10 @@ impl MacXtreamer {
             last_forced_repaint: std::time::Instant::now(),
             pending_repaint_due_to_msg: false,
             pending_player_redetect: false,
+            
+            // EPG data
+            epg_data: HashMap::new(),
+            epg_loading: HashSet::new(),
             
             // Update system  
             show_update_dialog: false,
@@ -835,6 +848,87 @@ impl MacXtreamer {
             let res = fetch_series_episodes(&cfg, &series_id).await.map_err(|e| e.to_string());
             let _ = tx.send(Msg::SeriesEpisodesForDownload { series_id, episodes: res });
         });
+    }
+    
+    // Lade EPG-Daten für einen Live-Kanal
+    fn spawn_load_epg(&mut self, stream_id: String) {
+        if !self.config_is_complete() { return; }
+        if self.epg_loading.contains(&stream_id) { return; } // Already loading
+        
+        self.epg_loading.insert(stream_id.clone());
+        let tx = self.tx.clone();
+        let cfg = self.config.clone();
+        let stream_id_clone = stream_id.clone();
+        
+        tokio::spawn(async move {
+            use crate::api::fetch_short_epg;
+            match fetch_short_epg(&cfg, &stream_id_clone).await {
+                Ok(Some(program)) => {
+                    // Format: "Title (until HH:MM)"
+                    let program_text = if !program.end.is_empty() {
+                        // Try to extract just the time (HH:MM) from the end timestamp
+                        let time_part = program.end.split_whitespace().last().unwrap_or(&program.end);
+                        format!("{} (bis {})", program.title, time_part)
+                    } else {
+                        program.title
+                    };
+                    let _ = tx.send(Msg::EpgLoaded { 
+                        stream_id: stream_id_clone, 
+                        program: Some(program_text) 
+                    });
+                }
+                Ok(None) => {
+                    // No EPG data available - this is normal for many channels
+                    let _ = tx.send(Msg::EpgLoaded { 
+                        stream_id: stream_id_clone, 
+                        program: None 
+                    });
+                }
+                Err(e) => {
+                    // Only log actual network errors, not "no data" situations
+                    if e.is_timeout() || e.is_connect() {
+                        eprintln!("EPG network error for {}: {}", stream_id_clone, e);
+                    }
+                    let _ = tx.send(Msg::EpgLoaded { 
+                        stream_id: stream_id_clone, 
+                        program: None 
+                    });
+                }
+            }
+        });
+    }
+
+    // Download all episodes starting from a specific episode
+    fn download_episodes_from_here(&mut self, rows: &[Row], starting_row: &Row) {
+        if !self.config.enable_downloads { return; }
+        
+        // Find the index of the starting episode
+        let start_idx = rows.iter().position(|row| row.id == starting_row.id);
+        if let Some(idx) = start_idx {
+            // Get all episodes from this point onwards
+            let episodes_to_download: Vec<&Row> = rows[idx..]
+                .iter()
+                .filter(|row| row.info == "SeriesEpisode")
+                .collect();
+            
+            println!("📥 Queuing {} episodes for download starting from: {}", 
+                episodes_to_download.len(), starting_row.name);
+            
+            let count = episodes_to_download.len();
+            
+            // Queue each episode for download
+            for episode in &episodes_to_download {
+                self.spawn_download(episode);
+            }
+            
+            // Show confirmation message using localized strings
+            let message = format!("{} {} {} '{}'", 
+                count,
+                t("episodes_queued", self.config.language), 
+                "", // connector word  
+                starting_row.name);
+            self.last_error = Some(message);
+        }
     }
 
     // Einzelnes Cover abrufen (falls nicht bereits vorhanden oder in Arbeit)
@@ -1474,7 +1568,7 @@ impl MacXtreamer {
                 .tcp_keepalive(Some(Duration::from_secs(60)))
                 .timeout(Duration::from_secs(7200))
                 .connect_timeout(Duration::from_secs(30))
-                .user_agent("MacXtreamer/1.0")
+                .user_agent("VLC/3.0.18 LibVLC/3.0.18")
                 .danger_accept_invalid_certs(true)
                 .build()
                 .unwrap();
@@ -1503,7 +1597,29 @@ impl MacXtreamer {
                 }
                 let mut req = client.get(&url);
                 if existing_len > 0 { req = req.header(reqwest::header::RANGE, format!("bytes={}-", existing_len)); }
-                let resp = match req.send().await { Ok(r)=>r, Err(e)=>{ let err = format!("Network error: {}", e); println!("{}", err); log_line(&err); attempt+=1; if attempt>=attempts_max { let _=tx.send(Msg::DownloadError { id: id.clone(), error: err }); return; } else { tokio::time::sleep(Duration::from_millis(delay_ms)).await; continue; } } };
+                let resp = match req.send().await { 
+                    Ok(r) => r, 
+                    Err(e) => { 
+                        let err_msg = e.to_string();
+                        let err = if err_msg.contains("timeout") || err_msg.contains("connection") {
+                            format!("Network error (VPN-related?): {}. Try disconnecting VPN if using one.", e)
+                        } else {
+                            format!("Network error: {}", e)
+                        };
+                        println!("{}", err); 
+                        log_line(&err); 
+                        attempt+=1; 
+                        if attempt>=attempts_max { 
+                            let _=tx.send(Msg::DownloadError { id: id.clone(), error: err }); 
+                            return; 
+                        } else { 
+                            // Longer delay for potential VPN issues
+                            let retry_delay = if err_msg.contains("timeout") { delay_ms * 2 } else { delay_ms };
+                            tokio::time::sleep(Duration::from_millis(retry_delay)).await; 
+                            continue; 
+                        } 
+                    } 
+                };
                 if resp.status() == reqwest::StatusCode::RANGE_NOT_SATISFIABLE {
                     // Möglicherweise schon komplett -> rename falls final nicht existiert
                     if !target_path.exists() { let _ = tokio::fs::rename(&tmp_path, &target_path).await; }
@@ -1511,8 +1627,42 @@ impl MacXtreamer {
                     return;
                 }
                 if !resp.status().is_success() {
-                    let err = format!("HTTP {}", resp.status()); println!("{}", err); log_line(&err);
-                    attempt+=1; if attempt>=attempts_max { let _=tx.send(Msg::DownloadError { id: id.clone(), error: err }); return; } else { tokio::time::sleep(Duration::from_millis(delay_ms)).await; continue; }
+                    let status_code = resp.status();
+                    let err = match status_code.as_u16() {
+                        458 => "HTTP 458: Server anti-bot protection triggered. Retrying with delay...".to_string(),
+                        403 => "HTTP 403: Access forbidden. Server may be blocking requests.".to_string(),
+                        429 => "HTTP 429: Too many requests. Server rate limiting active.".to_string(),
+                        451 => "HTTP 451: Content unavailable for legal reasons.".to_string(),
+                        _ => format!("HTTP {}: Server error", status_code)
+                    };
+                    println!("{}", err); 
+                    log_line(&err);
+                    
+                    // For HTTP 458 and 403, use exponential backoff
+                    let is_anti_bot = matches!(status_code.as_u16(), 458 | 403);
+                    let retry_delay = if is_anti_bot {
+                        // Exponential backoff: 2s, 4s, 8s, etc.
+                        delay_ms * 2u64.pow(attempt as u32)
+                    } else if status_code.as_u16() == 429 {
+                        delay_ms * 3
+                    } else {
+                        delay_ms
+                    };
+                    
+                    attempt+=1; 
+                    if attempt>=attempts_max { 
+                        let final_err = if is_anti_bot {
+                            format!("{} (Hint: Server may be detecting automated downloads. Try downloading manually or waiting a few minutes)", err)
+                        } else {
+                            err
+                        };
+                        let _=tx.send(Msg::DownloadError { id: id.clone(), error: final_err }); 
+                        return; 
+                    } else { 
+                        println!("Retrying in {}ms (attempt {}/{})...", retry_delay, attempt, attempts_max);
+                        tokio::time::sleep(Duration::from_millis(retry_delay)).await; 
+                        continue; 
+                    }
                 }
                 // Total Größe bestimmen
                 let total_opt = if resp.status()==reqwest::StatusCode::PARTIAL_CONTENT {
@@ -2105,6 +2255,19 @@ impl eframe::App for MacXtreamer {
                                         }),
                                     });
                                 }
+                                
+                                // Auto-load EPG data for live channels
+                                if kind == "subplaylist" {
+                                    let stream_ids: Vec<String> = self.content_rows.iter()
+                                        .filter(|r| r.info == "Channel")
+                                        .take(20) // Limit to first 20 channels to avoid overwhelming the server
+                                        .map(|r| r.id.clone())
+                                        .collect();
+                                    
+                                    for stream_id in stream_ids {
+                                        self.spawn_load_epg(stream_id);
+                                    }
+                                }
                             } else {
                                 println!("⚠️ Ignoriere ItemsLoaded während Suchansicht (current_view={:?})", self.current_view);
                             }
@@ -2586,6 +2749,16 @@ impl eframe::App for MacXtreamer {
                 Msg::UpdateError(error) => {
                     self.checking_for_updates = false;
                     self.last_error = Some(error);
+                }
+                Msg::EpgLoaded { stream_id, program } => {
+                    self.epg_loading.remove(&stream_id);
+                    if let Some(prog_text) = program {
+                        self.epg_data.insert(stream_id, prog_text);
+                    } else {
+                        self.epg_data.insert(stream_id, "Keine Programm-Info".to_string());
+                    }
+                    // Trigger repaint to show updated EPG data
+                    self.pending_repaint_due_to_msg = true;
                 }
             } // end match msg
         } // end while let Ok(msg)
@@ -3949,6 +4122,7 @@ impl eframe::App for MacXtreamer {
                     ColumnKey::Genre => table = table.column(egui_extras::Column::initial(200.0)),
                     ColumnKey::Languages => table = table.column(egui_extras::Column::initial(150.0)),
                     ColumnKey::Path => table = table.column(egui_extras::Column::initial(220.0)),
+                    ColumnKey::CurrentProgram => table = table.column(egui_extras::Column::initial(250.0)),
                     ColumnKey::Actions => table = table.column(egui_extras::Column::remainder().at_least(320.0)),
                 }
             }
@@ -4013,6 +4187,7 @@ impl eframe::App for MacXtreamer {
                             }
                         }); },
                         ColumnKey::Path => { header.col(|ui| { ui.strong("Path"); }); },
+                        ColumnKey::CurrentProgram => { header.col(|ui| { ui.strong("Current Program"); }); },
                         ColumnKey::Actions => { header.col(|ui| { ui.strong("Action"); }); },
                     }
                 }
@@ -4063,6 +4238,20 @@ impl eframe::App for MacXtreamer {
                             ColumnKey::Genre => { row.col(|ui| { ui.label(r.genre.clone().unwrap_or_default()); }); },
                             ColumnKey::Languages => { row.col(|ui| { ui.label(r.audio_languages.clone().unwrap_or_default()); }); },
                             ColumnKey::Path => { row.col(|ui| { ui.label(r.path.clone().unwrap_or_default()); }); },
+                            ColumnKey::CurrentProgram => { row.col(|ui| {
+                                // Only show for live channels
+                                if r.info == "Channel" {
+                                    if let Some(program) = self.epg_data.get(&r.id) {
+                                        ui.label(program);
+                                    } else if self.epg_loading.contains(&r.id) {
+                                        ui.spinner();
+                                    } else {
+                                        ui.label("--");
+                                    }
+                                } else {
+                                    ui.label("");
+                                }
+                            }); },
                             ColumnKey::Actions => { row.col(|ui| {
                                 ui.horizontal_wrapped(|ui| {
                                     if r.info == "Series" {
@@ -4144,8 +4333,17 @@ impl eframe::App for MacXtreamer {
                                             ui.output_mut(|o| o.copied_text = url.clone());
                                         }
                                         if r.info == "Movie" || r.info == "SeriesEpisode" || r.info == "Channel" {
-                                                if self.config.enable_downloads && ui.small_button("Download").on_hover_text("Download this item").clicked() {
+                                                if self.config.enable_downloads && ui.small_button(&t("download", self.config.language)).on_hover_text("Download this item").clicked() {
                                                     self.spawn_download(r);
+                                                }
+                                                
+                                                // Add "Download from here" for series episodes
+                                                if r.info == "SeriesEpisode" && self.config.enable_downloads {
+                                                    if ui.small_button(&t("download_from_here", self.config.language))
+                                                        .on_hover_text(&t("download_from_here_tooltip", self.config.language))
+                                                        .clicked() {
+                                                        self.download_episodes_from_here(&rows, r);
+                                                    }
                                                 }
                                         }
                                     }

@@ -6,6 +6,29 @@ use std::hash::{Hash, Hasher};
 use std::time::{SystemTime, UNIX_EPOCH};
 use tokio::time::Duration;
 
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct EpgProgram {
+    pub title: String,
+    pub start: String,
+    pub end: String,
+    pub description: Option<String>,
+}
+
+/// Try to decode base64 string, return original if decoding fails
+fn try_decode_base64(s: &str) -> String {
+    use base64::{Engine as _, engine::general_purpose};
+    
+    // Check if string looks like base64 (contains only base64 chars)
+    if s.chars().all(|c| c.is_ascii_alphanumeric() || c == '+' || c == '/' || c == '=') {
+        if let Ok(decoded_bytes) = general_purpose::STANDARD.decode(s) {
+            if let Ok(decoded_str) = String::from_utf8(decoded_bytes) {
+                return decoded_str;
+            }
+        }
+    }
+    s.to_string()
+}
+
 pub const CACHE_TTL_CATEGORIES_SECS: u64 = 6 * 60 * 60; // 6h
 pub const CACHE_TTL_ITEMS_SECS: u64 = 3 * 60 * 60; // 3h
 pub const CACHE_TTL_EPISODES_SECS: u64 = 12 * 60 * 60; // 12h
@@ -167,6 +190,109 @@ pub async fn fetch_series_episodes(cfg: &Config, series_id: &str) -> Result<Vec<
         Ok::<Vec<Episode>, reqwest::Error>(out)
     }.await;
     match net { Ok(eps) => { save_cache(&key, &eps); Ok(eps) } Err(e) => { if let Some(stale) = load_stale_cache::<Vec<Episode>>(&key) { Ok(stale) } else { Err(e) } } } }
+
+/// Fetch current EPG program for a live channel
+pub async fn fetch_short_epg(cfg: &Config, stream_id: &str) -> Result<Option<EpgProgram>, reqwest::Error> {
+    let key = format!("epg_{}", stream_id);
+    // Cache EPG for 5 minutes (programs change)
+    if let Some(cached) = load_cache::<Option<EpgProgram>>(&key, 300) { 
+        return Ok(cached); 
+    }
+    
+    let url = format!(
+        "{}/player_api.php?username={}&password={}&action=get_short_epg&stream_id={}",
+        cfg.address, cfg.username, cfg.password, stream_id
+    );
+    
+    let net = async {
+        let client = reqwest::Client::builder()
+            .timeout(std::time::Duration::from_secs(5))
+            .build()?;
+        let res = client.get(&url).send().await?;
+        
+        // Read response as text first to handle empty/invalid JSON
+        let text = res.text().await?;
+        
+        // Handle empty responses gracefully
+        if text.trim().is_empty() {
+            return Ok(None);
+        }
+        
+        // Try to parse as JSON
+        let json: Value = match serde_json::from_str(&text) {
+            Ok(j) => j,
+            Err(_) => {
+                // Invalid JSON - many channels don't have EPG data
+                return Ok(None);
+            }
+        };
+        
+        // Extract current/next program
+        let program = if let Some(epg_listings) = json.get("epg_listings").and_then(|x| x.as_array()) {
+            if epg_listings.is_empty() {
+                return Ok(None);
+            }
+            
+            // Find currently running program
+            let now = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_secs() as i64;
+            
+            epg_listings.iter()
+                .find(|item| {
+                    let start = item.get("start_timestamp")
+                        .and_then(|x| x.as_str())
+                        .and_then(|s| s.parse::<i64>().ok())
+                        .unwrap_or(0);
+                    let stop = item.get("stop_timestamp")
+                        .and_then(|x| x.as_str())
+                        .and_then(|s| s.parse::<i64>().ok())
+                        .unwrap_or(0);
+                    now >= start && now < stop
+                })
+                .or_else(|| epg_listings.first()) // Fallback to first program
+                .map(|item| {
+                    let raw_title = item.get("title")
+                        .and_then(|x| x.as_str())
+                        .unwrap_or("");
+                    let raw_desc = item.get("description")
+                        .and_then(|x| x.as_str());
+                    
+                    EpgProgram {
+                        title: try_decode_base64(raw_title),
+                        start: item.get("start")
+                            .and_then(|x| x.as_str())
+                            .unwrap_or("")
+                            .to_string(),
+                        end: item.get("stop")
+                            .and_then(|x| x.as_str())
+                            .unwrap_or("")
+                            .to_string(),
+                        description: raw_desc.map(|s| try_decode_base64(s)),
+                    }
+                })
+        } else {
+            None
+        };
+        
+        Ok::<Option<EpgProgram>, reqwest::Error>(program)
+    }.await;
+    
+    match net {
+        Ok(program) => {
+            save_cache(&key, &program);
+            Ok(program)
+        }
+        Err(e) => {
+            if let Some(stale) = load_stale_cache::<Option<EpgProgram>>(&key) {
+                Ok(stale)
+            } else {
+                Err(e)
+            }
+        }
+    }
+}
 
 // Wisdom-Gate AI API integration for streaming recommendations
 // Demo fallback function for testing

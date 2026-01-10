@@ -212,11 +212,18 @@ pub fn start_player(cfg: &Config, url: &str) -> Result<(), String> {
             let max_attempts = cfg_clone.mpv_live_retry_max.max(1);
             let delay_ms = cfg_clone.mpv_live_retry_delay_ms.max(500);
             let global_deadline = std::time::Instant::now() + std::time::Duration::from_secs(5*60);
+            let resolved_mpv = resolve_player_path("mpv");
+            let spawn_label = resolved_mpv.clone().unwrap_or_else(|| "mpv (PATH/open -a)".into());
             for attempt in 0..max_attempts {
                 if attempt > 0 { log_line(&format!("mpv Live-Retry Versuch {}/{}", attempt+1, max_attempts)); }
                 let start = std::time::Instant::now();
-                match Command::new("mpv").args(&base_args).stdout(Stdio::null()).stderr(Stdio::piped()).spawn() {
+                let mut cmd = resolved_mpv
+                    .as_ref()
+                    .map(|p| Command::new(p))
+                    .unwrap_or_else(|| build_player_command("mpv"));
+                match cmd.args(&base_args).stdout(Stdio::null()).stderr(Stdio::piped()).spawn() {
                     Ok(mut child) => {
+                        log_line(&format!("[DEBUG] mpv gestartet mit Pfad: {}", spawn_label));
                         if cfg_clone.mpv_verbose {
                             if let Some(mut stderr) = child.stderr.take() {
                                 std::thread::spawn(move || {
