@@ -51,6 +51,14 @@ pub fn search_items_with_language_filter(
     let query = text.trim();
     if query.is_empty() { return Vec::new(); }
     
+    // Debug: Zeige erste paar Filme
+    if !movies.is_empty() {
+        println!("🎬 Erste 5 Filme im Index:");
+        for (i, m) in movies.iter().take(5).enumerate() {
+            println!("  {}. \"{}\"", i+1, m.name);
+        }
+    }
+    
     // Für sehr kurze Queries (<=2 Zeichen) nur einfache substring Suche (Performance + Erwartung)
     if query.len() <= 2 { 
         return legacy_substring_with_filter(movies, series, channels, query, language_filter); 
@@ -70,6 +78,8 @@ pub fn search_items_with_language_filter(
             }
         })
         .collect();
+    
+    println!("📊 Scoring-Ergebnisse: {} Movies mit Score > 0", movie_scores.len());
 
     let series_scores: Vec<(String, (f64, &Item, &'static str))> = series.par_iter()
         .filter_map(|s| {
@@ -129,14 +139,21 @@ pub fn search_items_with_language_filter(
             } else {
                 // Check if item language matches any selected filter
                 if let Some(lang) = crate::helpers::extract_language_from_name(&item.name) {
-                    language_filter.contains(&lang)
+                    let matches = language_filter.contains(&lang);
+                    if !matches {
+                        println!("  🚫 Filter-Ausschluss: '{}' hat Sprache '{}' (Filter: {:?})", item.name, lang, language_filter);
+                    }
+                    matches
                 } else {
-                    // Exclude items without detectable language when filter is active
-                    false
+                    // Include items without detectable language prefix (e.g., "Vinland Saga" instead of "EN - Vinland Saga")
+                    println!("  ✅ Keine Sprache erkannt in '{}' - wird durchgelassen", item.name);
+                    true
                 }
             }
         })
         .collect();
+    
+    println!("📊 Nach Sprachfilter: {} Ergebnisse", results.len());
     
     results
 }
@@ -157,7 +174,7 @@ fn legacy_substring_with_filter(movies: &Vec<Item>, series: &Vec<Item>, channels
             if let Some(lang) = crate::helpers::extract_language_from_name(&item.name) {
                 language_filter.contains(&lang)
             } else {
-                false // Exclude items without detectable language when filter is active
+                true // Include items without detectable language prefix
             }
         }
     };

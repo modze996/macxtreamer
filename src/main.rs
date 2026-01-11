@@ -1196,6 +1196,17 @@ impl MacXtreamer {
             return; 
         }
         
+        // CRITICAL: Set search view BEFORE starting search to prevent ItemsLoaded from interfering
+        if !matches!(self.current_view, Some(ViewState::Search { .. })) {
+            println!("🔄 Setze View auf Search");
+            if let Some(cv) = &self.current_view {
+                self.view_stack.push(cv.clone());
+            }
+            self.current_view = Some(ViewState::Search { 
+                query: query.clone() 
+            });
+        }
+        
         // Send search started message and update status
         let _ = tx.send(Msg::SearchStarted);
         self.search_status = SearchStatus::Searching;
@@ -2676,6 +2687,14 @@ impl eframe::App for MacXtreamer {
                                 r.path = Some(p.clone()); 
                             }
                         }
+                    }
+                    
+                    // Ensure we're in Search view when results arrive
+                    if !matches!(self.current_view, Some(ViewState::Search { .. })) {
+                        println!("⚠️ Nicht in Search View - setze auf Search View");
+                        self.current_view = Some(ViewState::Search { 
+                            query: self.search_text.clone() 
+                        });
                     }
                     
                     self.content_rows = rows;
