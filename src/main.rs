@@ -318,8 +318,12 @@ struct MacXtreamer {
     
     // Update system
     show_update_dialog: bool,
+    show_no_update_dialog: bool,
     available_update: Option<updater::UpdateInfo>,
     checking_for_updates: bool,
+    update_downloading: bool,
+    update_installing: bool,
+    update_progress: String,
 }
 
 impl MacXtreamer {
@@ -476,8 +480,12 @@ impl MacXtreamer {
             
             // Update system  
             show_update_dialog: false,
+            show_no_update_dialog: false,
             available_update: None,
             checking_for_updates: false,
+            update_downloading: false,
+            update_installing: false,
+            update_progress: String::new(),
         };
 
         // Konfig prüfen – falls unvollständig, Config Dialog anzeigen
@@ -601,6 +609,7 @@ impl MacXtreamer {
     fn check_for_updates(&mut self) {
         if !self.checking_for_updates {
             self.checking_for_updates = true;
+            println!("🔄 Starting update check...");
             
             // Update last check timestamp
             let now = std::time::SystemTime::now()
@@ -615,15 +624,25 @@ impl MacXtreamer {
             tokio::spawn(async move {
                 // Use current app version for comparison
                 let current_version = env!("CARGO_PKG_VERSION");
+                println!("📦 Current version: {}", current_version);
+                println!("🌐 Checking GitHub for updates...");
+                
                 match updater::check_for_updates(current_version).await {
                     Ok(update_info) => {
+                        println!("✅ Update check successful!");
+                        println!("   Latest version: {}", update_info.latest_version);
+                        println!("   Update available: {}", update_info.update_available);
+                        
                         if update_info.update_available {
+                            println!("📥 Sending UpdateAvailable message");
                             let _ = tx.send(Msg::UpdateAvailable(update_info));
                         } else {
+                            println!("✔️ Sending NoUpdateAvailable message");
                             let _ = tx.send(Msg::NoUpdateAvailable);
                         }
                     }
                     Err(e) => {
+                        println!("❌ Update check failed: {}", e);
                         let _ = tx.send(Msg::UpdateError(format!("Update check failed: {}", e)));
                     }
                 }
@@ -638,6 +657,31 @@ impl MacXtreamer {
             }
         } else {
             eprintln!("No download URL available for update");
+        }
+    }
+
+    fn start_update_download(&mut self, update_info: &updater::UpdateInfo) {
+        if let Some(ref download_url) = update_info.download_url {
+            self.update_downloading = true;
+            self.update_progress = "0%".to_string();
+            
+            let tx = self.tx.clone();
+            let url = download_url.clone();
+            let version = update_info.latest_version.clone();
+            
+            tokio::spawn(async move {
+                println!("📥 Starting DMG download from: {}", url);
+                match updater::download_and_install_update(&url, &version).await {
+                    Ok(msg) => {
+                        println!("✅ {}", msg);
+                        let _ = tx.send(Msg::UpdateInstalled);
+                    }
+                    Err(e) => {
+                        println!("❌ Update installation failed: {}", e);
+                        let _ = tx.send(Msg::UpdateError(format!("Installation failed: {}", e)));
+                    }
+                }
+            });
         }
     }
 
@@ -1908,35 +1952,31 @@ impl eframe::App for MacXtreamer {
             || self.indexing;
         
         // CPU FIX: Dramatically reduce automatic repaint frequency
+        // FLICKER FIX: Disable aggressive repaint_after calls - let egui's spinner/progress handle animation
         if self.config.low_cpu_mode {
             // Low CPU Mode: adaptive Thresholds basierend auf durchschnittlicher Frame-Zeit
-            let base_critical = 2500u64; // länger
-            let base_minor = 5000u64;
+            let base_critical = 5000u64; // Much longer - let spinner animate
+            let base_minor = 10000u64;
             let critical_threshold = if self.avg_frame_ms > 30.0 { base_critical * 2 } else { base_critical };
             let minor_threshold = if self.avg_frame_ms > 30.0 { base_minor * 2 } else { base_minor };
-            if time_since_forced < critical_threshold && has_critical_bg_work {
-                // noch kein Repaint
-            } else if time_since_forced < minor_threshold && has_minor_bg_work {
-                // noch kein Repaint
-            } else if has_critical_bg_work {
-                ctx.request_repaint_after(Duration::from_millis(2000));
-            } else if has_minor_bg_work {
-                ctx.request_repaint_after(Duration::from_millis(4000));
+            if time_since_forced >= critical_threshold && has_critical_bg_work {
+                ctx.request_repaint_after(Duration::from_millis(5000));
+                self.last_forced_repaint = now;
+            } else if time_since_forced >= minor_threshold && has_minor_bg_work {
+                ctx.request_repaint_after(Duration::from_millis(10000));
+                self.last_forced_repaint = now;
             }
         } else if self.config.ultra_low_flicker_mode {
             // Ultra Flicker Guard: Nur heartbeats, keine Auto-Repaints außer bei kritischen Szenarien
-            let repaint_interval = 900u64;
+            let repaint_interval = 2000u64; // Much longer interval
             if time_since_forced >= repaint_interval && has_critical_bg_work {
                 ctx.request_repaint();
                 self.last_forced_repaint = now;
             }
         } else {
-            // Normal Mode: milderere Strategie
-            if has_critical_bg_work {
-                ctx.request_repaint_after(Duration::from_millis(500));
-            } else if has_minor_bg_work {
-                ctx.request_repaint_after(Duration::from_millis(1000));
-            }
+            // Normal Mode: DISABLED - let egui widgets handle their own animation
+            // Don't call request_repaint_after here - it causes flicker!
+            // egui's spinner and progress bar will handle repaints automatically
         }
         // If no background work, NO automatic repaints at all!
 
@@ -2757,17 +2797,35 @@ impl eframe::App for MacXtreamer {
                     self.is_loading = false;
                 }
                 Msg::UpdateAvailable(update_info) => {
+                    println!("📲 Received UpdateAvailable message");
                     self.available_update = Some(update_info);
                     self.show_update_dialog = true;
                     self.checking_for_updates = false;
                 }
                 Msg::NoUpdateAvailable => {
+                    println!("📲 Received NoUpdateAvailable message");
                     self.checking_for_updates = false;
-                    // Optional: Show a brief notification that no update is available
+                    self.show_no_update_dialog = true;
                 }
                 Msg::UpdateError(error) => {
+                    println!("📲 Received UpdateError message: {}", error);
                     self.checking_for_updates = false;
+                    self.update_downloading = false;
+                    self.update_installing = false;
                     self.last_error = Some(error);
+                }
+                Msg::UpdateInstalled => {
+                    println!("📲 Received UpdateInstalled message");
+                    self.update_downloading = false;
+                    self.update_installing = false;
+                    self.show_update_dialog = false;
+                    self.update_progress = "Installation complete! Restarting app...".to_string();
+                    // Schedule app restart after a brief delay
+                    std::thread::spawn(|| {
+                        std::thread::sleep(std::time::Duration::from_secs(2));
+                        println!("🔄 Restarting application...");
+                        std::process::exit(0);
+                    });
                 }
                 Msg::EpgLoaded { stream_id, program } => {
                     self.epg_loading.remove(&stream_id);
@@ -2781,19 +2839,14 @@ impl eframe::App for MacXtreamer {
                 }
             } // end match msg
         } // end while let Ok(msg)
-    // Ultra Flicker Guard erhöht Intervall und erzwingt ausschließlich Event-basierte Repaints
-    let repaint_interval = if self.config.ultra_low_flicker_mode { 900 } else if self.config.low_cpu_mode { 500 } else { 120 }; // base cadence
-        if self.pending_repaint_due_to_msg || got_msg {
-            ctx.request_repaint();
-            self.last_forced_repaint = now;
-            self.pending_repaint_due_to_msg = false;
-        } else if time_since_forced >= repaint_interval {
-            // periodic heartbeat only if background work exists
-            if !self.config.ultra_low_flicker_mode && (has_critical_bg_work || has_minor_bg_work) {
-                ctx.request_repaint();
-                self.last_forced_repaint = now;
-            }
-        }
+    
+    // After message processing, request repaint if messages arrived
+    if self.pending_repaint_due_to_msg || got_msg {
+        ctx.request_repaint();
+        self.last_forced_repaint = now;
+        self.pending_repaint_due_to_msg = false;
+    }
+    // Otherwise, don't force repaints - let egui widgets (spinners, progress bars) handle their own animation
 
         // Check for next downloads if flagged
         if self.should_check_downloads {
@@ -5236,9 +5289,39 @@ impl eframe::App for MacXtreamer {
             self.show_error_dialog = open;
         }
 
+        // No update dialog window
+        if self.show_no_update_dialog {
+            let mut open = self.show_no_update_dialog;
+            egui::Window::new(&t("no_update_available", self.config.language))
+                .collapsible(false)
+                .resizable(false)
+                .default_width(400.0)
+                .anchor(egui::Align2::CENTER_CENTER, egui::vec2(0.0, 0.0))
+                .open(&mut open)
+                .show(ctx, |ui| {
+                    ui.add_space(8.0);
+                    ui.label(&t("up_to_date", self.config.language));
+                    ui.add_space(4.0);
+                    ui.label(format!("{} {}", t("current_version", self.config.language), env!("CARGO_PKG_VERSION")));
+                    ui.add_space(12.0);
+                    
+                    ui.separator();
+                    ui.add_space(4.0);
+                    
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        if ui.button("OK").clicked() {
+                            self.show_no_update_dialog = false;
+                        }
+                    });
+                });
+            self.show_no_update_dialog = open;
+        }
+
         // Update dialog window
         if self.show_update_dialog {
             let mut open = self.show_update_dialog;
+            let mut close_requested = false;
+            
             egui::Window::new(&t("update_available", self.config.language))
                 .collapsible(false)
                 .resizable(true)
@@ -5265,22 +5348,35 @@ impl eframe::App for MacXtreamer {
                             ui.add_space(8.0);
                         }
                         
-                        ui.separator();
-                        ui.add_space(4.0);
-                        
-                        ui.horizontal(|ui| {
-                            if ui.button(&t("download_update", self.config.language)).clicked() {
-                                self.install_update(&update);
-                                self.show_update_dialog = false;
-                            }
-                            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                                if ui.button(&t("later", self.config.language)).clicked() {
-                                    self.show_update_dialog = false;
+                        if self.update_downloading {
+                            ui.separator();
+                            ui.add_space(4.0);
+                            ui.label(format!("⬇️ {}", self.update_progress));
+                        } else if self.update_installing {
+                            ui.separator();
+                            ui.add_space(4.0);
+                            ui.label("⚙️ Installing update...");
+                        } else {
+                            ui.separator();
+                            ui.add_space(4.0);
+                            
+                            ui.horizontal(|ui| {
+                                if ui.button(&t("download_update", self.config.language)).clicked() {
+                                    self.start_update_download(&update);
                                 }
+                                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                                    if ui.button(&t("later", self.config.language)).clicked() {
+                                        close_requested = true;
+                                    }
+                                });
                             });
-                        });
+                        }
                     }
                 });
+            
+            if close_requested {
+                open = false;
+            }
             self.show_update_dialog = open;
         }
 

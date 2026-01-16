@@ -82,6 +82,12 @@ pub fn t(key: &str, lang: Language) -> String {
         ("auto_check_tooltip", Language::German) => "Prüft beim Start auf neue Versionen",
         ("check_now", Language::English) => "🔄 Check for Updates Now",
         ("check_now", Language::German) => "🔄 Jetzt nach Updates suchen",
+        ("no_update_available", Language::English) => "✅ No Updates Available",
+        ("no_update_available", Language::German) => "✅ Keine Updates verfügbar",
+        ("up_to_date", Language::English) => "You are running the latest version",
+        ("up_to_date", Language::German) => "Sie verwenden die neueste Version",
+        ("current_version", Language::English) => "Current version:",
+        ("current_version", Language::German) => "Aktuelle Version:",
         
         // VPN/Download errors  
         ("vpn_error_458", Language::English) => "VPN/Proxy detected by server. Try disconnecting VPN or using different server location.",

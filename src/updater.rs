@@ -4,18 +4,37 @@ use std::cmp::Ordering;
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct GitHubRelease {
     pub tag_name: String,
+    #[serde(default)]
     pub name: String,
+    #[serde(default, deserialize_with = "deserialize_null_string")]
     pub body: String,
-    pub published_at: String,
-    pub prerelease: bool,
+    #[serde(default)]
     pub assets: Vec<GitHubAsset>,
+}
+
+fn deserialize_null_string<'de, D>(deserializer: D) -> Result<String, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    #[derive(Deserialize)]
+    #[serde(untagged)]
+    enum StringOrNull {
+        String(String),
+        Null,
+    }
+    
+    match StringOrNull::deserialize(deserializer)? {
+        StringOrNull::String(s) => Ok(s),
+        StringOrNull::Null => Ok(String::new()),
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct GitHubAsset {
+    #[serde(default)]
     pub name: String,
+    #[serde(default)]
     pub browser_download_url: String,
-    pub size: u64,
 }
 
 #[derive(Debug, Clone)]
@@ -65,10 +84,19 @@ pub async fn check_for_updates(current_version: &str) -> Result<UpdateInfo, Stri
         return Err(format!("GitHub API error: {}", response.status()));
     }
     
-    let release: GitHubRelease = response
-        .json()
+    let text = response
+        .text()
         .await
-        .map_err(|e| format!("JSON parse error: {}", e))?;
+        .map_err(|e| format!("Failed to get response text: {}", e))?;
+    
+    println!("📄 GitHub API response length: {} bytes", text.len());
+    
+    let release: GitHubRelease = serde_json::from_str(&text)
+        .map_err(|e| {
+            println!("❌ JSON parse error details: {}", e);
+            println!("📄 Response preview: {}", &text[..std::cmp::min(500, text.len())]);
+            format!("JSON parse error: {}", e)
+        })?;
     
     let update_available = compare_versions(current_version, &release.tag_name) == Ordering::Less;
     
@@ -95,6 +123,140 @@ pub fn install_update(download_url: &str) -> Result<(), String> {
     } else {
         Ok(())
     }
+}
+
+/// Download DMG and install update automatically (macOS)
+pub async fn download_and_install_update(download_url: &str, version: &str) -> Result<String, String> {
+    use futures_util::StreamExt;
+    use std::io::Write;
+    
+    println!("📥 Downloading update from: {}", download_url);
+    
+    // Create temp directory for download
+    let temp_dir = std::env::temp_dir();
+    let dmg_filename = format!("macxtreamer_{}.dmg", version);
+    let dmg_path = temp_dir.join(&dmg_filename);
+    
+    // Download DMG file
+    let client = reqwest::Client::builder()
+        .user_agent("macXtreamer-Updater")
+        .timeout(std::time::Duration::from_secs(300))
+        .build()
+        .map_err(|e| format!("HTTP client error: {}", e))?;
+    
+    let response = client
+        .get(download_url)
+        .send()
+        .await
+        .map_err(|e| format!("Download failed: {}", e))?;
+    
+    if !response.status().is_success() {
+        return Err(format!("Download failed with status: {}", response.status()));
+    }
+    
+    let total_size = response.content_length().unwrap_or(0);
+    println!("📦 Download size: {} MB", total_size / 1_048_576);
+    
+    // Create file and download with progress
+    let mut file = std::fs::File::create(&dmg_path)
+        .map_err(|e| format!("Failed to create file: {}", e))?;
+    
+    let mut downloaded: u64 = 0;
+    let mut stream = response.bytes_stream();
+    
+    while let Some(chunk) = stream.next().await {
+        let chunk = chunk.map_err(|e| format!("Download error: {}", e))?;
+        file.write_all(&chunk)
+            .map_err(|e| format!("Write error: {}", e))?;
+        downloaded += chunk.len() as u64;
+        
+        if total_size > 0 {
+            let progress = (downloaded as f64 / total_size as f64 * 100.0) as u32;
+            if downloaded % (5 * 1_048_576) == 0 || downloaded == total_size {
+                println!("📥 Progress: {}%", progress);
+            }
+        }
+    }
+    
+    drop(file);
+    println!("✅ Download complete: {}", dmg_path.display());
+    
+    // Mount DMG
+    println!("💿 Mounting DMG...");
+    let mount_output = std::process::Command::new("hdiutil")
+        .args(&["attach", "-nobrowse", "-quiet"])
+        .arg(&dmg_path)
+        .output()
+        .map_err(|e| format!("Failed to mount DMG: {}", e))?;
+    
+    if !mount_output.status.success() {
+        return Err(format!("DMG mount failed: {}", String::from_utf8_lossy(&mount_output.stderr)));
+    }
+    
+    // Parse mount point from output
+    let mount_info = String::from_utf8_lossy(&mount_output.stdout);
+    let mount_point = mount_info
+        .lines()
+        .last()
+        .and_then(|line| line.split('\t').last())
+        .ok_or("Failed to parse mount point")?
+        .trim();
+    
+    println!("💿 Mounted at: {}", mount_point);
+    
+    // Find .app bundle in mounted volume
+    let mount_path = std::path::Path::new(mount_point);
+    let app_entries = std::fs::read_dir(mount_path)
+        .map_err(|e| format!("Failed to read mount directory: {}", e))?;
+    
+    let app_bundle = app_entries
+        .filter_map(|e| e.ok())
+        .find(|entry| {
+            entry.path().extension()
+                .and_then(|s| s.to_str())
+                .map(|s| s == "app")
+                .unwrap_or(false)
+        })
+        .ok_or("No .app bundle found in DMG")?;
+    
+    let source_app = app_bundle.path();
+    println!("📦 Found app: {}", source_app.display());
+    
+    // Install to /Applications
+    let dest_app = std::path::Path::new("/Applications/macxtreamer.app");
+    
+    // Remove old version if exists
+    if dest_app.exists() {
+        println!("🗑️  Removing old version...");
+        std::fs::remove_dir_all(dest_app)
+            .map_err(|e| format!("Failed to remove old version: {}", e))?;
+    }
+    
+    // Copy new version
+    println!("📋 Installing new version...");
+    let copy_status = std::process::Command::new("cp")
+        .args(&["-R"])
+        .arg(&source_app)
+        .arg(dest_app)
+        .status()
+        .map_err(|e| format!("Failed to copy app: {}", e))?;
+    
+    if !copy_status.success() {
+        return Err("Failed to install app".to_string());
+    }
+    
+    // Unmount DMG
+    println!("💿 Unmounting DMG...");
+    let _ = std::process::Command::new("hdiutil")
+        .args(&["detach", "-quiet"])
+        .arg(mount_point)
+        .status();
+    
+    // Clean up DMG file
+    let _ = std::fs::remove_file(&dmg_path);
+    
+    println!("✅ Installation complete!");
+    Ok("Update installed successfully. The app will restart.".to_string())
 }
 
 #[cfg(test)]

@@ -129,6 +129,7 @@ pub enum Msg {
     UpdateAvailable(crate::updater::UpdateInfo),
     NoUpdateAvailable,
     UpdateError(String),
+    UpdateInstalled,
     
     // EPG data
     EpgLoaded {
