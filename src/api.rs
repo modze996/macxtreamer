@@ -58,7 +58,7 @@ fn clean_unicode_text(text: &str) -> String {
         .collect()
 }
 
-pub async fn fetch_categories(cfg: &Config, action: &str) -> Result<Vec<Category>, reqwest::Error> {
+pub async fn fetch_categories(cfg: &Config, action: &str) -> Result<Vec<Category>, String> {
     let key = match action {
         "get_live_categories" => "live_categories",
         "get_vod_categories" => "vod_categories",
@@ -68,49 +68,52 @@ pub async fn fetch_categories(cfg: &Config, action: &str) -> Result<Vec<Category
     if let Some(cached) = load_cache::<Vec<Category>>(key, CACHE_TTL_CATEGORIES_SECS) { return Ok(cached); }
     let url = format!("{}/player_api.php?username={}&password={}&action={}", cfg.address, cfg.username, cfg.password, action);
     // println!("🌐 API-Aufruf: {}", url.replace(&cfg.password, "***"));
-    let net = async {
-        let client = reqwest::Client::builder()
-            .timeout(std::time::Duration::from_secs(10))
-            .build()?;
-        let res = client.get(&url).send().await?;
-        let status = res.status();
-        let body_text = res.text().await?;
-        
-        // Check if response is actually JSON
-        if body_text.trim().is_empty() {
-            eprintln!("❌ API returned empty response for {}", action);
-            return Err(reqwest::Client::new().get("about:blank").build().unwrap_err()); // Dummy error
+    
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(10))
+        .build()
+        .map_err(|e| format!("HTTP client error: {}", e))?;
+    
+    let res = client.get(&url).send().await
+        .map_err(|e| format!("API request failed: {}", e))?;
+    let status = res.status();
+    let body_text = res.text().await
+        .map_err(|e| format!("Failed to read response body: {}", e))?;
+    
+    // Check if response is actually JSON
+    if body_text.trim().is_empty() {
+        eprintln!("❌ API returned empty response for {}", action);
+        return Err(format!("Empty response from API (status: {})", status));
+    }
+    
+    // Try to parse as JSON
+    let json: Value = match serde_json::from_str(&body_text) {
+        Ok(v) => v,
+        Err(e) => {
+            eprintln!("❌ JSON parse error for {}: {}", action, e);
+            eprintln!("   Response status: {}", status);
+            eprintln!("   Response preview (first 200 chars): {}", 
+                body_text.chars().take(200).collect::<String>());
+            return Err(format!("JSON parse error (status {}): {}", status, e));
         }
-        
-        // Try to parse as JSON
-        let json: Value = match serde_json::from_str(&body_text) {
-            Ok(v) => v,
-            Err(e) => {
-                eprintln!("❌ JSON parse error for {}: {}", action, e);
-                eprintln!("   Response status: {}", status);
-                eprintln!("   Response preview (first 200 chars): {}", 
-                    body_text.chars().take(200).collect::<String>());
-                return Err(reqwest::Client::new().get("about:blank").build().unwrap_err()); // Dummy error
-            }
-        };
-        
-        let mut out = Vec::new();
-        if let Some(arr) = json.as_array() {
-            for v in arr {
-                let id = v.get("category_id").or_else(|| v.get("id")).and_then(|x| x.as_str()).unwrap_or_default().to_string();
-                let name = v.get("category_name").or_else(|| v.get("name")).and_then(|x| x.as_str()).unwrap_or_default().to_string();
-                let cleaned_name = clean_unicode_text(&name);
-                if !id.is_empty() || !cleaned_name.is_empty() { 
-                    out.push(Category { id, name: cleaned_name }); 
-                }
+    };
+    
+    let mut out = Vec::new();
+    if let Some(arr) = json.as_array() {
+        for v in arr {
+            let id = v.get("category_id").or_else(|| v.get("id")).and_then(|x| x.as_str()).unwrap_or_default().to_string();
+            let name = v.get("category_name").or_else(|| v.get("name")).and_then(|x| x.as_str()).unwrap_or_default().to_string();
+            let cleaned_name = clean_unicode_text(&name);
+            if !id.is_empty() || !cleaned_name.is_empty() { 
+                out.push(Category { id, name: cleaned_name }); 
             }
         }
-        Ok::<Vec<Category>, reqwest::Error>(out)
-    }.await;
-    match net { Ok(list) => { save_cache(key, &list); Ok(list) } Err(e) => { if let Some(stale) = load_stale_cache::<Vec<Category>>(key) { Ok(stale) } else { Err(e) } } }
+    }
+    save_cache(key, &out);
+    Ok(out)
 }
 
-pub async fn fetch_items(cfg: &Config, kind: &str, category_id: &str) -> Result<Vec<Item>, reqwest::Error> {
+pub async fn fetch_items(cfg: &Config, kind: &str, category_id: &str) -> Result<Vec<Item>, String> {
     let action = match kind { "subplaylist" => "get_live_streams", "vod" => "get_vod_streams", "series" => "get_series", other => other };
     let key = format!("items_{}_{}", action, category_id);
     if let Some(cached) = load_cache::<Vec<Item>>(&key, CACHE_TTL_ITEMS_SECS) { return Ok(cached); }
@@ -118,15 +121,18 @@ pub async fn fetch_items(cfg: &Config, kind: &str, category_id: &str) -> Result<
     let net = async {
         let client = reqwest::Client::builder()
             .timeout(std::time::Duration::from_secs(10))
-            .build()?;
-        let res = client.get(&url).send().await?;
+            .build()
+            .map_err(|e| format!("HTTP client error: {}", e))?;
+        let res = client.get(&url).send().await
+            .map_err(|e| format!("API request failed: {}", e))?;
         let status = res.status();
-        let body_text = res.text().await?;
+        let body_text = res.text().await
+            .map_err(|e| format!("Failed to read response body: {}", e))?;
         
         // Check if response is actually JSON
         if body_text.trim().is_empty() {
             eprintln!("❌ API returned empty response for {}", action);
-            return Err(reqwest::Client::new().get("about:blank").build().unwrap_err()); // Dummy error
+            return Err(format!("Empty response from API (status: {})", status));
         }
         
         // Try to parse as JSON
@@ -137,7 +143,7 @@ pub async fn fetch_items(cfg: &Config, kind: &str, category_id: &str) -> Result<
                 eprintln!("   Response status: {}", status);
                 eprintln!("   Response preview (first 200 chars): {}", 
                     body_text.chars().take(200).collect::<String>());
-                return Err(reqwest::Client::new().get("about:blank").build().unwrap_err()); // Dummy error
+                return Err(format!("JSON parse error (status {}): {}", status, e));
             }
         };
         
@@ -178,9 +184,9 @@ pub async fn fetch_items(cfg: &Config, kind: &str, category_id: &str) -> Result<
                 out.push(item);
             }
         }
-        Ok::<Vec<Item>, reqwest::Error>(out)
+        Ok::<Vec<Item>, String>(out)
     }.await;
-    match net { Ok(items) => { save_cache(&key, &items); Ok(items) } Err(e) => { if let Some(stale) = load_stale_cache::<Vec<Item>>(&key) { Ok(stale) } else { Err(e) } } }
+    match net { Ok(items) => { save_cache(&key, &items); Ok(items) } Err(e) => { eprintln!("{}", &e); if let Some(stale) = load_stale_cache::<Vec<Item>>(&key) { Ok(stale) } else { Err(e) } } }
 }
 
 pub async fn fetch_series_episodes(cfg: &Config, series_id: &str) -> Result<Vec<Episode>, reqwest::Error> {
