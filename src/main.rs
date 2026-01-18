@@ -2860,15 +2860,24 @@ impl eframe::App for MacXtreamer {
             // No automatic repaints for content updates - let user interaction drive them
         }
 
-        // Idle Governor: if there's absolutely nothing going on, throttle repaints to 1 FPS
-        let is_idle = !has_critical_bg_work
-            && !has_minor_bg_work
+        // Determine what work is actually happening
+        let has_active_downloads = self.active_downloads() > 0;
+        let has_pending_work = has_critical_bg_work || has_minor_bg_work;
+        
+        // Download Heartbeat: ensure download progress UI updates regularly
+        // This is critical - users need to see downloads progressing even without mouse movement
+        if has_active_downloads {
+            ctx.request_repaint_after(Duration::from_millis(500)); // Show download progress every 500ms
+        }
+
+        // Idle Governor: only throttle to 1 FPS if there's absolutely nothing going on
+        // AND no downloads are pending (which would block indefinitely)
+        let is_completely_idle = !has_pending_work
             && !self.is_loading
-            && self.active_downloads() == 0
-            && self.pending_texture_uploads.is_empty()
-            && self.pending_decode_urls.is_empty()
-            && self.pending_covers.is_empty();
-        if is_idle {
+            && !has_active_downloads
+            && self.downloads.iter().all(|(_, s)| s.finished || s.error.is_some() || s.waiting);
+        
+        if is_completely_idle {
             // Enforce a low-frequency heartbeat to keep UI responsive without burning CPU
             ctx.request_repaint_after(Duration::from_millis(1000));
         }
