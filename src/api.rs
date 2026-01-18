@@ -73,7 +73,27 @@ pub async fn fetch_categories(cfg: &Config, action: &str) -> Result<Vec<Category
             .timeout(std::time::Duration::from_secs(10))
             .build()?;
         let res = client.get(&url).send().await?;
-        let json = res.json::<Value>().await?;
+        let status = res.status();
+        let body_text = res.text().await?;
+        
+        // Check if response is actually JSON
+        if body_text.trim().is_empty() {
+            eprintln!("❌ API returned empty response for {}", action);
+            return Err(reqwest::Client::new().get("about:blank").build().unwrap_err()); // Dummy error
+        }
+        
+        // Try to parse as JSON
+        let json: Value = match serde_json::from_str(&body_text) {
+            Ok(v) => v,
+            Err(e) => {
+                eprintln!("❌ JSON parse error for {}: {}", action, e);
+                eprintln!("   Response status: {}", status);
+                eprintln!("   Response preview (first 200 chars): {}", 
+                    body_text.chars().take(200).collect::<String>());
+                return Err(reqwest::Client::new().get("about:blank").build().unwrap_err()); // Dummy error
+            }
+        };
+        
         let mut out = Vec::new();
         if let Some(arr) = json.as_array() {
             for v in arr {
@@ -100,7 +120,27 @@ pub async fn fetch_items(cfg: &Config, kind: &str, category_id: &str) -> Result<
             .timeout(std::time::Duration::from_secs(10))
             .build()?;
         let res = client.get(&url).send().await?;
-        let json = res.json::<Value>().await?;
+        let status = res.status();
+        let body_text = res.text().await?;
+        
+        // Check if response is actually JSON
+        if body_text.trim().is_empty() {
+            eprintln!("❌ API returned empty response for {}", action);
+            return Err(reqwest::Client::new().get("about:blank").build().unwrap_err()); // Dummy error
+        }
+        
+        // Try to parse as JSON
+        let json: Value = match serde_json::from_str(&body_text) {
+            Ok(v) => v,
+            Err(e) => {
+                eprintln!("❌ JSON parse error for {} (category={}): {}", action, category_id, e);
+                eprintln!("   Response status: {}", status);
+                eprintln!("   Response preview (first 200 chars): {}", 
+                    body_text.chars().take(200).collect::<String>());
+                return Err(reqwest::Client::new().get("about:blank").build().unwrap_err()); // Dummy error
+            }
+        };
+        
         let mut out = Vec::new();
     if let Some(arr) = json.as_array() {
             for v in arr {
