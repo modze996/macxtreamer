@@ -2882,6 +2882,14 @@ impl eframe::App for MacXtreamer {
             ctx.request_repaint_after(Duration::from_millis(1000));
         }
 
+        // CRITICAL FIX: Don't prefetch covers aggressively - this keeps the app busy even when idle!
+        // Instead, covers will be loaded on-demand when items are rendered (lazy loading)
+        // This dramatically improves idle CPU usage
+        if !covers_to_prefetch.is_empty() {
+            // Log that we received prefetch request but ignore it to keep idle CPU low
+            println!("⚠️ Ignoring {} prefetch cover requests to keep idle CPU low (covers loaded on-demand instead)", covers_to_prefetch.len());
+        }
+
         // Verarbeite pro Frame nur ein kleines Budget an Texture-Uploads,
         // um Frame-Drops beim Scrollen zu vermeiden.
         {
