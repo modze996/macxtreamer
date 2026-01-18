@@ -114,17 +114,6 @@ pub async fn check_for_updates(current_version: &str) -> Result<UpdateInfo, Stri
     })
 }
 
-/// Download and install update (opens download URL in browser for now)
-pub fn install_update(download_url: &str) -> Result<(), String> {
-    // For now, open download URL in browser
-    // In future versions, could implement automatic download and installation
-    if let Err(e) = webbrowser::open(download_url) {
-        Err(format!("Failed to open download URL: {}", e))
-    } else {
-        Ok(())
-    }
-}
-
 /// Download DMG and install update automatically (macOS)
 pub async fn download_and_install_update(download_url: &str, version: &str) -> Result<String, String> {
     use futures_util::StreamExt;

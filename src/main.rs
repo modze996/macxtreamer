@@ -650,16 +650,6 @@ impl MacXtreamer {
         }
     }
     
-    fn install_update(&self, update_info: &updater::UpdateInfo) {
-        if let Some(ref download_url) = update_info.download_url {
-            if let Err(e) = updater::install_update(download_url) {
-                eprintln!("Failed to install update: {}", e);
-            }
-        } else {
-            eprintln!("No download URL available for update");
-        }
-    }
-
     fn start_update_download(&mut self, update_info: &updater::UpdateInfo) {
         if let Some(ref download_url) = update_info.download_url {
             self.update_downloading = true;
@@ -2868,6 +2858,19 @@ impl eframe::App for MacXtreamer {
                 ctx.request_repaint_after(Duration::from_millis(1000)); // 1 second instead of 50ms!
             }
             // No automatic repaints for content updates - let user interaction drive them
+        }
+
+        // Idle Governor: if there's absolutely nothing going on, throttle repaints to 1 FPS
+        let is_idle = !has_critical_bg_work
+            && !has_minor_bg_work
+            && !self.is_loading
+            && self.active_downloads() == 0
+            && self.pending_texture_uploads.is_empty()
+            && self.pending_decode_urls.is_empty()
+            && self.pending_covers.is_empty();
+        if is_idle {
+            // Enforce a low-frequency heartbeat to keep UI responsive without burning CPU
+            ctx.request_repaint_after(Duration::from_millis(1000));
         }
 
         // Verarbeite pro Frame nur ein kleines Budget an Texture-Uploads,
