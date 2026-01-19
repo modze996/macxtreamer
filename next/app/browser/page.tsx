@@ -134,6 +134,103 @@ export default function Browser() {
     checkConfig();
   }, []);
 
+
+  // Check config on mount - moved before useEffect
+  useEffect(() => {
+    const checkConfig = async () => {
+      try {
+        const res = await fetch("/api/config");
+        const data = await res.json();
+        console.log("[Browser] Config status:", data);
+        setConfigStatus(data);
+        setLoading(false);
+      } catch (err) {
+        console.error("[Browser] Config check failed:", err);
+        setError("Failed to check configuration");
+        setLoading(false);
+      }
+    };
+
+    checkConfig();
+  }, []);
+
+  // Fetch categories when content type changes or config is ready
+  useEffect(() => {
+    if (!configStatus?.configured) return;
+
+    const fetchCategories = async () => {
+      try {
+        setLoading(true);
+        setItems([]);
+        setSelectedCategory(null);
+        setFilterText("");
+
+        const action = actionMap[contentType];
+        const url = `/api/categories?action=${action}`;
+        console.log(`[Browser] Fetching categories: ${url}`);
+
+        const res = await fetch(url);
+        if (res.ok) {
+          const data = await res.json();
+          console.log(`[Browser] Got ${data.length} categories`);
+          setCategories(data);
+          setError(null);
+          if (data.length > 0) {
+            setSelectedCategory(data[0].id);
+          }
+        } else {
+          const errorData = await res.json();
+          const errorMsg = errorData.error || `HTTP ${res.status}`;
+          console.error(`[Browser] Error loading categories: ${errorMsg}`);
+          setError(errorMsg);
+        }
+      } catch (err) {
+        const msg = err instanceof Error ? err.message : "Failed to load categories";
+        console.error(`[Browser] Exception: ${msg}`);
+        setError(msg);
+      } finally {
+        setLoading(false);
+      }
+    };
+
+    fetchCategories();
+  }, [contentType, configStatus?.configured]);
+
+  // Fetch items when category changes
+  useEffect(() => {
+    if (!selectedCategory || !configStatus?.configured) return;
+
+    const fetchItems = async () => {
+      try {
+        setItemsLoading(true);
+        const action = `get_${contentType}_streams`;
+        const url = `/api/items?cat_id=${selectedCategory}&action=${action}`;
+        console.log(`[Browser] Fetching items: ${url}`);
+
+        const res = await fetch(url);
+        if (res.ok) {
+          const data = await res.json();
+          console.log(`[Browser] Got ${data.length} items`);
+          setItems(data);
+          setError(null);
+        } else {
+          const errorData = await res.json();
+          const errorMsg = errorData.error || `HTTP ${res.status}`;
+          console.error(`[Browser] Error: ${errorMsg}`);
+          setError(errorMsg);
+        }
+      } catch (err) {
+        const msg = err instanceof Error ? err.message : "Failed to load items";
+        console.error(`[Browser] Exception: ${msg}`);
+        setError(msg);
+      } finally {
+        setItemsLoading(false);
+      }
+    };
+
+    fetchItems();
+  }, [selectedCategory, contentType, configStatus?.configured]);
+
   const currentCategory = categories.find((c) => c.id === selectedCategory);
   const filteredItems = items.filter((item) =>
     item.name.toLowerCase().includes(filterText.toLowerCase())
@@ -150,6 +247,19 @@ export default function Browser() {
     }
   };
 
+  // Loading state while checking config
+  if (configStatus === null) {
+    return (
+      <div className="min-h-screen flex items-center justify-center bg-gray-900">
+        <div className="text-center">
+          <div className="inline-block animate-spin rounded-full h-12 w-12 border-b-2 border-white"></div>
+          <p className="mt-4 text-gray-400">Loading configuration...</p>
+        </div>
+      </div>
+    );
+  }
+
+  // Config not found
   if (!configStatus?.configured) {
     return (
       <div className="min-h-screen flex items-center justify-center bg-gray-900">
@@ -295,18 +405,27 @@ export default function Browser() {
             <div className="flex items-center justify-center h-full">
               <div className="text-center">
                 <div className="inline-block animate-spin rounded-full h-12 w-12 border-b-2 border-white"></div>
-                <p className="mt-4 text-gray-400">Loading items...</p>
+                  <p className="mt-4 text-gray-400">Loading categories...</p>
+                </div>
+              </div>
+            )}
+
+            {!loading && itemsLoading && (
+              <div className="flex items-center justify-center h-full">
+                <div className="text-center">
+                  <div className="inline-block animate-spin rounded-full h-12 w-12 border-b-2 border-white"></div>
+                  <p className="mt-4 text-gray-400">Loading items...</p>
               </div>
             </div>
           )}
 
-          {!itemsLoading && filteredItems.length === 0 && (
+          {!loading && !itemsLoading && filteredItems.length === 0 && (
             <div className="flex items-center justify-center h-full">
               <p className="text-gray-400">No items found</p>
             </div>
           )}
 
-          {!itemsLoading && filteredItems.length > 0 && (
+          {!loading && !itemsLoading && filteredItems.length > 0 && (
             <div className="grid grid-cols-2 sm:grid-cols-3 md:grid-cols-4 lg:grid-cols-5 xl:grid-cols-6 gap-4 auto-rows-max">
               {filteredItems.map((item) => (
                 <div
