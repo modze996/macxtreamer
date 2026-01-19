@@ -50,20 +50,29 @@ export default function Browser() {
         setSelectedCategory(null);
         setFilterText("");
 
-        const res = await fetch(
-          `/api/categories?action=${actionMap[contentType]}`
-        );
+        const action = actionMap[contentType];
+        const url = `/api/categories?action=${action}`;
+        console.log(`[Browser] Fetching categories: ${url}`);
+        
+        const res = await fetch(url);
         if (res.ok) {
           const data = await res.json();
+          console.log(`[Browser] Got ${data.length} categories`);
           setCategories(data);
+          setError(null);
           if (data.length > 0) {
             setSelectedCategory(data[0].id);
           }
+        } else {
+          const errorData = await res.json();
+          const errorMsg = errorData.error || `HTTP ${res.status}`;
+          console.error(`[Browser] Error loading categories: ${errorMsg}`);
+          setError(errorMsg);
         }
       } catch (err) {
-        setError(
-          err instanceof Error ? err.message : "Failed to load categories"
-        );
+        const msg = err instanceof Error ? err.message : "Failed to load categories";
+        console.error(`[Browser] Exception: ${msg}`);
+        setError(msg);
       } finally {
         setLoading(false);
       }
@@ -79,15 +88,26 @@ export default function Browser() {
 
       try {
         setItemsLoading(true);
-        const res = await fetch(
-          `/api/items?cat_id=${selectedCategory}&action=get_${contentType}_streams`
-        );
+        const action = `get_${contentType}_streams`;
+        const url = `/api/items?cat_id=${selectedCategory}&action=${action}`;
+        console.log(`[Browser] Fetching items: ${url}`);
+        
+        const res = await fetch(url);
         if (res.ok) {
           const data = await res.json();
+          console.log(`[Browser] Got ${data.length} items`);
           setItems(data);
+          setError(null);
+        } else {
+          const errorData = await res.json();
+          const errorMsg = errorData.error || `HTTP ${res.status}`;
+          console.error(`[Browser] Error: ${errorMsg}`);
+          setError(errorMsg);
         }
       } catch (err) {
-        setError(err instanceof Error ? err.message : "Failed to load items");
+        const msg = err instanceof Error ? err.message : "Failed to load items";
+        console.error(`[Browser] Exception: ${msg}`);
+        setError(msg);
       } finally {
         setItemsLoading(false);
       }

@@ -15,7 +15,7 @@ export async function GET(request: NextRequest) {
       );
     }
 
-    const validActions = ["get_live_streams", "get_vod_streams", "get_series"];
+    const validActions = ["get_live_streams", "get_vod_streams", "get_series_streams"];
     if (!validActions.includes(action)) {
       return NextResponse.json(
         { error: "Invalid action" },
@@ -30,13 +30,28 @@ export async function GET(request: NextRequest) {
     });
 
     if (!response.ok) {
+      console.error(
+        `[API Items] HTTP ${response.status} for action ${action}, cat_id ${categoryId}`
+      );
       return NextResponse.json(
         { error: `API returned status ${response.status}` },
         { status: response.status }
       );
     }
 
-    const data = await response.json();
+    let data;
+    try {
+      data = await response.json();
+    } catch (err) {
+      const text = await response.text();
+      console.error(
+        `[API Items] JSON parse error for action ${action}, cat_id ${categoryId}. Response: ${text.substring(0, 200)}`
+      );
+      return NextResponse.json(
+        { error: "Invalid JSON response from API" },
+        { status: 500 }
+      );
+    }
 
     // Validate and clean data
     const items = Array.isArray(data)
@@ -58,9 +73,12 @@ export async function GET(request: NextRequest) {
 
     return NextResponse.json(items);
   } catch (error) {
-    console.error("Error fetching items:", error);
+    console.error("[API Items] Error:", error);
     return NextResponse.json(
-      { error: "Failed to fetch items" },
+      {
+        error:
+          error instanceof Error ? error.message : "Failed to fetch items",
+      },
       { status: 500 }
     );
   }
