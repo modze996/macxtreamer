@@ -1,2 +1,0 @@
--keep class com.example.macxtreamer.jni.** { *; }
--dontwarn org.jetbrains.annotations.**

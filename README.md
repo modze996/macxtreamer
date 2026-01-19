@@ -1,8 +1,12 @@
 # MacXtreamer
 
-A lightweight macOS client (Rust, eframe/egui) for Xtream APIs. It preloads categories and items in the background, caches cover images, renders a fast table for Live/VOD/Series, and launches your external player (e.g., VLC) with sensible streaming defaults.
+A lightweight IPTV client for Xtream APIs available as:
+- **macOS Desktop App** (Rust, eframe/egui)
+- **Web Frontend** (Next.js, TypeScript)
 
 ## Features
+
+### macOS Desktop App
 - Native macOS app using eframe/egui
 - Live, VOD and Series with a fast, full-width/height table
 - Draggable top/bottom panels with visible grab bars
@@ -13,6 +17,13 @@ A lightweight macOS client (Rust, eframe/egui) for Xtream APIs. It preloads cate
 - Automatic local file preference when playing already downloaded items (MPV/VLC nutzen lokale Datei statt Stream)
 - Light/Dark theme, increased default font size
 
+### Web Frontend (Next.js)
+- 📺 Live TV channels browsing
+- 🎬 Movies (VOD) with metadata
+- 📺 Series with episode navigation
+- 🔄 Automatic config integration with macOS app
+- 🎨 Modern UI with Tailwind CSS
+
 ## Prerequisites
 - macOS
 - Rust (stable), installed via rustup (https://rustup.rs)
@@ -21,32 +32,59 @@ A lightweight macOS client (Rust, eframe/egui) for Xtream APIs. It preloads cate
 	- Alternatively, ensure `vlc` is in your PATH
 
 ## Build
+
+### macOS Desktop App
 ```bash
 # Dependencies are managed by Cargo
 cargo build --release
 ```
 
-Run (development):
+### Web Frontend
+```bash
+cd next
+npm install
+npm run build
+```
+
+## Running
+
+### macOS Desktop App (development):
 ```bash
 cargo run -q
 ```
 
-Run (release binary):
+### macOS Desktop App (release binary):
 ```bash
-./target/release/MacXtreamer
+./target/release/macxtreamer
 ```
 
-Note: The produced binary name may vary with Cargo settings (case sensitivity). Use `cargo build --release` and check `target/release/`.
-
-## Installation
-Simplest: use the generated binary from `target/release/`. Take a look on chapter "Bypass signing checks for DMG/App (Gatekeeper)" as there is currently only a not signed version.
-
-Optional (macOS App Bundle): Use `cargo-bundle` to create a `.app` bundle:
+### Web Frontend (development):
 ```bash
-cargo install cargo-bundle
-cargo bundle --release
+cd next
+npm run dev
 ```
-The `.app` bundle will show up under `target/release/bundle/osx/`.
+Server runs on `http://localhost:3000`
+
+### Web Frontend (production):
+```bash
+cd next
+npm run build
+npm start
+```
+
+## Configuration
+
+Both apps read from the same configuration file:
+```
+~/.config/macxtreamer/config.toml
+```
+
+Example:
+```toml
+address = "http://your-iptv-server.com"
+username = "your_username"
+password = "your_password"
+```
 
 ### App Icon
 - Generate assets (once):
