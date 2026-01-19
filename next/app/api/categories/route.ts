@@ -29,7 +29,6 @@ export async function GET(request: NextRequest) {
 
     const response = await fetch(url, {
       method: "GET",
-      timeout: 10000,
     });
 
     if (!response.ok) {

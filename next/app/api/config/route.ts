@@ -17,7 +17,6 @@ export async function GET(request: NextRequest) {
       const testUrl = `${config.address}/player_api.php?username=${config.username}&password=${config.password}&action=get_live_categories`;
       const response = await fetch(testUrl, {
         method: "GET",
-        timeout: 5000,
       });
 
       return NextResponse.json({
