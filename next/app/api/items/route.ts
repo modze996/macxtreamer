@@ -5,11 +5,12 @@ export async function GET(request: NextRequest) {
   try {
     const config = await getConfig();
     const action = request.nextUrl.searchParams.get("action");
-    const categoryId = request.nextUrl.searchParams.get("category_id");
+    // Accept both cat_id and category_id for flexibility
+    const categoryId = request.nextUrl.searchParams.get("cat_id") || request.nextUrl.searchParams.get("category_id");
 
     if (!action || !categoryId) {
       return NextResponse.json(
-        { error: "Missing action or category_id parameter" },
+        { error: "Missing action or cat_id parameter" },
         { status: 400 }
       );
     }
@@ -41,8 +42,8 @@ export async function GET(request: NextRequest) {
     const items = Array.isArray(data)
       ? data.map((item: any) => ({
           id: item.stream_id || item.series_id || item.id || "",
-          name: item.name || "",
-          cover: item.cover || item.stream_icon || null,
+          name: item.name || item.title || "",
+          image: item.cover || item.stream_icon || item.image || item.thumb || undefined,
           plot: item.plot || "",
           containerExtension: item.container_extension || "mp4",
           streamUrl: item.stream_url || null,
