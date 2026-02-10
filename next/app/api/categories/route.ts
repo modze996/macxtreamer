@@ -1,5 +1,6 @@
 import { NextRequest, NextResponse } from "next/server";
 import { getConfig } from "@/lib/config";
+import { getOrFetch } from "@/lib/cache";
 
 export async function GET(request: NextRequest) {
   try {
@@ -25,35 +26,45 @@ export async function GET(request: NextRequest) {
       );
     }
 
-    const url = `${config.address}/player_api.php?username=${config.username}&password=${config.password}&action=${action}`;
+    const refresh = request.nextUrl.searchParams.get("refresh") === "true";
 
-    const response = await fetch(url, {
-      method: "GET",
-    });
+    const categories = await getOrFetch(
+      config,
+      `categories:${action}`,
+      {},
+      async () => {
+        const url = `${config.address}/player_api.php?username=${config.username}&password=${config.password}&action=${action}`;
 
-    if (!response.ok) {
-      return NextResponse.json(
-        { error: `API returned status ${response.status}` },
-        { status: response.status }
-      );
-    }
+        const response = await fetch(url, {
+          method: "GET",
+        });
 
-    const data = await response.json();
+        if (!response.ok) {
+          const error: any = new Error(`API returned status ${response.status}`);
+          error.status = response.status;
+          throw error;
+        }
 
-    // Validate and clean data
-    const categories = Array.isArray(data)
-      ? data.map((item: any) => ({
-          id: item.category_id || item.id || "",
-          name: item.category_name || item.name || "",
-        }))
-      : [];
+        const data = await response.json();
+
+        return Array.isArray(data)
+          ? data.map((item: any) => ({
+              id: item.category_id || item.id || "",
+              name: item.category_name || item.name || "",
+            }))
+          : [];
+      },
+      { forceRefresh: refresh }
+    );
 
     return NextResponse.json(categories);
   } catch (error) {
     console.error("Error fetching categories:", error);
+    const status = (error as any)?.status ?? 500;
+    const message = (error as any)?.message ?? "Failed to fetch categories";
     return NextResponse.json(
-      { error: "Failed to fetch categories" },
-      { status: 500 }
+      { error: message },
+      { status }
     );
   }
 }

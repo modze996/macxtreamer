@@ -1,5 +1,6 @@
 import { NextRequest, NextResponse } from "next/server";
 import { getConfig } from "@/lib/config";
+import { getOrFetch } from "@/lib/cache";
 
 export async function GET(request: NextRequest) {
   try {
@@ -13,50 +14,61 @@ export async function GET(request: NextRequest) {
       );
     }
 
-    const url = `${config.address}/player_api.php?username=${config.username}&password=${config.password}&action=get_series_info&series_id=${seriesId}`;
+    const refresh = request.nextUrl.searchParams.get("refresh") === "true";
 
-    const response = await fetch(url, {
-      method: "GET",
-    });
+    const episodes = await getOrFetch(
+      config,
+      "series:episodes",
+      { seriesId },
+      async () => {
+        const url = `${config.address}/player_api.php?username=${config.username}&password=${config.password}&action=get_series_info&series_id=${seriesId}`;
 
-    if (!response.ok) {
-      return NextResponse.json(
-        { error: `API returned status ${response.status}` },
-        { status: response.status }
-      );
-    }
+        const response = await fetch(url, {
+          method: "GET",
+        });
 
-    const data = await response.json();
+        if (!response.ok) {
+          const error: any = new Error(`API returned status ${response.status}`);
+          error.status = response.status;
+          throw error;
+        }
 
-    const episodes: any[] = [];
-    const seriesCover =
-      data.info?.movie_image || data.info?.cover || null;
+        const data = await response.json();
 
-    if (data.episodes && typeof data.episodes === "object") {
-      for (const season in data.episodes) {
-        const seasonEpisodes = data.episodes[season];
-        if (Array.isArray(seasonEpisodes)) {
-          for (const ep of seasonEpisodes) {
-            episodes.push({
-              episodeId:
-                ep.episode_id || ep.id || ep.stream_id || "",
-              name: ep.title || ep.name || "",
-              containerExtension:
-                ep.container_extension || "mp4",
-              streamUrl: ep.stream_url || null,
-              cover: ep.cover || seriesCover,
-            });
+        const episodesResult: any[] = [];
+        const seriesCover =
+          data.info?.movie_image || data.info?.cover || null;
+
+        if (data.episodes && typeof data.episodes === "object") {
+          for (const season in data.episodes) {
+            const seasonEpisodes = data.episodes[season];
+            if (Array.isArray(seasonEpisodes)) {
+              for (const ep of seasonEpisodes) {
+                episodesResult.push({
+                  episodeId:
+                    ep.episode_id || ep.id || ep.stream_id || "",
+                  name: ep.title || ep.name || "",
+                  containerExtension:
+                    ep.container_extension || "mp4",
+                  streamUrl: ep.stream_url || null,
+                  cover: ep.cover || seriesCover,
+                });
+              }
+            }
           }
         }
-      }
-    }
+
+        return episodesResult;
+      },
+      { forceRefresh: refresh }
+    );
 
     return NextResponse.json(episodes);
   } catch (error) {
     console.error("Error fetching episodes:", error);
     return NextResponse.json(
       { error: "Failed to fetch episodes" },
-      { status: 500 }
+      { status: (error as any)?.status ?? 500 }
     );
   }
 }

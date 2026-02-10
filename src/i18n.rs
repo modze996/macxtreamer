@@ -88,6 +88,8 @@ pub fn t(key: &str, lang: Language) -> String {
         ("up_to_date", Language::German) => "Sie verwenden die neueste Version",
         ("current_version", Language::English) => "Current version:",
         ("current_version", Language::German) => "Aktuelle Version:",
+        ("available_short", Language::English) => "available",
+        ("available_short", Language::German) => "verfügbar",
         
         // VPN/Download errors  
         ("vpn_error_458", Language::English) => "VPN/Proxy detected by server. Try disconnecting VPN or using different server location.",

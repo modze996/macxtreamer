@@ -1,5 +1,6 @@
 import { NextRequest, NextResponse } from "next/server";
 import { getConfig } from "@/lib/config";
+import { getOrFetch } from "@/lib/cache";
 
 export async function GET(request: NextRequest) {
   try {
@@ -23,53 +24,60 @@ export async function GET(request: NextRequest) {
       );
     }
 
-    const url = `${config.address}/player_api.php?username=${config.username}&password=${config.password}&action=${action}&category_id=${categoryId}`;
+    const refresh = request.nextUrl.searchParams.get("refresh") === "true";
 
-    const response = await fetch(url, {
-      method: "GET",
-    });
+    const items = await getOrFetch(
+      config,
+      `items:${action}`,
+      { categoryId },
+      async () => {
+        const url = `${config.address}/player_api.php?username=${config.username}&password=${config.password}&action=${action}&category_id=${categoryId}`;
 
-    if (!response.ok) {
-      console.error(
-        `[API Items] HTTP ${response.status} for action ${action}, cat_id ${categoryId}`
-      );
-      return NextResponse.json(
-        { error: `API returned status ${response.status}` },
-        { status: response.status }
-      );
-    }
+        const response = await fetch(url, {
+          method: "GET",
+        });
 
-    let data;
-    try {
-      data = await response.json();
-    } catch (err) {
-      const text = await response.text();
-      console.error(
-        `[API Items] JSON parse error for action ${action}, cat_id ${categoryId}. Response: ${text.substring(0, 200)}`
-      );
-      return NextResponse.json(
-        { error: "Invalid JSON response from API" },
-        { status: 500 }
-      );
-    }
+        if (!response.ok) {
+          console.error(
+            `[API Items] HTTP ${response.status} for action ${action}, cat_id ${categoryId}`
+          );
+          const error: any = new Error(`API returned status ${response.status}`);
+          error.status = response.status;
+          throw error;
+        }
 
-    // Validate and clean data
-    const items = Array.isArray(data)
-      ? data.map((item: any) => ({
-          id: item.stream_id || item.series_id || item.id || "",
-          name: item.name || item.title || "",
-          image: item.cover || item.stream_icon || item.image || item.thumb || undefined,
-          plot: item.plot || "",
-          containerExtension: item.container_extension || "mp4",
-          streamUrl: item.stream_url || null,
-          year: item.year || null,
-          rating: item.rating_5based || item.rating || null,
-          genre: item.genre || null,
-          director: item.director || null,
-          cast: item.cast || null,
-          audioLanguages: item.audio_languages || null,
-        }))
-      : [];
+        let data;
+        try {
+          data = await response.json();
+        } catch (err) {
+          const text = await response.text();
+          console.error(
+            `[API Items] JSON parse error for action ${action}, cat_id ${categoryId}. Response: ${text.substring(0, 200)}`
+          );
+          const parseError: any = new Error("Invalid JSON response from API");
+          parseError.status = 500;
+          throw parseError;
+        }
+
+        return Array.isArray(data)
+          ? data.map((item: any) => ({
+              id: item.stream_id || item.series_id || item.id || "",
+              name: item.name || item.title || "",
+              image: item.cover || item.stream_icon || item.image || item.thumb || undefined,
+              plot: item.plot || "",
+              containerExtension: item.container_extension || "mp4",
+              streamUrl: item.stream_url || null,
+              year: item.year || null,
+              rating: item.rating_5based || item.rating || null,
+              genre: item.genre || null,
+              director: item.director || null,
+              cast: item.cast || null,
+              audioLanguages: item.audio_languages || null,
+            }))
+          : [];
+      },
+      { forceRefresh: refresh }
+    );
 
     return NextResponse.json(items);
   } catch (error) {
@@ -79,7 +87,7 @@ export async function GET(request: NextRequest) {
         error:
           error instanceof Error ? error.message : "Failed to fetch items",
       },
-      { status: 500 }
+      { status: (error as any)?.status ?? 500 }
     );
   }
 }

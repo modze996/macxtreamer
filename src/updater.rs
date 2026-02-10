@@ -41,7 +41,9 @@ pub struct GitHubAsset {
 pub struct UpdateInfo {
     pub latest_version: String,
     pub update_available: bool,
+    #[allow(dead_code)]
     pub release_notes: String,
+    #[allow(dead_code)]
     pub download_url: Option<String>,
 }
 
@@ -115,6 +117,7 @@ pub async fn check_for_updates(current_version: &str) -> Result<UpdateInfo, Stri
 }
 
 /// Download DMG and install update automatically (macOS)
+#[allow(dead_code)]
 pub async fn download_and_install_update(download_url: &str, version: &str) -> Result<String, String> {
     use futures_util::StreamExt;
     use std::io::Write;

@@ -207,6 +207,22 @@ fn setup_custom_fonts(ctx: &egui::Context) {
     println!("✅ Font-Konfiguration angewendet mit erweiterten Unicode-Bereichen");
 }
 
+#[derive(Clone)]
+struct Toast {
+    message: String,
+    toast_type: ToastType,
+    created_at: std::time::Instant,
+}
+
+#[derive(Clone, Copy, PartialEq)]
+enum ToastType {
+    Info,
+    Success,
+    Warning,
+    #[allow(dead_code)]
+    Error,
+}
+
 struct MacXtreamer {
         // Sichtbare und sortierte Spalten
         column_config: Vec<ColumnKey>,
@@ -317,13 +333,14 @@ struct MacXtreamer {
     epg_loading: HashSet<String>, // Track which channels are loading EPG
     
     // Update system
-    show_update_dialog: bool,
-    show_no_update_dialog: bool,
     available_update: Option<updater::UpdateInfo>,
     checking_for_updates: bool,
     update_downloading: bool,
     update_installing: bool,
     update_progress: String,
+    
+    // Toast notifications
+    toasts: Vec<Toast>,
 }
 
 impl MacXtreamer {
@@ -479,10 +496,9 @@ impl MacXtreamer {
             epg_loading: HashSet::new(),
             
             // Update system  
-            show_update_dialog: false,
-            show_no_update_dialog: false,
             available_update: None,
             checking_for_updates: false,
+            toasts: Vec::new(),
             update_downloading: false,
             update_installing: false,
             update_progress: String::new(),
@@ -530,6 +546,102 @@ impl MacXtreamer {
         
         // Check once per day (86400 seconds)
         now - self.config.last_update_check > 86400
+    }
+    
+    fn add_toast(&mut self, message: String, toast_type: ToastType) {
+        self.toasts.push(Toast {
+            message,
+            toast_type,
+            created_at: std::time::Instant::now(),
+        });
+    }
+    
+    fn render_toasts(&mut self, ctx: &egui::Context) {
+        const TOAST_DURATION: f32 = 5.0; // seconds
+        const TOAST_FADE_OUT: f32 = 1.0; // seconds fade-out
+        
+        let now = std::time::Instant::now();
+        
+        // Remove expired toasts
+        self.toasts.retain(|toast| {
+            now.duration_since(toast.created_at).as_secs_f32() < TOAST_DURATION + TOAST_FADE_OUT
+        });
+        
+        let has_active_toasts = !self.toasts.is_empty();
+        
+        // Render toasts
+        if has_active_toasts {
+            let screen_rect = ctx.screen_rect();
+            let toast_width = 400.0;
+            let toast_spacing = 10.0;
+            let margin = 20.0;
+            
+            for (i, toast) in self.toasts.iter().enumerate() {
+                let elapsed = now.duration_since(toast.created_at).as_secs_f32();
+                let alpha = if elapsed > TOAST_DURATION {
+                    1.0 - ((elapsed - TOAST_DURATION) / TOAST_FADE_OUT)
+                } else {
+                    1.0
+                };
+                
+                if alpha <= 0.0 {
+                    continue;
+                }
+                
+                let y_offset = margin + (i as f32) * (60.0 + toast_spacing);
+                let pos = egui::pos2(
+                    screen_rect.right() - toast_width - margin,
+                    screen_rect.top() + y_offset,
+                );
+                
+                let (bg_color, text_color) = match toast.toast_type {
+                    ToastType::Info => (
+                        Color32::from_rgba_unmultiplied(60, 120, 180, (200.0 * alpha) as u8),
+                        Color32::from_rgba_unmultiplied(255, 255, 255, (255.0 * alpha) as u8),
+                    ),
+                    ToastType::Success => (
+                        Color32::from_rgba_unmultiplied(60, 180, 80, (200.0 * alpha) as u8),
+                        Color32::from_rgba_unmultiplied(255, 255, 255, (255.0 * alpha) as u8),
+                    ),
+                    ToastType::Warning => (
+                        Color32::from_rgba_unmultiplied(220, 180, 60, (200.0 * alpha) as u8),
+                        Color32::from_rgba_unmultiplied(40, 40, 40, (255.0 * alpha) as u8),
+                    ),
+                    ToastType::Error => (
+                        Color32::from_rgba_unmultiplied(200, 60, 60, (200.0 * alpha) as u8),
+                        Color32::from_rgba_unmultiplied(255, 255, 255, (255.0 * alpha) as u8),
+                    ),
+                };
+                
+                egui::Area::new(egui::Id::new(format!("toast_{}", i)))
+                    .fixed_pos(pos)
+                    .show(ctx, |ui| {
+                        egui::Frame::none()
+                            .fill(bg_color)
+                            .rounding(8.0)
+                            .inner_margin(egui::Margin::symmetric(16.0, 12.0))
+                            .shadow(egui::epaint::Shadow {
+                                extrusion: 8.0,
+                                color: Color32::from_black_alpha((50.0 * alpha) as u8),
+                            })
+                            .show(ui, |ui| {
+                                ui.set_max_width(toast_width - 32.0);
+                                ui.style_mut().wrap = Some(true);
+                                ui.label(RichText::new(&toast.message).color(text_color));
+                            });
+                    });
+            }
+            
+            // Request repaint only if toasts are still animating (not at the end of their lifetime)
+            let min_elapsed = self.toasts.iter()
+                .map(|t| now.duration_since(t.created_at).as_secs_f32())
+                .min_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal))
+                .unwrap_or(0.0);
+            
+            if min_elapsed < TOAST_DURATION + TOAST_FADE_OUT {
+                ctx.request_repaint_after(Duration::from_millis(100)); // Repaint less frequently (every 100ms)
+            }
+        }
     }
 
     fn reload_categories(&mut self) {
@@ -650,6 +762,7 @@ impl MacXtreamer {
         }
     }
     
+    #[allow(dead_code)]
     fn start_update_download(&mut self, update_info: &updater::UpdateInfo) {
         if let Some(ref download_url) = update_info.download_url {
             self.update_downloading = true;
@@ -1903,8 +2016,19 @@ impl eframe::App for MacXtreamer {
         let now = std::time::Instant::now();
         let dt = now.duration_since(self.last_frame_time).as_millis() as f32;
         self.last_frame_time = now;
-        // Zeit seit letztem erzwungenen Repaint (ms) für Ultra Flicker Guard
-        let time_since_forced: u64 = now.duration_since(self.last_forced_repaint).as_millis() as u64;
+        
+        // FLICKER FIX: Nach Sleep/Ruhemodus: Detect große Zeitsprünge (>5s) und reset Repaint-Timing
+        // Dies verhindert aggressives Flackern nach Ruhemodus
+        let time_since_forced_raw: u64 = now.duration_since(self.last_forced_repaint).as_millis() as u64;
+        let is_after_sleep = time_since_forced_raw > 5000; // Threshold für Ruhemodus-Erkennung
+        let time_since_forced = if is_after_sleep {
+            // Nach Ruhemodus: reset Timing um Flackern zu vermeiden
+            self.last_forced_repaint = now;
+            0
+        } else {
+            time_since_forced_raw
+        };
+        
         // Exponentielles Glätten
         if self.avg_frame_ms == 0.0 { self.avg_frame_ms = dt; } else { self.avg_frame_ms = self.avg_frame_ms * 0.9 + dt * 0.1; }
 
@@ -1974,11 +2098,12 @@ impl eframe::App for MacXtreamer {
         let mut got_msg = false;
         let mut covers_to_prefetch: Vec<String> = Vec::new();
         let mut message_count = 0;
-        const MAX_MESSAGES_PER_FRAME: usize = 3; // Very strict limit!
+        // After sleep: significantly reduce message processing to prevent flicker
+        let max_msgs_per_frame = if is_after_sleep { 1 } else { 3 };
         
         while let Ok(msg) = self.rx.try_recv() {
             message_count += 1;
-            if message_count > MAX_MESSAGES_PER_FRAME {
+            if message_count > max_msgs_per_frame {
                 break; // Prevent infinite message processing
             }
             got_msg = true;
@@ -2504,7 +2629,6 @@ impl eframe::App for MacXtreamer {
                     println!("🏗️ Index aufgebaut: {} Movies, {} Series, {} Channels", _m, _s, _c);
                     self.indexing = false;
                     self.search_status = SearchStatus::Idle;
-                    self.search_status = SearchStatus::Idle;
                     
                     // If we have a search query, flag to perform/repeat the search
                     // This ensures search includes all content types (movies, series, channels)
@@ -2788,27 +2912,45 @@ impl eframe::App for MacXtreamer {
                 }
                 Msg::UpdateAvailable(update_info) => {
                     println!("📲 Received UpdateAvailable message");
+                    let version = update_info.latest_version.clone();
                     self.available_update = Some(update_info);
-                    self.show_update_dialog = true;
+                    self.add_toast(
+                        format!("🎉 {} {} {}", 
+                            t("new_version", self.config.language),
+                            version,
+                            t("available_short", self.config.language)
+                        ),
+                        ToastType::Success
+                    );
                     self.checking_for_updates = false;
                 }
                 Msg::NoUpdateAvailable => {
                     println!("📲 Received NoUpdateAvailable message");
                     self.checking_for_updates = false;
-                    self.show_no_update_dialog = true;
+                    self.add_toast(
+                        format!("✓ {}", t("up_to_date", self.config.language)),
+                        ToastType::Info
+                    );
                 }
                 Msg::UpdateError(error) => {
                     println!("📲 Received UpdateError message: {}", error);
                     self.checking_for_updates = false;
                     self.update_downloading = false;
                     self.update_installing = false;
-                    self.last_error = Some(error);
+                    // Only show toast for initial update check errors, not manual ones
+                    if !self.show_config {
+                        self.add_toast(
+                            format!("ℹ️ {}", error),
+                            ToastType::Warning
+                        );
+                    } else {
+                        self.last_error = Some(error);
+                    }
                 }
                 Msg::UpdateInstalled => {
                     println!("📲 Received UpdateInstalled message");
                     self.update_downloading = false;
                     self.update_installing = false;
-                    self.show_update_dialog = false;
                     self.update_progress = "Installation complete! Restarting app...".to_string();
                     // Schedule app restart after a brief delay
                     std::thread::spawn(|| {
@@ -2831,9 +2973,14 @@ impl eframe::App for MacXtreamer {
         } // end while let Ok(msg)
     
     // After message processing, request repaint if messages arrived
-    if self.pending_repaint_due_to_msg || got_msg {
+    // FLICKER FIX: Nach Sleep - nur vorsichtig repainten um Flackern zu vermeiden
+    if (self.pending_repaint_due_to_msg || got_msg) && !is_after_sleep {
         ctx.request_repaint();
         self.last_forced_repaint = now;
+        self.pending_repaint_due_to_msg = false;
+    } else if is_after_sleep && (self.pending_repaint_due_to_msg || got_msg) {
+        // Nach Sleep: setze Flag aber keine sofortige Repaint - warte bis nächster Frame
+        // Dies verhindert aggressives Flackern beim Aufwachen
         self.pending_repaint_due_to_msg = false;
     }
     // Otherwise, don't force repaints - let egui widgets (spinners, progress bars) handle their own animation
@@ -2852,7 +2999,8 @@ impl eframe::App for MacXtreamer {
 
         // CRITICAL CPU FIX: Massively reduce repaint frequency to prevent CPU overload
         // 50ms was causing 400% CPU usage!
-        if got_msg {
+        // FLICKER FIX: Nach Sleep - vermeide aggressive Repaints
+        if got_msg && !is_after_sleep {
             // Only repaint for critical loading states, and much less frequently
             if self.is_loading {
                 ctx.request_repaint_after(Duration::from_millis(1000)); // 1 second instead of 50ms!
@@ -2866,8 +3014,10 @@ impl eframe::App for MacXtreamer {
         
         // Download Heartbeat: ensure download progress UI updates regularly
         // This is critical - users need to see downloads progressing even without mouse movement
-        if has_active_downloads {
-            ctx.request_repaint_after(Duration::from_millis(500)); // Show download progress every 500ms
+        // FLICKER FIX: Nach Sleep - verlängere die Download-Heartbeat-Intervalle
+        let heartbeat_interval = if is_after_sleep { 1500 } else { 500 };
+        if has_active_downloads && !is_after_sleep {
+            ctx.request_repaint_after(Duration::from_millis(heartbeat_interval)); // Show download progress every 500ms
         }
 
         // Idle Governor: only throttle to 1 FPS if there's absolutely nothing going on
@@ -2877,7 +3027,7 @@ impl eframe::App for MacXtreamer {
             && !has_active_downloads
             && self.downloads.iter().all(|(_, s)| s.finished || s.error.is_some() || s.waiting);
         
-        if is_completely_idle {
+        if is_completely_idle && !is_after_sleep {
             // Enforce a low-frequency heartbeat to keep UI responsive without burning CPU
             ctx.request_repaint_after(Duration::from_millis(1000));
         }
@@ -5309,97 +5459,6 @@ impl eframe::App for MacXtreamer {
             self.show_error_dialog = open;
         }
 
-        // No update dialog window
-        if self.show_no_update_dialog {
-            let mut open = self.show_no_update_dialog;
-            egui::Window::new(&t("no_update_available", self.config.language))
-                .collapsible(false)
-                .resizable(false)
-                .default_width(400.0)
-                .anchor(egui::Align2::CENTER_CENTER, egui::vec2(0.0, 0.0))
-                .open(&mut open)
-                .show(ctx, |ui| {
-                    ui.add_space(8.0);
-                    ui.label(&t("up_to_date", self.config.language));
-                    ui.add_space(4.0);
-                    ui.label(format!("{} {}", t("current_version", self.config.language), env!("CARGO_PKG_VERSION")));
-                    ui.add_space(12.0);
-                    
-                    ui.separator();
-                    ui.add_space(4.0);
-                    
-                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        if ui.button("OK").clicked() {
-                            self.show_no_update_dialog = false;
-                        }
-                    });
-                });
-            self.show_no_update_dialog = open;
-        }
-
-        // Update dialog window
-        if self.show_update_dialog {
-            let mut open = self.show_update_dialog;
-            let mut close_requested = false;
-            
-            egui::Window::new(&t("update_available", self.config.language))
-                .collapsible(false)
-                .resizable(true)
-                .default_width(500.0)
-                .default_height(300.0)
-                .max_width(800.0)
-                .max_height(600.0)
-                .anchor(egui::Align2::CENTER_CENTER, egui::vec2(0.0, 0.0))
-                .open(&mut open)
-                .show(ctx, |ui| {
-                    if let Some(update) = self.available_update.clone() {
-                        ui.heading(format!("{} {}", t("new_version", self.config.language), update.latest_version));
-                        ui.add_space(8.0);
-                        
-                        if !update.release_notes.is_empty() {
-                            ui.label(format!("{}", t("release_notes", self.config.language)));
-                            egui::ScrollArea::vertical()
-                                .max_height(200.0)
-                                .auto_shrink([false, true])
-                                .show(ui, |ui| {
-                                    ui.style_mut().wrap = Some(true);
-                                    ui.label(&update.release_notes);
-                                });
-                            ui.add_space(8.0);
-                        }
-                        
-                        if self.update_downloading {
-                            ui.separator();
-                            ui.add_space(4.0);
-                            ui.label(format!("⬇️ {}", self.update_progress));
-                        } else if self.update_installing {
-                            ui.separator();
-                            ui.add_space(4.0);
-                            ui.label("⚙️ Installing update...");
-                        } else {
-                            ui.separator();
-                            ui.add_space(4.0);
-                            
-                            ui.horizontal(|ui| {
-                                if ui.button(&t("download_update", self.config.language)).clicked() {
-                                    self.start_update_download(&update);
-                                }
-                                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                                    if ui.button(&t("later", self.config.language)).clicked() {
-                                        close_requested = true;
-                                    }
-                                });
-                            });
-                        }
-                    }
-                });
-            
-            if close_requested {
-                open = false;
-            }
-            self.show_update_dialog = open;
-        }
-
         // (Bottom panel already rendered above CentralPanel)
 
         // Handle deferred save to avoid mutable borrow inside Window closure
@@ -5515,6 +5574,9 @@ impl eframe::App for MacXtreamer {
             self.perform_player_detection();
             self.pending_player_redetect = false;
         }
+        
+        // Render toasts
+        self.render_toasts(ctx);
 
         // Process any pending bulk downloads enqueued by messages to avoid borrow conflicts
         if !self.pending_bulk_downloads.is_empty() {

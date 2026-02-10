@@ -2,8 +2,8 @@ import type { Metadata } from "next";
 import "./globals.css";
 
 export const metadata: Metadata = {
-  title: "MacXStreamer Web",
-  description: "Web frontend for MacXStreamer IPTV player",
+  title: "nextreamer - IPTV Streaming",
+  description: "Modern IPTV streaming platform with Next.js",
 };
 
 export default function RootLayout({
@@ -13,7 +13,7 @@ export default function RootLayout({
 }) {
   return (
     <html lang="de">
-      <body className="bg-gray-900 text-white">
+      <body className="bg-[#050505] text-white antialiased">
         {children}
       </body>
     </html>

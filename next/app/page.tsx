@@ -1,13 +1,25 @@
 "use client";
 
 import { useEffect, useState } from "react";
-import Link from "next/link";
-import { Play, Grid3x3 } from "lucide-react";
-
-interface Category {
-  id: string;
-  name: string;
-}
+import Sidebar from "@/components/Sidebar";
+import TopBar from "@/components/TopBar";
+import ContinueWatching from "@/components/ContinueWatching";
+import HorizontalRow from "@/components/HorizontalRow";
+import TvGuide from "@/components/TvGuide";
+import {
+  HorizontalRowSkeleton,
+  ContinueWatchingSkeleton,
+  TvGuideSkeleton,
+} from "@/components/LoadingSkeletons";
+import {
+  fetchCategories,
+  fetchItems,
+  convertStreamToContentItem,
+  getContinueWatching,
+  type Category,
+  type ContentItem,
+  type ContinueWatchingItem,
+} from "@/lib/api";
 
 interface ConfigStatus {
   configured: boolean;
@@ -19,11 +31,16 @@ interface ConfigStatus {
 
 export default function Home() {
   const [configStatus, setConfigStatus] = useState<ConfigStatus | null>(null);
-  const [liveCategories, setLiveCategories] = useState<Category[]>([]);
-  const [vodCategories, setVodCategories] = useState<Category[]>([]);
-  const [seriesCategories, setSeriesCategories] = useState<Category[]>([]);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
+  
+  // Real data states
+  const [seriesCategories, setSeriesCategories] = useState<Category[]>([]);
+  const [vodCategories, setVodCategories] = useState<Category[]>([]);
+  const [popularSeries, setPopularSeries] = useState<ContentItem[]>([]);
+  const [popularMovies, setPopularMovies] = useState<ContentItem[]>([]);
+  const [favoriteSeries, setFavoriteSeries] = useState<ContentItem[]>([]);
+  const [continueWatchingItems, setContinueWatchingItems] = useState<ContinueWatchingItem[]>([]);
 
   useEffect(() => {
     const fetchData = async () => {
@@ -49,29 +66,46 @@ export default function Home() {
           return;
         }
 
+        // Load continue watching from localStorage
+        const continueWatching = getContinueWatching();
+        setContinueWatchingItems(continueWatching);
+
         // Fetch categories
-        const [liveRes, vodRes, seriesRes] = await Promise.all([
-          fetch("/api/categories?action=get_live_categories"),
-          fetch("/api/categories?action=get_vod_categories"),
-          fetch("/api/categories?action=get_series_categories"),
+        const [seriesCats, vodCats] = await Promise.all([
+          fetchCategories("series"),
+          fetchCategories("vod"),
         ]);
 
-        if (liveRes.ok) {
-          setLiveCategories(await liveRes.json());
+        setSeriesCategories(seriesCats);
+        setVodCategories(vodCats);
+
+        // Fetch popular content from first categories
+        if (seriesCats.length > 0) {
+          const seriesItems = await fetchItems("series", seriesCats[0].id);
+          const converted = seriesItems
+            .slice(0, 6)
+            .map((item, index) => convertStreamToContentItem(item, index + 1));
+          setPopularSeries(converted);
+          
+          // Use some for favorites too (in real app, filter by user's favorites)
+          setFavoriteSeries(converted.slice(0, 5));
         }
-        if (vodRes.ok) {
-          setVodCategories(await vodRes.json());
+
+        if (vodCats.length > 0) {
+          const vodItems = await fetchItems("vod", vodCats[0].id);
+          const converted = vodItems
+            .slice(0, 6)
+            .map((item, index) => convertStreamToContentItem(item, index + 1));
+          setPopularMovies(converted);
         }
-        if (seriesRes.ok) {
-          setSeriesCategories(await seriesRes.json());
-        }
+
+        setLoading(false);
       } catch (err) {
         setError(
           err instanceof Error
             ? err.message
             : "Failed to load data"
         );
-      } finally {
         setLoading(false);
       }
     };
@@ -79,122 +113,168 @@ export default function Home() {
     fetchData();
   }, []);
 
+  // Mock data for demo purposes
+  const xtreamAccounts = [
+    { id: "1", name: configStatus?.address ? "Main IPTV" : "IPTV Account" },
+  ];
+
+  const tvGuideChannels = [
+    {
+      id: "1",
+      name: "Sky Bundesliga 1 HD",
+      category: "bundesliga",
+      programs: [
+        { id: "1", title: "Bundesliga Konferenz", startTime: "15:30", endTime: "17:30", duration: 120 },
+        { id: "2", title: "Highlights & Analysen", startTime: "17:30", endTime: "18:30", duration: 60 },
+      ],
+    },
+    {
+      id: "2",
+      name: "Sky Bundesliga 2 HD",
+      category: "bundesliga",
+      programs: [
+        { id: "3", title: "Bayern München - Dortmund", startTime: "15:30", endTime: "17:15", duration: 105 },
+        { id: "4", title: "Vorschau", startTime: "17:15", endTime: "17:45", duration: 30 },
+      ],
+    },
+    {
+      id: "3",
+      name: "Sky Sport 2. Liga HD",
+      category: "2bundesliga",
+      programs: [
+        { id: "5", title: "2. Bundesliga Konferenz", startTime: "13:00", endTime: "15:00", duration: 120 },
+        { id: "6", title: "Highlights", startTime: "15:00", endTime: "16:00", duration: 60 },
+      ],
+    },
+    {
+      id: "4",
+      name: "DAZN 1 HD",
+      category: "dazn",
+      programs: [
+        { id: "7", title: "Champions League Live", startTime: "21:00", endTime: "23:00", duration: 120 },
+      ],
+    },
+    {
+      id: "5",
+      name: "DAZN 2 HD",
+      category: "dazn",
+      programs: [
+        { id: "8", title: "UEFA Europa League", startTime: "18:45", endTime: "20:45", duration: 120 },
+        { id: "9", title: "Highlights", startTime: "20:45", endTime: "21:30", duration: 45 },
+      ],
+    },
+  ];
+
   if (loading) {
     return (
-      <div className="min-h-screen flex items-center justify-center">
-        <div className="text-center">
-          <div className="inline-block animate-spin rounded-full h-12 w-12 border-b-2 border-white"></div>
-          <p className="mt-4">Loading...</p>
+      <div className="flex min-h-screen bg-[#050505]">
+        <Sidebar accounts={xtreamAccounts} />
+        
+        <main className="flex-1 lg:ml-64 p-4 md:p-6 lg:p-8 pt-16 lg:pt-8">
+          <TopBar 
+            title="Startseite" 
+            onSearch={(query) => console.log("Search:", query)}
+          />
+          
+          {/* Loading Skeletons */}
+          <ContinueWatchingSkeleton />
+          <HorizontalRowSkeleton type="poster" />
+          <HorizontalRowSkeleton type="poster" />
+          <HorizontalRowSkeleton type="poster" />
+          <TvGuideSkeleton />
+        </main>
+      </div>
+    );
+  }
+
+  if (error) {
+    return (
+      <div className="min-h-screen flex items-center justify-center bg-[#050505]">
+        <div className="max-w-md w-full mx-4">
+          <div className="bg-red-900/20 border border-red-700 rounded-lg p-6">
+            <p className="text-red-200">{error}</p>
+          </div>
         </div>
       </div>
     );
   }
 
   return (
-    <main className="min-h-screen bg-gradient-to-br from-gray-900 to-black">
-      {/* Header */}
-      <header className="bg-gray-800 border-b border-gray-700 sticky top-0 z-50">
-        <div className="max-w-7xl mx-auto px-4 py-6">
-          <div className="flex items-center justify-between">
-            <div>
-              <h1 className="text-3xl font-bold">MacXStreamer Web</h1>
-              {configStatus?.address && (
-                <p className="text-gray-400 text-sm mt-2">
-                  Connected to: {configStatus.address}
-                </p>
-              )}
+    <div className="flex min-h-screen bg-[#050505]">
+      {/* Sidebar */}
+      <Sidebar accounts={xtreamAccounts} />
+
+      {/* Main Content */}
+      <main className="flex-1 lg:ml-64 p-4 md:p-6 lg:p-8 pt-16 lg:pt-8">
+        {/* Top Bar */}
+        <TopBar 
+          title="Startseite" 
+          onSearch={(query) => console.log("Search:", query)}
+        />
+
+        {/* Continue Watching */}
+        {continueWatchingItems.length > 0 && (
+          <ContinueWatching items={continueWatchingItems} />
+        )}
+
+        {/* Favorite Series */}
+        {favoriteSeries.length > 0 && (
+          <HorizontalRow 
+            title="Lieblingsserien" 
+            items={favoriteSeries}
+            type="poster"
+            contentType="series"
+          />
+        )}
+
+        {/* Popular Series */}
+        {popularSeries.length > 0 && (
+          <HorizontalRow 
+            title="Beliebte Serien" 
+            items={popularSeries}
+            type="poster"
+            contentType="series"
+          />
+        )}
+
+        {/* Popular Movies */}
+        {popularMovies.length > 0 && (
+          <HorizontalRow 
+            title="Beliebte Filme" 
+            items={popularMovies}
+            type="poster"
+            contentType="vod"
+          />
+        )}
+
+        {/* Show message if no content */}
+        {continueWatchingItems.length === 0 && 
+         popularSeries.length === 0 && 
+         popularMovies.length === 0 && 
+         favoriteSeries.length === 0 && (
+          <div className="flex items-center justify-center py-20">
+            <div className="text-center">
+              <div className="text-6xl mb-4">📺</div>
+              <h3 className="text-xl font-semibold text-white mb-2">
+                Willkommen bei nextreamer
+              </h3>
+              <p className="text-gray-400">
+                Laden Sie Inhalte von Ihrem IPTV-Anbieter...
+              </p>
             </div>
-            <Link
-              href="/browser"
-              className="flex items-center gap-2 bg-blue-600 hover:bg-blue-700 rounded-lg px-6 py-3 font-semibold transition"
-            >
-              <Grid3x3 size={20} />
-              Browser View
-            </Link>
+          </div>
+        )}
+
+        {/* TV Guide */}
+        <TvGuide channels={tvGuideChannels} loading={false} />
+
+        {/* Footer Status */}
+        <div className="flex justify-center mt-8 mb-4">
+          <div className="bg-gray-800/50 border border-gray-700 rounded-full px-4 py-2 text-sm text-gray-400">
+            EPG wurden geladen
           </div>
         </div>
-      </header>
-
-      {error ? (
-        <div className="max-w-7xl mx-auto px-4 py-8">
-          <div className="bg-red-900 border border-red-700 rounded-lg p-4">
-            <p className="text-red-200">{error}</p>
-          </div>
-        </div>
-      ) : (
-        <div className="max-w-7xl mx-auto px-4 py-8">
-          {/* Live Categories */}
-          {liveCategories.length > 0 && (
-            <section className="mb-12">
-              <h2 className="text-2xl font-bold mb-6">📺 Live TV</h2>
-              <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-4">
-                {liveCategories.map((cat) => (
-                  <Link
-                    key={cat.id}
-                    href={`/live/${cat.id}`}
-                    className="bg-gray-800 hover:bg-gray-700 rounded-lg p-4 transition cursor-pointer border border-gray-700"
-                  >
-                    <h3 className="font-semibold text-lg">{cat.name}</h3>
-                    <p className="text-gray-400 text-sm mt-2">
-                      View channels →
-                    </p>
-                  </Link>
-                ))}
-              </div>
-            </section>
-          )}
-
-          {/* VOD Categories */}
-          {vodCategories.length > 0 && (
-            <section className="mb-12">
-              <h2 className="text-2xl font-bold mb-6">🎬 Movies</h2>
-              <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-4">
-                {vodCategories.map((cat) => (
-                  <Link
-                    key={cat.id}
-                    href={`/vod/${cat.id}`}
-                    className="bg-gray-800 hover:bg-gray-700 rounded-lg p-4 transition cursor-pointer border border-gray-700"
-                  >
-                    <h3 className="font-semibold text-lg">{cat.name}</h3>
-                    <p className="text-gray-400 text-sm mt-2">
-                      View movies →
-                    </p>
-                  </Link>
-                ))}
-              </div>
-            </section>
-          )}
-
-          {/* Series Categories */}
-          {seriesCategories.length > 0 && (
-            <section className="mb-12">
-              <h2 className="text-2xl font-bold mb-6">📺 Series</h2>
-              <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-4">
-                {seriesCategories.map((cat) => (
-                  <Link
-                    key={cat.id}
-                    href={`/series/${cat.id}`}
-                    className="bg-gray-800 hover:bg-gray-700 rounded-lg p-4 transition cursor-pointer border border-gray-700"
-                  >
-                    <h3 className="font-semibold text-lg">{cat.name}</h3>
-                    <p className="text-gray-400 text-sm mt-2">
-                      View series →
-                    </p>
-                  </Link>
-                ))}
-              </div>
-            </section>
-          )}
-
-          {liveCategories.length === 0 &&
-            vodCategories.length === 0 &&
-            seriesCategories.length === 0 && (
-              <div className="bg-gray-800 border border-gray-700 rounded-lg p-8 text-center">
-                <p className="text-gray-400">No categories found</p>
-              </div>
-            )}
-        </div>
-      )}
-    </main>
+      </main>
+    </div>
   );
 }

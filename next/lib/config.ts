@@ -6,28 +6,33 @@ export interface Config {
   address: string;
   username: string;
   password: string;
+  /** Optional override in days for API response cache TTL */
+  cacheDays?: number;
 }
 
 let cachedConfig: Config | null = null;
 
 function parseTomlConfig(content: string): Config | null {
   // Try TOML format first
-  let addressMatch = content.match(/address\s*=\s*['"](.*?)['"]/);
-  let usernameMatch = content.match(/username\s*=\s*['"](.*?)['"]/);
-  let passwordMatch = content.match(/password\s*=\s*['"](.*?)['"]/);
+  let addressMatch = content.match(/address\s*=\s*['\"](.*?)['\"]/);
+  let usernameMatch = content.match(/username\s*=\s*['\"](.*?)['\"]/);
+  let passwordMatch = content.match(/password\s*=\s*['\"](.*?)['\"]/);
+  let cacheDaysMatch = content.match(/cache_days\s*=\s*['\"]?(\d+)['\"]?/);
 
   // If TOML format doesn't work, try plain key=value format (from Rust app)
   if (!addressMatch || !usernameMatch || !passwordMatch) {
     addressMatch = content.match(/^address\s*=\s*(.+?)$/m);
     usernameMatch = content.match(/^username\s*=\s*(.+?)$/m);
     passwordMatch = content.match(/^password\s*=\s*(.+?)$/m);
+    cacheDaysMatch = content.match(/^cache_days\s*=\s*(\d+)$/m);
   }
 
   if (addressMatch && usernameMatch && passwordMatch) {
     return {
-      address: addressMatch[1].trim().replace(/^['"]|['"]$/g, ''),
-      username: usernameMatch[1].trim().replace(/^['"]|['"]$/g, ''),
-      password: passwordMatch[1].trim().replace(/^['"]|['"]$/g, ''),
+      address: addressMatch[1].trim().replace(/^['\"]|['\"]$/g, ''),
+      username: usernameMatch[1].trim().replace(/^['\"]|['\"]$/g, ''),
+      password: passwordMatch[1].trim().replace(/^['\"]|['\"]$/g, ''),
+      cacheDays: cacheDaysMatch ? Number(cacheDaysMatch[1]) : undefined,
     };
   }
 
@@ -95,4 +100,26 @@ export async function getConfig(): Promise<Config> {
     );
   }
   return config;
+}
+
+const DEFAULT_CACHE_DAYS = 5;
+
+function resolveCacheDays(config?: Config): number {
+  const envValue =
+    process.env.MACXTREAMER_CACHE_DAYS || process.env.NEXT_PUBLIC_MACXTREAMER_CACHE_DAYS;
+
+  if (envValue && !Number.isNaN(Number(envValue))) {
+    return Math.max(0, Number(envValue));
+  }
+
+  if (config?.cacheDays !== undefined && !Number.isNaN(Number(config.cacheDays))) {
+    return Math.max(0, Number(config.cacheDays));
+  }
+
+  return DEFAULT_CACHE_DAYS;
+}
+
+export function getCacheTtlMs(config?: Config): number {
+  const days = resolveCacheDays(config);
+  return days * 24 * 60 * 60 * 1000;
 }
