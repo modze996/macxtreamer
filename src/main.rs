@@ -2182,7 +2182,9 @@ impl eframe::App for MacXtreamer {
         let mut covers_to_prefetch: Vec<String> = Vec::new();
         let mut message_count = 0;
         // After sleep: significantly reduce message processing to prevent flicker
-        let max_msgs_per_frame = if is_after_sleep { 1 } else { 3 };
+        // During wake cooldown process 2 messages/frame: enough to drain the queue
+        // without triggering the repaint burst that is_after_sleep / in_wake_cooldown guards against.
+        let max_msgs_per_frame = if is_after_sleep { 2 } else { 5 };
         
         while let Ok(msg) = self.rx.try_recv() {
             message_count += 1;
@@ -3177,8 +3179,13 @@ impl eframe::App for MacXtreamer {
         // Verarbeite pro Frame nur ein kleines Budget an Texture-Uploads,
         // um Frame-Drops beim Scrollen zu vermeiden.
         {
-            let max_uploads_per_frame: usize =
-                self.config.cover_uploads_per_frame.max(1).min(16) as usize;
+            // During wake cooldown: upload at most 1 texture per frame to avoid a burst of state
+            // changes that trigger immediate repaints from the texture-atlas resize.
+            let max_uploads_per_frame: usize = if in_wake_cooldown {
+                1
+            } else {
+                self.config.cover_uploads_per_frame.max(1).min(16) as usize
+            };
             let mut done = 0usize;
             while done < max_uploads_per_frame {
                 let Some((url, rgba_bytes, w, h)) = self.pending_texture_uploads.pop_front() else {
@@ -3215,6 +3222,16 @@ impl eframe::App for MacXtreamer {
                     self.textures.remove(&k);
                 }
             }
+        }
+
+        // --- Post-wake repaint throttle ------------------------------------------
+        // During the cooldown window we must still schedule repaints (so the UI
+        // isn't frozen) but at a capped rate of ~5 FPS.  All the guards above
+        // already skip immediate request_repaint() calls when in_wake_cooldown,
+        // so this single call provides the gentle heartbeat that keeps the UI
+        // updating without triggering the burst that causes visible flicker.
+        if in_wake_cooldown {
+            ctx.request_repaint_after(Duration::from_millis(200));
         }
 
         let win_h = ctx.input(|i| i.screen_rect().height());
