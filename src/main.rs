@@ -41,6 +41,7 @@ mod icon;
 mod images;
 mod logger;
 mod models;
+mod network;
 mod player;
 mod search;
 mod storage;
@@ -168,7 +169,7 @@ fn setup_custom_fonts(ctx: &egui::Context) {
         if !loaded_fonts.is_empty() {
             println!("✅ Fonts geladen: {}", loaded_fonts.join(", "));
         } else {
-            println!("⚠️ Keine zusätzlichen Fonts geladen - Unicode-Zeichen könnten nicht korrekt dargestellt werden");
+            println!("⚠️ No additional fonts loaded - some Unicode characters may not render correctly");
         }
     }
     
@@ -204,7 +205,7 @@ fn setup_custom_fonts(ctx: &egui::Context) {
     
     // Force immediate font atlas rebuild with full Unicode support
     ctx.request_repaint();
-    println!("✅ Font-Konfiguration angewendet mit erweiterten Unicode-Bereichen");
+    println!("✅ Font configuration applied with extended Unicode ranges");
 }
 
 #[derive(Clone)]
@@ -327,6 +328,11 @@ struct MacXtreamer {
     last_forced_repaint: std::time::Instant,
     pending_repaint_due_to_msg: bool,
     pending_player_redetect: bool,
+    /// Wallclock time of the previous frame — used to detect system suspend/resume
+    last_frame_wallclock: std::time::SystemTime,
+    /// Set to `Some(deadline)` for a few seconds after a suspected wake from sleep/hibernate.
+    /// While active, repaints are throttled to ~5 FPS to prevent the flicker burst.
+    post_wake_cooldown_until: Option<std::time::Instant>,
     
     // EPG data: stream_id -> current program info
     epg_data: HashMap<String, String>,
@@ -335,6 +341,7 @@ struct MacXtreamer {
     // Update system
     available_update: Option<updater::UpdateInfo>,
     checking_for_updates: bool,
+    update_check_deadline: Option<std::time::Instant>,
     update_downloading: bool,
     update_installing: bool,
     update_progress: String,
@@ -361,8 +368,8 @@ impl MacXtreamer {
         // Check for cached recommendations
         let cached_recommendations = if config.is_wisdom_gate_cache_valid() && !config.wisdom_gate_cache_content.is_empty() {
             let cache_age = config.get_wisdom_gate_cache_age_hours();
-            println!("📦 Lade gecachte Empfehlungen beim Start (Alter: {}h)", cache_age);
-            Some(format!("📦 **Gecachte Empfehlungen** (vor {}h aktualisiert)\n\n{}", 
+            println!("📦 Loading cached AI recommendations (age: {}h)", cache_age);
+            Some(format!("📦 **Cached Recommendations** (updated {}h ago)\n\n{}", 
                 cache_age, &config.wisdom_gate_cache_content))
         } else {
             None
@@ -490,6 +497,8 @@ impl MacXtreamer {
             last_forced_repaint: std::time::Instant::now(),
             pending_repaint_due_to_msg: false,
             pending_player_redetect: false,
+            last_frame_wallclock: std::time::SystemTime::now(),
+            post_wake_cooldown_until: None,
             
             // EPG data
             epg_data: HashMap::new(),
@@ -498,6 +507,7 @@ impl MacXtreamer {
             // Update system  
             available_update: None,
             checking_for_updates: false,
+            update_check_deadline: None,
             toasts: Vec::new(),
             update_downloading: false,
             update_installing: false,
@@ -708,7 +718,7 @@ impl MacXtreamer {
     fn perform_player_detection(&mut self) {
         let (has_vlc, has_mpv, vlc_path, mpv_path, vlc_version, mpv_version) = Self::detect_players(&self.config);
         self.has_vlc = has_vlc; self.has_mpv = has_mpv; self.detected_vlc_path = vlc_path; self.detected_mpv_path = mpv_path; self.vlc_version = vlc_version; self.mpv_version = mpv_version;
-        if self.config.use_mpv && !self.has_mpv { self.config.use_mpv = false; self.last_error = Some("mpv nicht gefunden – zurück zu VLC".into()); self.pending_save_config = true; }
+        if self.config.use_mpv && !self.has_mpv { self.config.use_mpv = false; self.last_error = Some("mpv not found – falling back to VLC".into()); self.pending_save_config = true; }
         if !self.config.use_mpv && self.has_mpv && !self.has_vlc { self.config.use_mpv = true; self.pending_save_config = true; }
     }
 
@@ -721,6 +731,8 @@ impl MacXtreamer {
     fn check_for_updates(&mut self) {
         if !self.checking_for_updates {
             self.checking_for_updates = true;
+            // set watchdog deadline to auto-clear the UI if something goes wrong
+            self.update_check_deadline = Some(std::time::Instant::now() + std::time::Duration::from_secs(20));
             println!("🔄 Starting update check...");
             
             // Update last check timestamp
@@ -738,13 +750,15 @@ impl MacXtreamer {
                 let current_version = env!("CARGO_PKG_VERSION");
                 println!("📦 Current version: {}", current_version);
                 println!("🌐 Checking GitHub for updates...");
-                
-                match updater::check_for_updates(current_version).await {
-                    Ok(update_info) => {
+
+                // Wrap the updater call in a timeout so the UI doesn't stay stuck
+                let timeout_dur = tokio::time::Duration::from_secs(15);
+                match tokio::time::timeout(timeout_dur, updater::check_for_updates(current_version)).await {
+                    Ok(Ok(update_info)) => {
                         println!("✅ Update check successful!");
                         println!("   Latest version: {}", update_info.latest_version);
                         println!("   Update available: {}", update_info.update_available);
-                        
+
                         if update_info.update_available {
                             println!("📥 Sending UpdateAvailable message");
                             let _ = tx.send(Msg::UpdateAvailable(update_info));
@@ -753,9 +767,13 @@ impl MacXtreamer {
                             let _ = tx.send(Msg::NoUpdateAvailable);
                         }
                     }
-                    Err(e) => {
+                    Ok(Err(e)) => {
                         println!("❌ Update check failed: {}", e);
                         let _ = tx.send(Msg::UpdateError(format!("Update check failed: {}", e)));
+                    }
+                    Err(_) => {
+                        println!("⏱️ Update check timed out after {}s", timeout_dur.as_secs());
+                        let _ = tx.send(Msg::UpdateError(format!("Update check timed out after {}s", timeout_dur.as_secs())));
                     }
                 }
             });
@@ -793,21 +811,25 @@ impl MacXtreamer {
     }
 
     fn clear_caches_and_reload(&mut self) {
+        println!("🧹 [Reload] Clearing all caches and reloading...");
         // In-Memory Texturen und Cover Warteschlangen leeren
         self.textures.clear();
         self.pending_covers.clear();
         // Dateisystem Cache leeren (Images, ggf. andere)
         clear_all_caches();
-        // Suchindex leeren und neu aufbauen
+        // Suchindex leeren
         self.all_movies.clear();
         self.all_series.clear();
         self.all_channels.clear();
         self.index_paths.clear();
         // Kategorien neu laden falls Konfig vollständig
         if self.config_is_complete() { 
+            println!("✅ [Reload] Config complete, reloading categories...");
             self.reload_categories();
-            // Index neu aufbauen
-            self.spawn_build_index();
+            // Don't call spawn_build_index() here - let auto-build handle it after categories load
+            println!("⏳ [Reload] Auto-build will trigger after categories finish loading...");
+        } else {
+            println!("⚠️ [Reload] Config incomplete, skipping reload");
         }
     }
 
@@ -997,10 +1019,10 @@ impl MacXtreamer {
         });
     }
     
-    // Lade EPG-Daten für einen Live-Kanal
+    // Load EPG data for a live channel
     fn spawn_load_epg(&mut self, stream_id: String) {
         if !self.config_is_complete() { return; }
-        if self.epg_loading.contains(&stream_id) { return; } // Already loading
+        if self.epg_loading.contains(&stream_id) { return; } // already loading
         
         self.epg_loading.insert(stream_id.clone());
         let tx = self.tx.clone();
@@ -1015,7 +1037,7 @@ impl MacXtreamer {
                     let program_text = if !program.end.is_empty() {
                         // Try to extract just the time (HH:MM) from the end timestamp
                         let time_part = program.end.split_whitespace().last().unwrap_or(&program.end);
-                        format!("{} (bis {})", program.title, time_part)
+                        format!("{} (until {})", program.title, time_part)
                     } else {
                         program.title
                     };
@@ -1025,14 +1047,13 @@ impl MacXtreamer {
                     });
                 }
                 Ok(None) => {
-                    // No EPG data available - this is normal for many channels
+                    // No EPG data available - normal for many channels
                     let _ = tx.send(Msg::EpgLoaded { 
                         stream_id: stream_id_clone, 
                         program: None 
                     });
                 }
                 Err(e) => {
-                    // Only log actual network errors, not "no data" situations
                     if e.is_timeout() || e.is_connect() {
                         eprintln!("EPG network error for {}: {}", stream_id_clone, e);
                     }
@@ -1102,51 +1123,75 @@ impl MacXtreamer {
     }
 
     fn spawn_build_index(&mut self) {
-        if self.indexing || !self.config_is_complete() { return; }
-        
-        // Versuche zuerst, den Index von Disk zu laden
-        if let Some((movies, series, channels, paths)) = crate::storage::load_search_index(&self.config.address, &self.config.username) {
-            println!("✨ Index aus Cache geladen");
-            self.all_movies = movies.clone();
-            self.all_series = series.clone();
-            self.all_channels = channels.clone();
-            self.index_paths = paths.clone();
-            
-            // Sende auch als IndexData für UI-Update
-            let movies_with_paths: Vec<(Item, String)> = movies.into_iter()
-                .map(|item| {
-                    let path = paths.get(&item.id).cloned().unwrap_or_default();
-                    (item, path)
-                })
-                .collect();
-            let series_with_paths: Vec<(Item, String)> = series.into_iter()
-                .map(|item| {
-                    let path = paths.get(&item.id).cloned().unwrap_or_default();
-                    (item, path)
-                })
-                .collect();
-            let channels_with_paths: Vec<(Item, String)> = channels.into_iter()
-                .map(|item| {
-                    let path = paths.get(&item.id).cloned().unwrap_or_default();
-                    (item, path)
-                })
-                .collect();
-            
-            let _ = self.tx.send(Msg::IndexData { 
-                movies: movies_with_paths, 
-                series: series_with_paths, 
-                channels: channels_with_paths 
-            });
-            let _ = self.tx.send(Msg::IndexBuilt { 
-                movies: self.all_movies.len(), 
-                series: self.all_series.len(), 
-                channels: self.all_channels.len() 
-            });
+        println!("🔧 [spawn_build_index] Called - indexing={}, config_complete={}", self.indexing, self.config_is_complete());
+        if self.indexing {
+            println!("⚠️ [spawn_build_index] Already indexing, skipping");
+            return;
+        }
+        if !self.config_is_complete() {
+            println!("⚠️ [spawn_build_index] Config incomplete, skipping");
             return;
         }
         
-        // Kein Cache vorhanden oder ungültig - baue Index neu auf
+        // Set indexing flag early to prevent concurrent builds
         self.indexing = true;
+        println!("🚀 [spawn_build_index] Set indexing=true");
+        
+        // Versuche zuerst, den Index von Disk zu laden
+        if let Some((movies, series, channels, paths)) = crate::storage::load_search_index(&self.config.address, &self.config.username) {
+            println!("✨ Index loaded from cache: {} movies, {} series, {} channels", movies.len(), series.len(), channels.len());
+            
+            // Only use cache if it actually has data
+            let total_items = movies.len() + series.len() + channels.len();
+            if total_items > 0 {
+                println!("✅ Cache has data, using it");
+                self.all_movies = movies.clone();
+                self.all_series = series.clone();
+                self.all_channels = channels.clone();
+                self.index_paths = paths.clone();
+                
+                // Sende auch als IndexData für UI-Update
+                let movies_with_paths: Vec<(Item, String)> = movies.into_iter()
+                    .map(|item| {
+                        let path = paths.get(&item.id).cloned().unwrap_or_default();
+                        (item, path)
+                    })
+                    .collect();
+                let series_with_paths: Vec<(Item, String)> = series.into_iter()
+                    .map(|item| {
+                        let path = paths.get(&item.id).cloned().unwrap_or_default();
+                        (item, path)
+                    })
+                    .collect();
+                let channels_with_paths: Vec<(Item, String)> = channels.into_iter()
+                    .map(|item| {
+                        let path = paths.get(&item.id).cloned().unwrap_or_default();
+                        (item, path)
+                    })
+                    .collect();
+                
+                let _ = self.tx.send(Msg::IndexData { 
+                    movies: movies_with_paths, 
+                    series: series_with_paths, 
+                    channels: channels_with_paths 
+                });
+                let _ = self.tx.send(Msg::IndexBuilt { 
+                    movies: self.all_movies.len(), 
+                    series: self.all_series.len(), 
+                    channels: self.all_channels.len() 
+                });
+                // Reset indexing flag since we used cache
+                self.indexing = false;
+                println!("✅ [spawn_build_index] Cache used, set indexing=false");
+                return;
+            } else {
+                println!("⚠️ Cache is empty, building fresh index instead");
+            }
+        }
+        
+        // Kein Cache vorhanden oder ungültig - baue Index neu auf
+        // indexing flag already set above
+        println!("📂 [spawn_build_index] Starting async index build task");
         self.search_status = SearchStatus::Indexing { progress: "Starte Index-Aufbau...".to_string() };
         let tx = self.tx.clone();
         let cfg = self.config.clone();
@@ -1166,8 +1211,8 @@ impl MacXtreamer {
                 Err(e) => { println!("❌ VOD Fehler: {}", e); Vec::new() }
             };
             let ser = match ser_result {
-                Ok(cats) => { println!("✅ Serien: {} Kategorien", cats.len()); cats }
-                Err(e) => { println!("❌ Serien Fehler: {}", e); Vec::new() }
+                Ok(cats) => { println!("✅ Series: {} categories", cats.len()); cats }
+                Err(e) => { println!("❌ Series error: {}", e); Vec::new() }
             };
             let live = match live_result {
                 Ok(cats) => { println!("✅ Live: {} Kategorien", cats.len()); cats }
@@ -1298,7 +1343,7 @@ impl MacXtreamer {
             let series_len = deduplicated_series.len();
             let channels_len = deduplicated_channels.len();
             
-            println!("✅ Index-Aufbau abgeschlossen: {} Movies, {} Series, {} Channels", movies_len, series_len, channels_len);
+            println!("✅ Index build complete: {} movies, {} series, {} channels", movies_len, series_len, channels_len);
             
             // Speichere Index auf Disk
             let movies_only: Vec<Item> = deduplicated_movies.iter().map(|(item, _)| item.clone()).collect();
@@ -1332,14 +1377,14 @@ impl MacXtreamer {
         // Debug-Informationen für die Suche
         println!("🔍 Starte Suche mit Query: '{}'", query);
         println!("🌐 Sprach-Filter: {:?}", language_filter);
-        println!("📊 Index-Größen: Movies={}, Series={}, Channels={}", movies.len(), series.len(), channels.len());
+        println!("📊 Index sizes: movies={}, series={}, channels={}", movies.len(), series.len(), channels.len());
         println!("⚙️ Indexing: {}, Config komplett: {}", self.indexing, self.config_is_complete());
         
         if movies.is_empty() && series.is_empty() && channels.is_empty() && !self.indexing {
             println!("📂 Index leer, starte Index-Aufbau...");
             self.spawn_build_index(); return; }
         if self.indexing { 
-            println!("⏳ Indexing läuft bereits...");
+            println!("⏳ Index build already in progress...");
             return; 
         }
         
@@ -1361,7 +1406,7 @@ impl MacXtreamer {
         
         tokio::spawn(async move {
             match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                println!("🔎 Führe Suche durch...");
+                println!("🔎 Running search...");
                 search_items_with_language_filter(&movies, &series, &channels, &query, &language_filter)
             })) {
                 Ok(results) => {
@@ -1389,14 +1434,14 @@ impl MacXtreamer {
                     }).collect();
                     
                     let result_count = rows.len();
-                    println!("📊 {} eindeutige Ergebnisse nach Deduplizierung", result_count);
+                    println!("📊 {} unique results after deduplication", result_count);
                     let _ = tx.send(Msg::SearchReady(rows));
                     
                     if result_count == 0 {
-                        println!("❌ Keine Suchergebnisse");
+                        println!("❌ No search results");
                         let _ = tx.send(Msg::SearchCompleted { results: 0 });
                     } else {
-                        println!("📤 Sende {} Ergebnisse an UI", result_count);
+                        println!("📤 Sending {} results to UI", result_count);
                         let _ = tx.send(Msg::SearchCompleted { results: result_count });
                     }
                 },
@@ -2012,25 +2057,63 @@ impl MacXtreamer {
 
 impl eframe::App for MacXtreamer {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
-        // Frame Timing erfassen für adaptive Repaint-Steuerung
+        // --- Frame timing & hibernate/wake detection ---
         let now = std::time::Instant::now();
+        let wall_now = std::time::SystemTime::now();
+
+        // Elapsed wall-clock time since last frame.  On a normal 60 Hz frame this is ~16 ms.
+        // After system sleep/hibernate it can jump by minutes.  We use >8 s as the threshold.
+        let wall_gap_ms = wall_now
+            .duration_since(self.last_frame_wallclock)
+            .unwrap_or_default()
+            .as_millis() as u64;
+        let woke_from_sleep = wall_gap_ms > 8_000;
+
+        self.last_frame_wallclock = wall_now;
+
+        // If we just woke, start a 2.5 s cooldown window.  During that window we throttle
+        // repaints to ≤5 FPS so egui's internal event burst doesn't produce visible flicker.
+        if woke_from_sleep {
+            println!("💤 Wake from sleep detected (wall gap {}ms) — starting repaint cooldown", wall_gap_ms);
+            self.post_wake_cooldown_until = Some(now + Duration::from_millis(2500));
+            // Reset frame-timing state to avoid stale averages.
+            self.last_forced_repaint = now;
+            self.avg_frame_ms = 16.0;
+        }
+
+        // Are we still inside the post-wake cooldown?
+        let in_wake_cooldown = self
+            .post_wake_cooldown_until
+            .map(|deadline| now < deadline)
+            .unwrap_or(false);
+        if !in_wake_cooldown {
+            self.post_wake_cooldown_until = None;
+        }
+
+        // Keep the old `is_after_sleep` binding so that the message-processing code
+        // below (which already guards on it) continues to work without changes.
+        let is_after_sleep = in_wake_cooldown;
+
         let dt = now.duration_since(self.last_frame_time).as_millis() as f32;
         self.last_frame_time = now;
         
-        // FLICKER FIX: Nach Sleep/Ruhemodus: Detect große Zeitsprünge (>5s) und reset Repaint-Timing
-        // Dies verhindert aggressives Flackern nach Ruhemodus
-        let time_since_forced_raw: u64 = now.duration_since(self.last_forced_repaint).as_millis() as u64;
-        let is_after_sleep = time_since_forced_raw > 5000; // Threshold für Ruhemodus-Erkennung
-        let time_since_forced = if is_after_sleep {
-            // Nach Ruhemodus: reset Timing um Flackern zu vermeiden
-            self.last_forced_repaint = now;
-            0
-        } else {
-            time_since_forced_raw
-        };
-        
         // Exponentielles Glätten
         if self.avg_frame_ms == 0.0 { self.avg_frame_ms = dt; } else { self.avg_frame_ms = self.avg_frame_ms * 0.9 + dt * 0.1; }
+
+        let time_since_forced_raw: u64 = now.duration_since(self.last_forced_repaint).as_millis() as u64;
+        let time_since_forced = time_since_forced_raw;
+
+        // Watchdog: if update check hangs, auto-clear after deadline
+        if self.checking_for_updates {
+            if let Some(deadline) = self.update_check_deadline {
+                if now > deadline {
+                    println!("⏱️ Update-check watchdog expired, clearing checking_for_updates flag");
+                    self.checking_for_updates = false;
+                    self.update_check_deadline = None;
+                    self.add_toast("Update check timed out (watchdog)".to_string(), ToastType::Warning);
+                }
+            }
+        }
 
         // Theme anwenden (einmalig oder bei Wechsel)
         if !self.theme_applied {
@@ -2158,6 +2241,16 @@ impl eframe::App for MacXtreamer {
                     self.loading_done = self.loading_done.saturating_add(1);
                     if self.loading_done >= self.loading_total {
                         self.is_loading = false;
+                        println!("🏁 [LiveCategories] All categories loaded ({}/{})", self.loading_done, self.loading_total);
+                        
+                        // Auto-build search index if empty
+                        if self.all_movies.is_empty() && self.all_series.is_empty() && self.all_channels.is_empty() {
+                            println!("🔍 [Auto-build] Index is empty, triggering spawn_build_index()");
+                            self.spawn_build_index();
+                        } else {
+                            println!("✅ [Auto-build] Index already has {} movies, {} series, {} channels",
+                                self.all_movies.len(), self.all_series.len(), self.all_channels.len());
+                        }
                     }
                 }
                 Msg::VodCategories(res) => {
@@ -2208,6 +2301,16 @@ impl eframe::App for MacXtreamer {
                     self.loading_done = self.loading_done.saturating_add(1);
                     if self.loading_done >= self.loading_total {
                         self.is_loading = false;
+                        println!("🏁 [VodCategories] All categories loaded ({}/{})", self.loading_done, self.loading_total);
+                        
+                        // Auto-build search index if empty
+                        if self.all_movies.is_empty() && self.all_series.is_empty() && self.all_channels.is_empty() {
+                            println!("🔍 [Auto-build] Index is empty, triggering spawn_build_index()");
+                            self.spawn_build_index();
+                        } else {
+                            println!("✅ [Auto-build] Index already has {} movies, {} series, {} channels",
+                                self.all_movies.len(), self.all_series.len(), self.all_channels.len());
+                        }
                     }
                 }
                 Msg::SeriesCategories(res) => {
@@ -2258,6 +2361,16 @@ impl eframe::App for MacXtreamer {
                     self.loading_done = self.loading_done.saturating_add(1);
                     if self.loading_done >= self.loading_total {
                         self.is_loading = false;
+                        println!("🏁 [SeriesCategories] All categories loaded ({}/{})", self.loading_done, self.loading_total);
+                        
+                        // Auto-build search index if empty
+                        if self.all_movies.is_empty() && self.all_series.is_empty() && self.all_channels.is_empty() {
+                            println!("🔍 [Auto-build] Index is empty, triggering spawn_build_index()");
+                            self.spawn_build_index();
+                        } else {
+                            println!("✅ [Auto-build] Index already has {} movies, {} series, {} channels",
+                                self.all_movies.len(), self.all_series.len(), self.all_channels.len());
+                        }
                     }
                 }
                 Msg::VlcDiagnostics(output) => {
@@ -2275,7 +2388,7 @@ impl eframe::App for MacXtreamer {
                     self.detected_vlc_path = vlc_path;
                     self.detected_mpv_path = mpv_path;
                     // Policy: if user wanted mpv but not present -> disable
-                    if self.config.use_mpv && !self.has_mpv { self.config.use_mpv = false; self.last_error = Some("mpv nicht gefunden – zurück zu VLC".into()); self.pending_save_config = true; }
+                    if self.config.use_mpv && !self.has_mpv { self.config.use_mpv = false; self.last_error = Some("mpv not found – falling back to VLC".into()); self.pending_save_config = true; }
                     // If mpv only available -> auto enable
                     if !self.config.use_mpv && self.has_mpv && !self.has_vlc { self.config.use_mpv = true; self.pending_save_config = true; }
                 }
@@ -2309,11 +2422,11 @@ impl eframe::App for MacXtreamer {
                         self.config.use_mpv = true; 
                         self.pending_save_config = true; 
                         self.last_error = Some("⚠️ VLC wiederholt fehlgeschlagen – Automatischer Wechsel auf mpv".into()); 
-                        log_line("🔄 Auto-Wechsel: VLC → mpv");
+                        log_line("🔄 Auto-switch: VLC → mpv");
                     }
                 }
                 Msg::DiagnosticsStopped => {
-                    self.last_error = Some("VLC Diagnose gestoppt".into());
+                    self.last_error = Some("VLC Diagnostics stopped".into());
                     if let Some(flag) = &self.active_diag_stop { flag.store(true, std::sync::atomic::Ordering::Relaxed); }
                 }
                 Msg::StopDiagnostics => {
@@ -2435,7 +2548,7 @@ impl eframe::App for MacXtreamer {
                                     }
                                 }
                             } else {
-                                println!("⚠️ Ignoriere ItemsLoaded während Suchansicht (current_view={:?})", self.current_view);
+                                println!("⚠️ Ignoring ItemsLoaded during search view (current_view={:?})", self.current_view);
                             }
                         }
                         Err(e) => {
@@ -2633,7 +2746,7 @@ impl eframe::App for MacXtreamer {
                     // If we have a search query, flag to perform/repeat the search
                     // This ensures search includes all content types (movies, series, channels)
                     if !self.search_text.trim().is_empty() {
-                        println!("🔄 Wiederhole Suche mit vollständigem Index (inkl. {} Channels)...", _c);
+                        println!("🔄 Repeating search with complete index (incl. {} channels)...", _c);
                         self.should_start_search = true;
                     }
                 }
@@ -2923,10 +3036,12 @@ impl eframe::App for MacXtreamer {
                         ToastType::Success
                     );
                     self.checking_for_updates = false;
+                    self.update_check_deadline = None;
                 }
                 Msg::NoUpdateAvailable => {
                     println!("📲 Received NoUpdateAvailable message");
                     self.checking_for_updates = false;
+                    self.update_check_deadline = None;
                     self.add_toast(
                         format!("✓ {}", t("up_to_date", self.config.language)),
                         ToastType::Info
@@ -2935,6 +3050,7 @@ impl eframe::App for MacXtreamer {
                 Msg::UpdateError(error) => {
                     println!("📲 Received UpdateError message: {}", error);
                     self.checking_for_updates = false;
+                    self.update_check_deadline = None;
                     self.update_downloading = false;
                     self.update_installing = false;
                     // Only show toast for initial update check errors, not manual ones
@@ -2964,10 +3080,28 @@ impl eframe::App for MacXtreamer {
                     if let Some(prog_text) = program {
                         self.epg_data.insert(stream_id, prog_text);
                     } else {
-                        self.epg_data.insert(stream_id, "Keine Programm-Info".to_string());
+                        self.epg_data.insert(stream_id, "Not available".to_string());
                     }
                     // Trigger repaint to show updated EPG data
                     self.pending_repaint_due_to_msg = true;
+                }
+                Msg::SkipSeriesLoading => {
+                    println!("⏭️ Series loading skipped");
+                    // Mark series loading as complete
+                    if self.loading_total > 0 {
+                        self.loading_done = self.loading_done.saturating_add(1);
+                        if self.loading_done >= self.loading_total {
+                            self.is_loading = false;
+                        }
+                    }
+                }
+                Msg::ProxyTestResult { success, message } => {
+                    if success {
+                        self.add_toast(message.clone(), ToastType::Success);
+                    } else {
+                        self.add_toast(message.clone(), ToastType::Error);
+                        self.last_error = Some(message.clone());
+                    }
                 }
             } // end match msg
         } // end while let Ok(msg)
@@ -3165,7 +3299,7 @@ impl eframe::App for MacXtreamer {
                     }
                     let mut use_mpv = self.config.use_mpv;
                     ui.add_enabled_ui(self.has_mpv, |ui| {
-                        if ui.checkbox(&mut use_mpv, "Use MPV").on_hover_text(if self.has_mpv { "Statt VLC den mpv Player verwenden" } else { "mpv nicht gefunden (brew install mpv)" }).changed() {
+                        if ui.checkbox(&mut use_mpv, "Use MPV").on_hover_text(if self.has_mpv { "Use MPV player instead of VLC" } else { "mpv not found (brew install mpv)" }).changed() {
                             self.config.use_mpv = use_mpv;
                             if use_mpv { self.config.reuse_vlc = false; }
                             self.pending_save_config = true;
@@ -3202,7 +3336,7 @@ impl eframe::App for MacXtreamer {
                             ui.label(egui::RichText::new(format!("Pending tex:{} covers:{} decodes:{} dl:{}", self.pending_texture_uploads.len(), self.pending_covers.len(), self.pending_decode_urls.len(), self.active_downloads())).small()).on_hover_text("Debug Statistiken im Low-CPU Mode");
                         }
                         if !self.has_mpv {
-                            ui.colored_label(egui::Color32::YELLOW, "mpv nicht gefunden – Settings öffnen und Pfad setzen falls installiert");
+                            ui.colored_label(egui::Color32::YELLOW, "mpv not found – open Settings and set the path if installed");
                         }
                     });
                     if ui.button("Settings").clicked() {
@@ -3217,6 +3351,17 @@ impl eframe::App for MacXtreamer {
                         if ui.button(&t("check_updates", self.config.language)).clicked() {
                             self.check_for_updates();
                         }
+                    }
+                    // Proxy status / quick access
+                    {
+                        let proxy_active = self.config.proxy_enabled && !self.config.proxy_host.is_empty();
+                        let status_text = if proxy_active { t("proxy_status_connected", self.config.language) } else { t("proxy_status_disconnected", self.config.language) };
+                        if ui.add(egui::Button::new(status_text)).on_hover_text(&t("proxy_help", self.config.language)).clicked() {
+                            // Open full settings when clicking the proxy status
+                            self.config_draft = Some(self.config.clone());
+                            self.show_config = true;
+                        }
+                        // (Top-bar test button removed; use Test in Settings dialog)
                     }
                     // Short hint about player URL placeholder
                     ui.add_space(6.0);
@@ -3391,14 +3536,14 @@ impl eframe::App for MacXtreamer {
                             
                             // History dropdown button
                             if !self.search_history.is_empty() {
-                                let history_button = ui.button("🕐").on_hover_text("Suchverlauf");
+                                let history_button = ui.button("🕐").on_hover_text("Search history");
                                 if history_button.clicked() {
                                     self.show_search_history = !self.show_search_history;
                                 }
                                 
                                 // Show history popup
                                 if self.show_search_history {
-                                    egui::Window::new("Suchverlauf")
+                                    egui::Window::new("Search History")
                                         .anchor(egui::Align2::RIGHT_TOP, [-10.0, 40.0])
                                         .collapsible(false)
                                         .resizable(false)
@@ -3423,7 +3568,7 @@ impl eframe::App for MacXtreamer {
                                             }
                                             
                                             ui.separator();
-                                            if ui.button("🗑 Verlauf löschen").clicked() {
+                                            if ui.button("🗑 Clear history").clicked() {
                                                 self.search_history.clear();
                                                 save_search_history(&self.search_history);
                                                 self.show_search_history = false;
@@ -3475,7 +3620,7 @@ impl eframe::App for MacXtreamer {
                         SearchStatus::Searching => {
                             ui.horizontal(|ui| {
                                 ui.spinner();
-                                ui.label(colored_text_by_type("Suche läuft...", "info"));
+                                ui.label(colored_text_by_type("Searching...", "info"));
                             });
                         }
                         SearchStatus::NoResults => {
@@ -3731,18 +3876,18 @@ impl eframe::App for MacXtreamer {
                         .show(&mut cols[1], |ui| {
                             if self.vod_categories.is_empty() {
                                 if self.is_loading {
-                                    ui.weak("⏳ Laden...");
+                                    ui.weak("⏳ Loading...");
                                 } else if !self.config_is_complete() {
-                                    ui.weak("⚠️ Einstellungen erforderlich");
+                                    ui.weak("⚠️ Settings required");
                                 } else {
-                                    ui.colored_label(egui::Color32::from_rgb(255, 150, 0), "⚠️ Keine VOD-Kategorien gefunden");
+                                    ui.colored_label(egui::Color32::from_rgb(255, 150, 0), "⚠️ No VOD categories found");
                                     if let Some(ref err) = self.last_error {
                                         ui.small(err);
-                                        if ui.small_button("🔄 Nochmal versuchen").clicked() {
+                                        if ui.small_button("🔄 Retry").clicked() {
                                             self.clear_caches_and_reload();
                                         }
                                     } else {
-                                        ui.weak("Server liefert keine VOD-Kategorien.");
+                                        ui.weak("Server provides no VOD categories.");
                                     }
                                 }
                             }
@@ -3796,18 +3941,18 @@ impl eframe::App for MacXtreamer {
                         |ui| {
                             if self.series_categories.is_empty() {
                                 if self.is_loading {
-                                    ui.weak("⏳ Laden...");
+                                    ui.weak("⏳ Loading...");
                                 } else if !self.config_is_complete() {
-                                    ui.weak("⚠️ Einstellungen erforderlich");
+                                    ui.weak("⚠️ Settings required");
                                 } else {
-                                    ui.colored_label(egui::Color32::from_rgb(255, 150, 0), "⚠️ Keine Serien-Kategorien gefunden");
+                                    ui.colored_label(egui::Color32::from_rgb(255, 150, 0), "⚠️ No series categories found");
                                     if let Some(ref err) = self.last_error {
                                         ui.small(err);
-                                        if ui.small_button("🔄 Nochmal versuchen").clicked() {
+                                        if ui.small_button("🔄 Retry").clicked() {
                                             self.clear_caches_and_reload();
                                         }
                                     } else {
-                                        ui.weak("Server liefert keine Serien-Kategorien.");
+                                        ui.weak("Server provides no series categories.");
                                     }
                                 }
                             }
@@ -4157,7 +4302,7 @@ impl eframe::App for MacXtreamer {
                                     .desired_width(300.0),
                             );
                             ui.add_space(10.0);
-                            ui.label(RichText::new("Suche ist verfügbar sobald der Index fertig ist.").size(12.0).color(Color32::from_rgb(150, 150, 150)));
+                            ui.label(RichText::new("Search is available once the index is ready.").size(12.0).color(Color32::from_rgb(150, 150, 150)));
                         });
                         return; // Früher Return, um Tabelle nicht zu rendern
                     }
@@ -4184,7 +4329,7 @@ impl eframe::App for MacXtreamer {
                             ui.add_space(avail_h / 3.0);
                             ui.label(RichText::new("🔍 Keine Ergebnisse gefunden").size(18.0).color(Color32::from_rgb(255, 165, 0)));
                             ui.add_space(10.0);
-                            ui.label(RichText::new(&format!("Für '{}' wurden keine Inhalte gefunden.", query)).size(14.0));
+                            ui.label(RichText::new(&format!("No results found for '{}'.", query)).size(14.0));
                             ui.add_space(10.0);
                             ui.label("Versuche es mit einem anderen Suchbegriff.");
                         });
@@ -4201,7 +4346,7 @@ impl eframe::App for MacXtreamer {
                     }
                     SearchStatus::Completed { results } => {
                         ui.horizontal(|ui| {
-                            ui.label(RichText::new(&format!("🔍 Suchergebnisse für '{}': {} gefunden", query, results)).strong());
+                            ui.label(RichText::new(&format!("🔍 Search results for '{}': {} found", query, results)).strong());
                         });
                         ui.separator();
                     }
@@ -4249,7 +4394,7 @@ impl eframe::App for MacXtreamer {
                                 }
                             }
                             ui.separator();
-                            ui.label("Reihenfolge ändern (Drag & Drop):");
+                            ui.label("Reorder columns (drag & drop):");
                             for col in self.column_config.iter() {
                                 // TODO: Drag-and-drop für Spaltenreihenfolge mit egui unterstützen
                                 // Derzeit deaktiviert, da die API nicht existiert (start_drag, dragged_item, stop_drag)
@@ -4488,7 +4633,7 @@ impl eframe::App for MacXtreamer {
                                     } else if self.epg_loading.contains(&r.id) {
                                         ui.spinner();
                                     } else {
-                                        ui.label("--");
+                                        ui.label(egui::RichText::new("N/A").weak());
                                     }
                                 } else {
                                     ui.label("");
@@ -4658,12 +4803,12 @@ impl eframe::App for MacXtreamer {
                                 ui.small("Use {URL} placeholder where the stream URL goes");
                                 ui.horizontal(|ui| {
                                     let mut reuse = draft.reuse_vlc; if ui.checkbox(&mut reuse, "Reuse VLC").on_hover_text("Open links in running VLC instance (macOS)").changed() { draft.reuse_vlc = reuse; }
-                                    let mut use_mpv = draft.use_mpv; if ui.checkbox(&mut use_mpv, "Use MPV").on_hover_text(if self.has_mpv {"mpv aktivieren"} else {"mpv nicht gefunden"}).changed() { draft.use_mpv = use_mpv; if use_mpv { draft.reuse_vlc = false; } }
+                                    let mut use_mpv = draft.use_mpv; if ui.checkbox(&mut use_mpv, "Use MPV").on_hover_text(if self.has_mpv {"enable mpv"} else {"mpv not found"}).changed() { draft.use_mpv = use_mpv; if use_mpv { draft.reuse_vlc = false; } }
                                     if self.has_vlc { if let Some(v)=&self.vlc_version { ui.label(egui::RichText::new(format!("vlc {}", v)).small()); }}
                                     if self.has_mpv { if let Some(v)=&self.mpv_version { ui.label(egui::RichText::new(format!("mpv {}", v)).small()); }}
                                 });
                                 ui.horizontal(|ui| {
-                                    let mut low = draft.low_cpu_mode; if ui.checkbox(&mut low, "Low CPU").on_hover_text("Reduziert Repaints & Diagnose-Frequenz").changed() { draft.low_cpu_mode = low; }
+                                    let mut low = draft.low_cpu_mode; if ui.checkbox(&mut low, "Low CPU").on_hover_text("Reduces repaints and diagnostic frequency").changed() { draft.low_cpu_mode = low; }
                                     let mut ultra = draft.ultra_low_flicker_mode; if ui.checkbox(&mut ultra, "Ultra Flicker").on_hover_text("Event-basierte Repaints – evtl. träge").changed() { draft.ultra_low_flicker_mode = ultra; }
                                 });
                                 // Bias Slider
@@ -4752,9 +4897,62 @@ impl eframe::App for MacXtreamer {
                             });
                             
                             ui.add_space(8.0);
-                            ui.heading("🎬 Player Einstellungen");
+
+                            // SOCKS5 / Proxy Einstellungen
+                            ui.collapsing(&t("proxy_settings", self.config.language), |ui| {
+                                ui.horizontal(|ui| {
+                                    let mut enabled = draft.proxy_enabled;
+                                    if ui.checkbox(&mut enabled, &t("proxy_enable", self.config.language)).changed() {
+                                        draft.proxy_enabled = enabled;
+                                    }
+                                    ui.weak(&t("proxy_help", self.config.language));
+                                });
+
+                                ui.horizontal(|ui| {
+                                    ui.label(&t("proxy_host", self.config.language));
+                                    ui.add(egui::TextEdit::singleline(&mut draft.proxy_host).desired_width(240.0));
+                                    ui.label(&t("proxy_port", self.config.language));
+                                    let mut port = draft.proxy_port as i32;
+                                    if ui.add(egui::DragValue::new(&mut port).clamp_range(0..=65535)).changed() {
+                                        draft.proxy_port = port as u16;
+                                    }
+                                });
+
+                                ui.horizontal(|ui| {
+                                    ui.label(&t("proxy_username", self.config.language));
+                                    ui.add(egui::TextEdit::singleline(&mut draft.proxy_username).desired_width(160.0));
+                                    ui.label(&t("proxy_password", self.config.language));
+                                    ui.add(egui::TextEdit::singleline(&mut draft.proxy_password).password(true).desired_width(160.0));
+                                });
+
+                                ui.horizontal(|ui| {
+                                    ui.label("Type");
+                                    let mut pt = draft.proxy_type.clone();
+                                    egui::ComboBox::from_id_source("proxy_type")
+                                        .selected_text(&pt)
+                                        .show_ui(ui, |ui| {
+                                            ui.selectable_value(&mut pt, "socks5".to_string(), "SOCKS5");
+                                            ui.selectable_value(&mut pt, "http".to_string(), "HTTP (Privoxy)");
+                                        });
+                                    if pt != draft.proxy_type { draft.proxy_type = pt; }
+
+                                    if ui.button(&t("proxy_test", draft.language)).clicked() {
+                                        let tx = self.tx.clone();
+                                        let cfg = draft.clone();
+                                        tokio::spawn(async move {
+                                            let res = crate::network::test_socks5_connection(&cfg).await;
+                                            match res {
+                                                Ok(msg) => { let _ = tx.send(Msg::ProxyTestResult { success: true, message: msg }); }
+                                                Err(e) => { let _ = tx.send(Msg::ProxyTestResult { success: false, message: e }); }
+                                            }
+                                        });
+                                    }
+                                });
+                            });
+
+                            ui.heading("🎬 Player Settings");
                             ui.separator();
-                            // Kommando-Vorschau aktualisieren (Draft Config)
+                            // Update command preview (Draft Config)
                             let preview = if draft.use_mpv {
                                 let mut args = vec!["mpv".to_string(), "--force-window=no".into(), "--fullscreen".into()];
                                 let cache = if draft.mpv_cache_secs_override!=0 { draft.mpv_cache_secs_override } else { (draft.vlc_network_caching_ms/1000).max(1) }; 
@@ -4767,19 +4965,19 @@ impl eframe::App for MacXtreamer {
                             } else {
                                 crate::player::get_vlc_command_for_stream_type(crate::player::StreamType::Default, &draft)
                             };
-                            // Nur aktualisieren wenn sich der Wert wirklich geändert hat, um unnötige Repaints zu vermeiden
+                        // Only update when value actually changes to avoid unnecessary repaints
                             if self.command_preview != preview {
                                 self.command_preview = preview;
                             }
                             ui.horizontal(|ui| {
                                 let mut use_mpv = draft.use_mpv;
-                                if ui.checkbox(&mut use_mpv, "MPV statt VLC verwenden").on_hover_text(if self.has_mpv { "mpv aktivieren" } else { "mpv nicht gefunden" }).changed() { draft.use_mpv = use_mpv; if use_mpv { draft.reuse_vlc = false; } }
+                                if ui.checkbox(&mut use_mpv, "Use MPV instead of VLC").on_hover_text(if self.has_mpv { "enable mpv" } else { "mpv not found" }).changed() { draft.use_mpv = use_mpv; if use_mpv { draft.reuse_vlc = false; } }
                                 if self.has_mpv { if let Some(v)=&self.mpv_version { ui.label(egui::RichText::new(format!("mpv: {}", v)).small()); }} else { ui.label(egui::RichText::new("mpv: not found").small()); }
                                 if self.has_vlc { if let Some(v)=&self.vlc_version { ui.label(egui::RichText::new(format!("vlc: {}", v)).small()); }} else { ui.label(egui::RichText::new("vlc: not found").small()); }
                                 let mut low = draft.low_cpu_mode;
-                                if ui.checkbox(&mut low, "Low CPU Mode").on_hover_text("Reduziert Repaints & drosselt Diagnose-Thread").changed() { draft.low_cpu_mode = low; }
+                                if ui.checkbox(&mut low, "Low CPU Mode").on_hover_text("Reduces repaints and throttles diagnostics thread").changed() { draft.low_cpu_mode = low; }
                                 let mut ultra = draft.ultra_low_flicker_mode;
-                                if ui.checkbox(&mut ultra, "Ultra Flicker Guard").on_hover_text("Noch weniger Repaints (nur bei Events/Heartbeat) – kann UI-Verzögerung erhöhen").changed() { draft.ultra_low_flicker_mode = ultra; }
+                                if ui.checkbox(&mut ultra, "Ultra Flicker Guard").on_hover_text("Even fewer repaints (event-based only) – may increase UI latency").changed() { draft.ultra_low_flicker_mode = ultra; }
                             });
 
                             // MPV Abschnitt
@@ -4788,16 +4986,16 @@ impl eframe::App for MacXtreamer {
 
                             // VLC Abschnitt ausgegraut wenn MPV aktiv
                             ui.add_enabled_ui(!draft.use_mpv, |ui| {
-                                ui.collapsing("VLC Optimierung & Diagnose", |ui| {
+                                ui.collapsing("VLC Optimization & Diagnostics", |ui| {
                                     ui.horizontal(|ui| {
                                         let mut verbose = draft.vlc_verbose;
                                         if ui.checkbox(&mut verbose, "Verbose (-vvv)").changed() { draft.vlc_verbose = verbose; }
                                         let mut diag_once = draft.vlc_diagnose_on_start;
-                                        if ui.checkbox(&mut diag_once, "Diagnose einmalig").changed() { draft.vlc_diagnose_on_start = diag_once; }
+                                        if ui.checkbox(&mut diag_once, "Diagnose once").changed() { draft.vlc_diagnose_on_start = diag_once; }
                                         let mut cont_diag = draft.vlc_continuous_diagnostics;
-                                        if ui.checkbox(&mut cont_diag, "Kontinuierliche Diagnose").changed() { draft.vlc_continuous_diagnostics = cont_diag; }
+                                        if ui.checkbox(&mut cont_diag, "Continuous").changed() { draft.vlc_continuous_diagnostics = cont_diag; }
                                         if draft.vlc_continuous_diagnostics {
-                                            if ui.button("Stop Diagnose").on_hover_text("Beendet die laufende kontinuierliche VLC Diagnose").clicked() {
+                                            if ui.button("Stop").on_hover_text("Stop the running continuous VLC diagnostics").clicked() {
                                                 let _ = self.tx.send(Msg::StopDiagnostics);
                                             }
                                         }
@@ -4805,7 +5003,7 @@ impl eframe::App for MacXtreamer {
                                     if let Some(suggestion) = self.vlc_diag_suggestion {
                                         ui.horizontal(|ui| {
                                             ui.label(format!("Suggestion: net={} live={} file={}", suggestion.0, suggestion.1, suggestion.2));
-                                            if ui.button("Anwenden").on_hover_text("Übernimmt Werte und speichert sie im Verlauf (max 10)").clicked() {
+                                            if ui.button("Apply").on_hover_text("Apply values and save to history (max 10)").clicked() {
                                                 draft.vlc_network_caching_ms = suggestion.0;
                                                 draft.vlc_live_caching_ms = suggestion.1;
                                                 draft.vlc_file_caching_ms = suggestion.2;
@@ -4820,7 +5018,7 @@ impl eframe::App for MacXtreamer {
                                         });
                                     }
                                     if !draft.vlc_diag_history.trim().is_empty() {
-                                        ui.collapsing("Verlauf Vorschläge", |ui| {
+                                        ui.collapsing("Suggestions History", |ui| {
                                             for seg in draft.vlc_diag_history.split(';').filter(|s| !s.is_empty()).rev() {
                                                 let cols: Vec<&str> = seg.split(':').collect();
                                                 if cols.len()==4 {
@@ -4829,202 +5027,113 @@ impl eframe::App for MacXtreamer {
                                             }
                                         });
                                     }
-                                    ui.collapsing("VLC Diagnose Logs", |ui| {
+                                    ui.collapsing("VLC Diagnostic Logs", |ui| {
                                         let text = self.vlc_diag_lines.iter().rev().take(40).cloned().collect::<Vec<_>>().join("\n");
                                         ui.add(egui::TextEdit::multiline(&mut text.clone()).desired_rows(8));
                                     });
                                 });
                             });
-                            // (Bias controls moved into Player collapsing)
-                            
-                            ui.horizontal_wrapped(|ui| {
-                        if ui
-                            .button("IPTV Optimized")
-                            .on_hover_text("Apply VLC parameters optimized for IPTV/Xtream Codes streaming")
-                            .clicked()
-                        {
-                            draft.player_command = crate::player::get_vlc_command_for_stream_type(crate::player::StreamType::Default, &draft);
-                        }
-                        if ui
-                            .button("Live TV")
-                            .on_hover_text("Minimal buffering for live TV channels")
-                            .clicked()
-                        {
-                            draft.player_command = crate::player::get_vlc_command_for_stream_type(crate::player::StreamType::Live, &draft);
-                        }
-                        if ui
-                            .button("VOD/Movies")
-                            .on_hover_text("Larger buffer for better quality VOD playback")
-                            .clicked()
-                        {
-                            draft.player_command = crate::player::get_vlc_command_for_stream_type(crate::player::StreamType::Vod, &draft);
-                        }
-                        if ui
-                            .button("Minimal")
-                            .on_hover_text("Minimal VLC parameters for maximum compatibility")
-                            .clicked()
-                        {
-                            draft.player_command = "vlc --fullscreen {URL}".to_string();
-                        }
-                        // Show the currently effective command (with placeholder visible)
-                        let preview = if draft.player_command.trim().is_empty() {
-                            crate::player::get_vlc_command_for_stream_type(crate::player::StreamType::Default, &draft)
-                        } else {
-                            draft.player_command.clone()
-                        };
-                        ui.label(egui::RichText::new(format!("Current: {}", preview)).weak());
-                    });
-                    ui.separator();
-                    ui.horizontal(|ui| {
-                        ui.label("Cover TTL (days)");
-                        let mut ttl = if draft.cover_ttl_days == 0 {
-                            7
-                        } else {
-                            draft.cover_ttl_days
-                        } as i32;
-                        if ui
-                            .add(egui::DragValue::new(&mut ttl).clamp_range(1..=30))
-                            .changed()
-                        {
-                            draft.cover_ttl_days = ttl as u32;
-                        }
-                    });
-                    ui.horizontal(|ui| {
-                        ui.label("Cover parallelism");
-                        let mut par = if draft.cover_parallel == 0 {
-                            6
-                        } else {
-                            draft.cover_parallel
-                        } as i32;
-                        if ui
-                            .add(egui::DragValue::new(&mut par).clamp_range(1..=16))
-                            .changed()
-                        {
-                            draft.cover_parallel = par as u32;
-                        }
-                    });
-                    ui.horizontal(|ui| {
-                        ui.label("Uploads/frame");
-                        let mut upf = if draft.cover_uploads_per_frame == 0 {
-                            3
-                        } else {
-                            draft.cover_uploads_per_frame
-                        } as i32;
-                        if ui
-                            .add(egui::DragValue::new(&mut upf).clamp_range(1..=16))
-                            .changed()
-                        {
-                            draft.cover_uploads_per_frame = upf as u32;
-                        }
-                    });
-                    ui.horizontal(|ui| {
-                        ui.label("Decode parallelism");
-                        let mut dp = if draft.cover_decode_parallel == 0 {
-                            2
-                        } else {
-                            draft.cover_decode_parallel
-                        } as i32;
-                        if ui
-                            .add(egui::DragValue::new(&mut dp).clamp_range(1..=8))
-                            .changed()
-                        {
-                            draft.cover_decode_parallel = dp as u32;
-                        }
-                    });
-                    ui.horizontal(|ui| {
-                        ui.label("Texture cache limit");
-                        let mut tl = if draft.texture_cache_limit == 0 {
-                            512
-                        } else {
-                            draft.texture_cache_limit
-                        } as i32;
-                        if ui
-                            .add(egui::DragValue::new(&mut tl).clamp_range(64..=4096))
-                            .changed()
-                        {
-                            draft.texture_cache_limit = tl as u32;
-                        }
-                    });
-                    ui.horizontal(|ui| {
-                        ui.label("Category parallelism");
-                        let mut cp = if draft.category_parallel == 0 {
-                            6
-                        } else {
-                            draft.category_parallel
-                        } as i32;
-                        if ui
-                            .add(egui::DragValue::new(&mut cp).clamp_range(1..=20))
-                            .on_hover_text("Number of parallel category requests during loading")
-                            .changed()
-                        {
-                            draft.category_parallel = cp as u32;
-                        }
-                    });
-                    ui.horizontal(|ui| {
-                        ui.label("Cover height");
-                        let mut ch = if draft.cover_height == 0.0 {
-                            60.0
-                        } else {
-                            draft.cover_height
-                        };
-                        if ui
-                            .add(egui::Slider::new(&mut ch, 40.0..=120.0).step_by(2.0))
-                            .on_hover_text("Height of cover images in the content view")
-                            .changed()
-                        {
-                            draft.cover_height = ch;
-                        }
-                    });
-                    ui.horizontal(|ui| {
-                        ui.label("UI Language");
-                        egui::ComboBox::from_id_source("language_selector")
-                            .selected_text(draft.language.name())
-                            .show_ui(ui, |ui| {
-                                ui.selectable_value(&mut draft.language, Language::English, Language::English.name());
-                                ui.selectable_value(&mut draft.language, Language::German, Language::German.name());
+
+                            ui.collapsing("🖥 Appearance & UI", |ui| {
+                                ui.horizontal(|ui| {
+                                    ui.label("UI Language");
+                                    egui::ComboBox::from_id_source("language_selector")
+                                        .selected_text(draft.language.name())
+                                        .show_ui(ui, |ui| {
+                                            ui.selectable_value(&mut draft.language, Language::English, Language::English.name());
+                                            ui.selectable_value(&mut draft.language, Language::German, Language::German.name());
+                                        });
+                                });
+                                ui.horizontal(|ui| {
+                                    ui.label("Text size scale");
+                                    let mut fs = if draft.font_scale == 0.0 { 1.15 } else { draft.font_scale };
+                                    if ui.add(egui::Slider::new(&mut fs, 0.6..=2.0).step_by(0.05)).on_hover_text("Scale factor for all text in the interface").changed() {
+                                        draft.font_scale = fs;
+                                    }
+                                });
+                                ui.horizontal(|ui| {
+                                    ui.label("Cover height");
+                                    let mut ch = if draft.cover_height == 0.0 { 60.0 } else { draft.cover_height };
+                                    if ui.add(egui::Slider::new(&mut ch, 40.0..=120.0).step_by(2.0)).on_hover_text("Height of cover images in the content view").changed() {
+                                        draft.cover_height = ch;
+                                    }
+                                });
                             });
-                    });
-                    ui.horizontal(|ui| {
-                        ui.label("Text size scale");
-                        let mut fs = if draft.font_scale == 0.0 {
-                            1.15
-                        } else {
-                            draft.font_scale
-                        };
-                        if ui
-                            .add(egui::Slider::new(&mut fs, 0.6..=2.0).step_by(0.05))
-                            .on_hover_text("Scale factor for all text in the interface")
-                            .changed()
-                        {
-                            draft.font_scale = fs;
-                        }
-                    });
-                    ui.collapsing("🧮 Buffering & Caching", |ui| {
-                        ui.label("VLC buffer settings");
-                    ui.horizontal(|ui| {
-                        ui.label("Network caching (ms)");
-                        let mut network = if draft.vlc_network_caching_ms == 0 { 10000 } else { draft.vlc_network_caching_ms } as i32;
-                        if ui.add(egui::DragValue::new(&mut network).clamp_range(1000..=60000)).on_hover_text("Amount of network buffering in milliseconds for VLC (10s default for live TV stability)").changed() {
-                            draft.vlc_network_caching_ms = network as u32;
-                        }
-                    });
-                    ui.horizontal(|ui| {
-                        ui.label("Live caching (ms)");
-                        let mut live = if draft.vlc_live_caching_ms == 0 { 5000 } else { draft.vlc_live_caching_ms } as i32;
-                        if ui.add(egui::DragValue::new(&mut live).clamp_range(0..=30000)).on_hover_text("Additional live-specific caching in milliseconds (5s default)").changed() {
-                            draft.vlc_live_caching_ms = live as u32;
-                        }
-                    });
-                    ui.horizontal(|ui| {
-                        ui.label("Prefetch buffer (bytes)");
-                        let mut prefetch = if draft.vlc_prefetch_buffer_bytes == 0 { 16 * 1024 * 1024 } else { draft.vlc_prefetch_buffer_bytes } as i64;
-                        if ui.add(egui::DragValue::new(&mut prefetch).clamp_range(1024..=128 * 1024 * 1024)).on_hover_text("Prefetch buffer size in bytes used by VLC (16 MiB default for stability)").changed() {
-                            draft.vlc_prefetch_buffer_bytes = prefetch as u64;
-                        }
-                    });
-                    });
+
+                            ui.collapsing("⚡ Performance & Cache", |ui| {
+                                ui.label("VLC preset commands:");
+                                ui.horizontal_wrapped(|ui| {
+                                    if ui.button("IPTV Optimized").on_hover_text("Apply VLC parameters optimized for IPTV/Xtream Codes streaming").clicked() {
+                                        draft.player_command = crate::player::get_vlc_command_for_stream_type(crate::player::StreamType::Default, &draft);
+                                    }
+                                    if ui.button("Live TV").on_hover_text("Minimal buffering for live TV channels").clicked() {
+                                        draft.player_command = crate::player::get_vlc_command_for_stream_type(crate::player::StreamType::Live, &draft);
+                                    }
+                                    if ui.button("VOD/Movies").on_hover_text("Larger buffer for better quality VOD playback").clicked() {
+                                        draft.player_command = crate::player::get_vlc_command_for_stream_type(crate::player::StreamType::Vod, &draft);
+                                    }
+                                    if ui.button("Minimal").on_hover_text("Minimal VLC parameters for maximum compatibility").clicked() {
+                                        draft.player_command = "vlc --fullscreen {URL}".to_string();
+                                    }
+                                });
+                                let preview_cmd = if draft.player_command.trim().is_empty() {
+                                    crate::player::get_vlc_command_for_stream_type(crate::player::StreamType::Default, &draft)
+                                } else {
+                                    draft.player_command.clone()
+                                };
+                                ui.label(egui::RichText::new(format!("Current: {}", preview_cmd)).weak());
+                                ui.separator();
+                                ui.label("VLC buffer settings:");
+                                ui.horizontal(|ui| {
+                                    ui.label("Network caching (ms)");
+                                    let mut network = if draft.vlc_network_caching_ms == 0 { 10000 } else { draft.vlc_network_caching_ms } as i32;
+                                    if ui.add(egui::DragValue::new(&mut network).clamp_range(1000..=60000)).on_hover_text("10s default for live TV stability").changed() {
+                                        draft.vlc_network_caching_ms = network as u32;
+                                    }
+                                });
+                                ui.horizontal(|ui| {
+                                    ui.label("Live caching (ms)");
+                                    let mut live = if draft.vlc_live_caching_ms == 0 { 5000 } else { draft.vlc_live_caching_ms } as i32;
+                                    if ui.add(egui::DragValue::new(&mut live).clamp_range(0..=30000)).on_hover_text("5s default").changed() {
+                                        draft.vlc_live_caching_ms = live as u32;
+                                    }
+                                });
+                                ui.horizontal(|ui| {
+                                    ui.label("Prefetch buffer (bytes)");
+                                    let mut prefetch = if draft.vlc_prefetch_buffer_bytes == 0 { 16 * 1024 * 1024 } else { draft.vlc_prefetch_buffer_bytes } as i64;
+                                    if ui.add(egui::DragValue::new(&mut prefetch).clamp_range(1024..=128 * 1024 * 1024)).on_hover_text("16 MiB default").changed() {
+                                        draft.vlc_prefetch_buffer_bytes = prefetch as u64;
+                                    }
+                                });
+                                ui.separator();
+                                ui.label("Cover & texture:");
+                                ui.horizontal(|ui| {
+                                    ui.label("Cover TTL (days)");
+                                    let mut ttl = if draft.cover_ttl_days == 0 { 7 } else { draft.cover_ttl_days } as i32;
+                                    if ui.add(egui::DragValue::new(&mut ttl).clamp_range(1..=30)).changed() { draft.cover_ttl_days = ttl as u32; }
+                                    ui.label("Cover parallelism");
+                                    let mut par = if draft.cover_parallel == 0 { 6 } else { draft.cover_parallel } as i32;
+                                    if ui.add(egui::DragValue::new(&mut par).clamp_range(1..=16)).changed() { draft.cover_parallel = par as u32; }
+                                });
+                                ui.horizontal(|ui| {
+                                    ui.label("Uploads/frame");
+                                    let mut upf = if draft.cover_uploads_per_frame == 0 { 3 } else { draft.cover_uploads_per_frame } as i32;
+                                    if ui.add(egui::DragValue::new(&mut upf).clamp_range(1..=16)).changed() { draft.cover_uploads_per_frame = upf as u32; }
+                                    ui.label("Decode parallelism");
+                                    let mut dp = if draft.cover_decode_parallel == 0 { 2 } else { draft.cover_decode_parallel } as i32;
+                                    if ui.add(egui::DragValue::new(&mut dp).clamp_range(1..=8)).changed() { draft.cover_decode_parallel = dp as u32; }
+                                });
+                                ui.horizontal(|ui| {
+                                    ui.label("Texture cache limit");
+                                    let mut tl = if draft.texture_cache_limit == 0 { 512 } else { draft.texture_cache_limit } as i32;
+                                    if ui.add(egui::DragValue::new(&mut tl).clamp_range(64..=4096)).changed() { draft.texture_cache_limit = tl as u32; }
+                                    ui.label("Category parallelism");
+                                    let mut cp = if draft.category_parallel == 0 { 6 } else { draft.category_parallel } as i32;
+                                    if ui.add(egui::DragValue::new(&mut cp).clamp_range(1..=20)).on_hover_text("Parallel category requests during loading").changed() { draft.category_parallel = cp as u32; }
+                                });
+                            });
                     
-                    ui.collapsing("🧠 AI Empfehlungen", |ui| {
+                    ui.collapsing("🧠 AI Recommendations", |ui| {
                     ui.horizontal(|ui| {
                         ui.label("AI Provider:");
                         ui.radio_value(&mut draft.ai_provider, "wisdom-gate".to_string(), "🤖 Wisdom-Gate");
@@ -5047,7 +5156,7 @@ impl eframe::App for MacXtreamer {
                             );
                         });
                         if draft.wisdom_gate_api_key.trim().is_empty() {
-                            ui.weak("API Key erforderlich für AI-Empfehlungen");
+                            ui.weak("API key required for AI recommendations");
                         }
                         
                         ui.horizontal(|ui| {
@@ -5055,7 +5164,7 @@ impl eframe::App for MacXtreamer {
                             egui::ComboBox::from_label("")
                                 .selected_text(&draft.wisdom_gate_model)
                                 .show_ui(ui, |ui| {
-                                    ui.selectable_value(&mut draft.wisdom_gate_model, "gpt-3.5-turbo".to_string(), "🥇 GPT-3.5 Turbo (Empfohlen)");
+                                    ui.selectable_value(&mut draft.wisdom_gate_model, "gpt-3.5-turbo".to_string(), "🥇 GPT-3.5 Turbo (Recommended)");
                                     ui.selectable_value(&mut draft.wisdom_gate_model, "gpt-4".to_string(), "🧠 GPT-4 (Premium)");
                                     ui.selectable_value(&mut draft.wisdom_gate_model, "claude-3-sonnet".to_string(), "🎭 Claude 3 Sonnet");
                                     ui.selectable_value(&mut draft.wisdom_gate_model, "gemini-pro".to_string(), "💎 Gemini Pro");
@@ -5066,24 +5175,24 @@ impl eframe::App for MacXtreamer {
                                     ui.label("Endpoint:");
                                     ui.text_edit_singleline(&mut draft.wisdom_gate_endpoint);
                                     ui.separator();
-                                    ui.label("⚠️ Alte Modelle (evtl. nicht verfügbar):");
-                                    ui.selectable_value(&mut draft.wisdom_gate_model, "wisdom-ai-dsv3".to_string(), "❌ Wisdom-AI DSV3 (veraltet)");
-                                    ui.selectable_value(&mut draft.wisdom_gate_model, "deepseek-v3".to_string(), "❌ DeepSeek V3 (veraltet)");
+                                    ui.label("⚠️ Legacy models (may not be available):");
+                                    ui.selectable_value(&mut draft.wisdom_gate_model, "wisdom-ai-dsv3".to_string(), "❌ Wisdom-AI DSV3 (deprecated)");
+                                    ui.selectable_value(&mut draft.wisdom_gate_model, "deepseek-v3".to_string(), "❌ DeepSeek V3 (deprecated)");
                                 });
                         });
                         
-                        ui.label("Prompt für Empfehlungen:");
+                        ui.label("Prompt for recommendations:");
                         ui.add(
                             egui::TextEdit::multiline(&mut draft.wisdom_gate_prompt)
                                 .desired_rows(3)
-                                .hint_text("Was sind die besten Streaming-Empfehlungen für heute?")
+                                .hint_text("What are the best streaming recommendations for today?")
                         );
                         
                         ui.horizontal(|ui| {
-                            if ui.button("Standard Prompt").clicked() {
+                            if ui.button("Default Prompt").clicked() {
                                 draft.wisdom_gate_prompt = crate::models::default_wisdom_gate_prompt();
                             }
-                            ui.weak("Tipp: Frage nach aktuellen Filmen und Serien");
+                            ui.weak("Tip: Ask for current movies and series");
                         });
                     } else if draft.ai_provider == "perplexity" {
                         ui.label("🔮 Perplexity AI");
@@ -5096,7 +5205,7 @@ impl eframe::App for MacXtreamer {
                             );
                         });
                         if draft.perplexity_api_key.trim().is_empty() {
-                            ui.weak("API Key erforderlich für Perplexity-Empfehlungen");
+                            ui.weak("API key required for Perplexity recommendations");
                         }
                         
                         ui.horizontal(|ui| {
@@ -5104,23 +5213,23 @@ impl eframe::App for MacXtreamer {
                             egui::ComboBox::from_label("")
                                 .selected_text(&draft.perplexity_model)
                                 .show_ui(ui, |ui| {
-                                    ui.selectable_value(&mut draft.perplexity_model, "sonar".to_string(), "🦙 Sonar (Empfohlen)");
+                                    ui.selectable_value(&mut draft.perplexity_model, "sonar".to_string(), "🦙 Sonar (Recommended)");
                                     ui.selectable_value(&mut draft.perplexity_model, "sonar-pro".to_string(), "💎 Sonar Pro (Premium)");
                                 });
                         });
                         
-                        ui.label("Prompt für Empfehlungen:");
+                        ui.label("Prompt for recommendations:");
                         ui.add(
                             egui::TextEdit::multiline(&mut draft.wisdom_gate_prompt)
                                 .desired_rows(3)
-                                .hint_text("Was sind die besten Streaming-Empfehlungen für heute?")
+                                .hint_text("What are the best streaming recommendations for today?")  // perplexity
                         );
                         
                         ui.horizontal(|ui| {
-                            if ui.button("Standard Prompt").clicked() {
+                            if ui.button("Default Prompt").clicked() {
                                 draft.wisdom_gate_prompt = crate::models::default_wisdom_gate_prompt();
                             }
-                            ui.weak("Tipp: Perplexity hat Zugriff auf aktuelle Informationen");
+                            ui.weak("Tip: Perplexity has access to current information");
                         });
                     } else if draft.ai_provider == "cognora" {
                         ui.label("🧠 Cognora Toolkit");
@@ -5133,7 +5242,7 @@ impl eframe::App for MacXtreamer {
                             );
                         });
                         if draft.cognora_api_key.trim().is_empty() {
-                            ui.weak("API Key erforderlich für Cognora-Empfehlungen");
+                            ui.weak("API key required for Cognora recommendations");
                         }
                         
                         ui.horizontal(|ui| {
@@ -5141,23 +5250,23 @@ impl eframe::App for MacXtreamer {
                             egui::ComboBox::from_label("")
                                 .selected_text(&draft.cognora_model)
                                 .show_ui(ui, |ui| {
-                                    ui.selectable_value(&mut draft.cognora_model, "cognora-3".to_string(), "🧠 Cognora-3 (Empfohlen)");
+                                    ui.selectable_value(&mut draft.cognora_model, "cognora-3".to_string(), "🧠 Cognora-3 (Recommended)");
                                     ui.selectable_value(&mut draft.cognora_model, "cognora-4".to_string(), "💎 Cognora-4 (Premium)");
                                 });
                         });
                         
-                        ui.label("Prompt für Empfehlungen:");
+                        ui.label("Prompt for recommendations:");
                         ui.add(
                             egui::TextEdit::multiline(&mut draft.wisdom_gate_prompt)
                                 .desired_rows(3)
-                                .hint_text("Was sind die besten Streaming-Empfehlungen für heute?")
+                                .hint_text("What are the best streaming recommendations for today?")
                         );
                         
                         ui.horizontal(|ui| {
-                            if ui.button("Standard Prompt").clicked() {
+                            if ui.button("Default Prompt").clicked() {
                                 draft.wisdom_gate_prompt = crate::models::default_wisdom_gate_prompt();
                             }
-                            ui.weak("Tipp: Cognora bietet spezialisierte Empfehlungen");
+                            ui.weak("Tip: Cognora offers specialized recommendations");
                         });
                     } else if draft.ai_provider == "gemini" {
                         ui.label("💎 Google Gemini");
@@ -5170,7 +5279,7 @@ impl eframe::App for MacXtreamer {
                             );
                         });
                         if draft.gemini_api_key.trim().is_empty() {
-                            ui.weak("API Key erforderlich für Gemini-Empfehlungen");
+                            ui.weak("API key required for Gemini recommendations");
                         }
                         
                         ui.horizontal(|ui| {
@@ -5178,24 +5287,24 @@ impl eframe::App for MacXtreamer {
                             egui::ComboBox::from_label("")
                                 .selected_text(&draft.gemini_model)
                                 .show_ui(ui, |ui| {
-                                    ui.selectable_value(&mut draft.gemini_model, "gemini-2.0-flash-exp".to_string(), "⚡ Gemini 2.0 Flash (Empfohlen)");
+                                    ui.selectable_value(&mut draft.gemini_model, "gemini-2.0-flash-exp".to_string(), "⚡ Gemini 2.0 Flash (Recommended)");
                                     ui.selectable_value(&mut draft.gemini_model, "gemini-1.5-pro".to_string(), "🧠 Gemini 1.5 Pro");
                                     ui.selectable_value(&mut draft.gemini_model, "gemini-1.5-flash".to_string(), "💨 Gemini 1.5 Flash");
                                 });
                         });
                         
-                        ui.label("Prompt für Empfehlungen:");
+                        ui.label("Prompt for recommendations:");
                         ui.add(
                             egui::TextEdit::multiline(&mut draft.wisdom_gate_prompt)
                                 .desired_rows(3)
-                                .hint_text("Was sind die besten Streaming-Empfehlungen für heute?")
+                                .hint_text("What are the best streaming recommendations for today?")
                         );
                         
                         ui.horizontal(|ui| {
-                            if ui.button("Standard Prompt").clicked() {
+                            if ui.button("Default Prompt").clicked() {
                                 draft.wisdom_gate_prompt = crate::models::default_wisdom_gate_prompt();
                             }
-                            ui.weak("Tipp: Gemini bietet multimodale Fähigkeiten");
+                            ui.weak("Tip: Gemini offers multimodal capabilities");
                         });
                     } else if draft.ai_provider == "openai" {
                         ui.label("🤖 OpenAI");
@@ -5208,7 +5317,7 @@ impl eframe::App for MacXtreamer {
                             );
                         });
                         if draft.openai_api_key.trim().is_empty() {
-                            ui.weak("API Key erforderlich für OpenAI-Empfehlungen");
+                            ui.weak("API key required for OpenAI recommendations");
                         }
                         
                         ui.horizontal(|ui| {
@@ -5216,25 +5325,25 @@ impl eframe::App for MacXtreamer {
                             egui::ComboBox::from_label("")
                                 .selected_text(&draft.openai_model)
                                 .show_ui(ui, |ui| {
-                                    ui.selectable_value(&mut draft.openai_model, "gpt-4o".to_string(), "🚀 GPT-4o (Empfohlen)");
+                                    ui.selectable_value(&mut draft.openai_model, "gpt-4o".to_string(), "🚀 GPT-4o (Recommended)");
                                     ui.selectable_value(&mut draft.openai_model, "gpt-4o-mini".to_string(), "⚡ GPT-4o Mini");
                                     ui.selectable_value(&mut draft.openai_model, "gpt-4-turbo".to_string(), "🧠 GPT-4 Turbo");
                                     ui.selectable_value(&mut draft.openai_model, "gpt-3.5-turbo".to_string(), "💨 GPT-3.5 Turbo");
                                 });
                         });
                         
-                        ui.label("Prompt für Empfehlungen:");
+                        ui.label("Prompt for recommendations:");
                         ui.add(
                             egui::TextEdit::multiline(&mut draft.wisdom_gate_prompt)
                                 .desired_rows(3)
-                                .hint_text("Was sind die besten Streaming-Empfehlungen für heute?")
+                                .hint_text("What are the best streaming recommendations for today?")
                         );
                         
                         ui.horizontal(|ui| {
-                            if ui.button("Standard Prompt").clicked() {
+                            if ui.button("Default Prompt").clicked() {
                                 draft.wisdom_gate_prompt = crate::models::default_wisdom_gate_prompt();
                             }
-                            ui.weak("Tipp: OpenAI bietet leistungsstarke Modelle");
+                            ui.weak("Tip: OpenAI offers powerful models");
                         });
                     }
                     });
@@ -5290,6 +5399,82 @@ impl eframe::App for MacXtreamer {
             } else {
                 self.show_config = open;
             }
+        }
+
+        // Update Available Dialog
+        if self.available_update.is_some() && !self.update_downloading && !self.update_installing {
+            let update_info = self.available_update.clone().unwrap();
+            let mut close_update = false;
+            let mut start_download = false;
+            egui::Window::new("🎉 Update Available")
+                .collapsible(false)
+                .resizable(false)
+                .default_width(480.0)
+                .anchor(egui::Align2::CENTER_CENTER, egui::vec2(0.0, 0.0))
+                .show(ctx, |ui| {
+                    ui.vertical_centered(|ui| {
+                        ui.add_space(8.0);
+                        ui.label(egui::RichText::new(format!("Version {} is available!", update_info.latest_version)).strong().size(16.0));
+                        ui.add_space(4.0);
+                        ui.label(format!("You are running v{}", env!("CARGO_PKG_VERSION")));
+                        ui.add_space(8.0);
+                    });
+                    if !update_info.release_notes.is_empty() {
+                        ui.collapsing("Release Notes", |ui| {
+                            egui::ScrollArea::vertical().max_height(200.0).show(ui, |ui| {
+                                let notes = if update_info.release_notes.len() > 2000 {
+                                    format!("{}\n...(truncated)", &update_info.release_notes[..2000])
+                                } else {
+                                    update_info.release_notes.clone()
+                                };
+                                ui.label(&notes);
+                            });
+                        });
+                        ui.add_space(8.0);
+                    }
+                    if update_info.download_url.is_some() {
+                        ui.horizontal(|ui| {
+                            if ui.button(egui::RichText::new("⬇ Install Update").strong()).on_hover_text("Downloads the DMG, mounts it and installs the app to /Applications").clicked() {
+                                start_download = true;
+                            }
+                            if ui.button("Later").clicked() {
+                                close_update = true;
+                            }
+                        });
+                        ui.add_space(4.0);
+                        ui.weak("The app will restart automatically after installation.");
+                    } else {
+                        ui.colored_label(egui::Color32::YELLOW, "⚠️ No DMG asset found in this release.");
+                        ui.horizontal(|ui| {
+                            if ui.hyperlink_to("Open Releases page", "https://github.com/modze996/macxtreamer/releases").clicked() {}
+                            if ui.button("Close").clicked() { close_update = true; }
+                        });
+                    }
+                });
+            if start_download {
+                self.start_update_download(&update_info);
+                self.available_update = None;
+            } else if close_update {
+                self.available_update = None;
+            }
+        }
+
+        // Update Progress Dialog
+        if self.update_downloading || self.update_installing {
+            egui::Window::new("⬇ Installing Update")
+                .collapsible(false)
+                .resizable(false)
+                .default_width(360.0)
+                .anchor(egui::Align2::CENTER_CENTER, egui::vec2(0.0, 0.0))
+                .show(ctx, |ui| {
+                    ui.vertical_centered(|ui| {
+                        ui.spinner();
+                        ui.add_space(6.0);
+                        ui.label(&self.update_progress);
+                        ui.add_space(4.0);
+                        ui.weak("Please wait, do not close the app...");
+                    });
+                });
         }
 
         // Server Profile Manager Window
@@ -5503,7 +5688,7 @@ impl eframe::App for MacXtreamer {
                 }
                 // Rebuild index if server changed
                 if server_changed {
-                    println!("🔄 Server geändert, baue Index neu auf...");
+                    println!("🔄 Server profile changed, rebuilding search index...");
                     self.all_movies.clear();
                     self.all_series.clear();
                     self.all_channels.clear();

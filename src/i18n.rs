@@ -101,7 +101,48 @@ pub fn t(key: &str, lang: Language) -> String {
         ("vpn_network_error", Language::English) => "Network timeout - try disconnecting VPN if using one.",
         ("vpn_network_error", Language::German) => "Netzwerk-Timeout - versuche VPN zu trennen falls verwendet.",
         
+        // SOCKS5 Proxy Settings
+        ("proxy_settings", Language::English) => "🔒 SOCKS5 Proxy / VPN",
+        ("proxy_settings", Language::German) => "🔒 SOCKS5 Proxy / VPN",
+        ("proxy_enable", Language::English) => "Enable SOCKS5 Proxy",
+        ("proxy_enable", Language::German) => "SOCKS5 Proxy aktivieren",
+        ("proxy_host", Language::English) => "Host",
+        ("proxy_host", Language::German) => "Host",
+        ("proxy_port", Language::English) => "Port",
+        ("proxy_port", Language::German) => "Port",
+        ("proxy_username", Language::English) => "Username",
+        ("proxy_username", Language::German) => "Benutzername",
+        ("proxy_password", Language::English) => "Password",
+        ("proxy_password", Language::German) => "Passwort",
+        ("proxy_test", Language::English) => "🔍 Test Connection",
+        ("proxy_test", Language::German) => "🔍 Verbindung testen",
+        ("proxy_testing", Language::English) => "Testing connection...",
+        ("proxy_testing", Language::German) => "Teste Verbindung...",
+        ("proxy_status_connected", Language::English) => "🟢 Proxy",
+        ("proxy_status_connected", Language::German) => "🟢 Proxy",
+        ("proxy_status_disconnected", Language::English) => "🔴 Direct",
+        ("proxy_status_disconnected", Language::German) => "🔴 Direkt",
+        ("proxy_help", Language::English) => "💡 Works with any SOCKS5 provider:\n   • PrivadoVPN (Premium)\n   • Mullvad, Windscribe\n   • SSH tunnel (ssh -D 1080)",
+        ("proxy_help", Language::German) => "💡 Funktioniert mit jedem SOCKS5-Provider:\n   • PrivadoVPN (Premium)\n   • Mullvad, Windscribe\n   • SSH Tunnel (ssh -D 1080)",
+        
+        // SOCKS5 Error Messages
+        ("proxy_not_enabled", Language::English) => "Proxy is not enabled",
+        ("proxy_not_enabled", Language::German) => "Proxy ist nicht aktiviert",
+        ("proxy_host_empty", Language::English) => "Proxy host is empty",
+        ("proxy_host_empty", Language::German) => "Proxy-Host ist leer",
+        ("proxy_conn_success", Language::English) => "✓ Connected successfully!",
+        ("proxy_conn_success", Language::German) => "✓ Erfolgreich verbunden!",
+        ("proxy_conn_timeout", Language::English) => "Connection timeout - proxy server not reachable",
+        ("proxy_conn_timeout", Language::German) => "Verbindungs-Timeout - Proxy-Server nicht erreichbar",
+        ("proxy_conn_failed", Language::English) => "Connection failed - check proxy host and port",
+        ("proxy_conn_failed", Language::German) => "Verbindung fehlgeschlagen - prüfe Proxy-Host und Port",
+        ("proxy_auth_failed", Language::English) => "Authentication failed - check username/password",
+        ("proxy_auth_failed", Language::German) => "Authentifizierung fehlgeschlagen - prüfe Benutzername/Passwort",
+        ("vlc_not_installed", Language::English) => "VLC not installed. Download from videolan.org",
+        ("vlc_not_installed", Language::German) => "VLC nicht installiert. Download von videolan.org",
+        ("libvlc_init_failed", Language::English) => "Failed to initialize VLC player",
+        ("libvlc_init_failed", Language::German) => "VLC Player konnte nicht initialisiert werden",
+        
         // Fallback
-        _ => key,
-    }.to_string()
+        _ => key,    }.to_string()
 }

@@ -199,6 +199,19 @@ pub struct Config {
     pub check_for_updates: bool, // Auto-check for updates on startup
     #[serde(default)]
     pub last_update_check: u64, // Unix timestamp of last update check
+    // SOCKS5 Proxy / VPN Settings
+    #[serde(default)]
+    pub proxy_enabled: bool, // Enable proxy for network traffic
+    #[serde(default)]
+    pub proxy_type: String, // "socks5" or "http"
+    #[serde(default)]
+    pub proxy_host: String, // proxy server hostname (e.g., "proxy.privadovpn.com")
+    #[serde(default)]
+    pub proxy_port: u16, // proxy port (1080 for socks5, 8118 for privoxy/http)
+    #[serde(default)]
+    pub proxy_username: String, // proxy auth username (optional)
+    #[serde(default)]
+    pub proxy_password: String, // proxy auth password (optional)
 }
 
 impl Default for Config {
@@ -277,6 +290,12 @@ impl Default for Config {
             language: Language::English,
             check_for_updates: true,
             last_update_check: 0,
+            proxy_enabled: false,
+            proxy_type: "socks5".to_string(),
+            proxy_host: String::new(),
+            proxy_port: 1080,
+            proxy_username: String::new(),
+            proxy_password: String::new(),
         }
     }
 }

@@ -116,6 +116,12 @@ pub fn read_config() -> Result<Config, io::Error> {
                 "bottom_panel_height" => cfg.bottom_panel_height = v.trim().parse::<f32>().unwrap_or(0.0),
                 "left_panel_width" => cfg.left_panel_width = v.trim().parse::<f32>().unwrap_or(0.0),
                 "active_profile_index" => cfg.active_profile_index = v.trim().parse::<usize>().unwrap_or(0),
+                "proxy_enabled" => cfg.proxy_enabled = v.trim().parse::<u8>().map(|n| n != 0).unwrap_or(false),
+                "proxy_type" => cfg.proxy_type = v.trim().to_string(),
+                "proxy_host" => cfg.proxy_host = v.trim().to_string(),
+                "proxy_port" => cfg.proxy_port = v.trim().parse::<u16>().unwrap_or(1080),
+                "proxy_username" => cfg.proxy_username = v.trim().to_string(),
+                "proxy_password" => cfg.proxy_password = v.trim().to_string(),
                 "server_profile" => {
                     // Format: name|address|username|password
                     let parts: Vec<&str> = v.split('|').collect();
@@ -292,6 +298,14 @@ pub fn save_config(cfg: &Config) -> Result<(), io::Error> {
     writeln!(f, "filter_series_language={}", if cfg.filter_series_language {1} else {0})?;
     if cfg.bottom_panel_height > 0.0 { writeln!(f, "bottom_panel_height={:.1}", cfg.bottom_panel_height)?; }
     if cfg.left_panel_width > 0.0 { writeln!(f, "left_panel_width={:.1}", cfg.left_panel_width)?; }
+    
+    // Save SOCKS5 Proxy configuration
+    writeln!(f, "proxy_enabled={}", if cfg.proxy_enabled { 1 } else { 0 })?;
+    if !cfg.proxy_type.trim().is_empty() { writeln!(f, "proxy_type={}", cfg.proxy_type)?; }
+    if !cfg.proxy_host.is_empty() { writeln!(f, "proxy_host={}", cfg.proxy_host)?; }
+    if cfg.proxy_port != 0 { writeln!(f, "proxy_port={}", cfg.proxy_port)?; }
+    if !cfg.proxy_username.is_empty() { writeln!(f, "proxy_username={}", cfg.proxy_username)?; }
+    if !cfg.proxy_password.is_empty() { writeln!(f, "proxy_password={}", cfg.proxy_password)?; }
     
     Ok(())
 }

@@ -128,6 +128,10 @@ fn build_vlc_args(cfg: &Config, st: StreamType) -> Vec<String> {
         }
     }
     // Entfernt: instabile Flags (--mux-caching / --http-timeout)
+    
+    // If user requested SOCKS5 proxying for players, pass it to VLC where possible
+    // (Some VLC builds accept --socks=<host:port> to configure a SOCKS proxy for streams).
+    
     if !cfg.vlc_extra_args.trim().is_empty() { for part in cfg.vlc_extra_args.split_whitespace() { args.push(part.to_string()); } }
     args
 }
@@ -158,7 +162,7 @@ pub fn start_player(cfg: &Config, url: &str) -> Result<(), String> {
     if cfg.use_mpv && mpv_available {
         // mpv Argumente vorbereiten und dann in Hintergrund-Thread starten, um UI nicht zu blockieren.
         let (net_ms, live_ms, _file_ms) = apply_bias(cfg);
-        let cache_secs = if cfg.mpv_cache_secs_override != 0 { cfg.mpv_cache_secs_override } else { (net_ms / 1000).max(1) };
+        let cache_secs = if cfg.mpv_cache_secs_override != 0 { cfg.mpv_cache_secs_override } else { (net_ms / 1000).max(10) };
         let readahead_secs = if cfg.mpv_readahead_secs_override != 0 { cfg.mpv_readahead_secs_override } else { (live_ms / 1000).max(1) };
         let mut base_args: Vec<String> = vec!["--fullscreen".into(), "--no-terminal".into(), "--force-window=yes".into()];
         // Moderne mpv Cache Optionen
@@ -283,6 +287,18 @@ pub fn start_player(cfg: &Config, url: &str) -> Result<(), String> {
             let supported_fb = probe_vlc_supported_flags();
             let filtered_fb = filter_supported(&args_fb, &supported_fb);
             let mut final_fb = filtered_fb;
+            // Wenn SOCKS5 Proxy in der Konfiguration aktiviert ist, versuchen wir VLC entsprechende Flags mitzugeben.
+            if cfg_clone.proxy_enabled && cfg_clone.proxy_type == "socks5" {
+                if !cfg_clone.proxy_host.is_empty() && cfg_clone.proxy_port != 0 {
+                    final_fb.push(format!("--socks={}:{}", cfg_clone.proxy_host, cfg_clone.proxy_port));
+                    if !cfg_clone.proxy_username.is_empty() {
+                        final_fb.push(format!("--socks-user={}", cfg_clone.proxy_username));
+                    }
+                    if !cfg_clone.proxy_password.is_empty() {
+                        final_fb.push(format!("--socks-pwd={}", cfg_clone.proxy_password));
+                    }
+                }
+            }
             final_fb.push(url_string.clone());
             log_command("vlc", &final_fb);
             
@@ -311,6 +327,18 @@ pub fn start_player(cfg: &Config, url: &str) -> Result<(), String> {
     let supported = probe_vlc_supported_flags();
     let filtered = filter_supported(&args, &supported);
     let mut final_args = filtered;
+    // Falls SOCKS5 Proxy gewünscht ist, geben wir VLC die --socks Option mit (Host:Port)
+    if cfg.proxy_enabled && cfg.proxy_type == "socks5" {
+        if !cfg.proxy_host.is_empty() && cfg.proxy_port != 0 {
+            final_args.push(format!("--socks={}:{}", cfg.proxy_host, cfg.proxy_port));
+            if !cfg.proxy_username.is_empty() {
+                final_args.push(format!("--socks-user={}", cfg.proxy_username));
+            }
+            if !cfg.proxy_password.is_empty() {
+                final_args.push(format!("--socks-pwd={}", cfg.proxy_password));
+            }
+        }
+    }
     final_args.push(url.to_string());
     
     if !vlc_available {

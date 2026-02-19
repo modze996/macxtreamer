@@ -35,6 +35,7 @@ pub enum Msg {
     LiveCategories(Result<Vec<Category>, String>),
     VodCategories(Result<Vec<Category>, String>),
     SeriesCategories(Result<Vec<Category>, String>),
+    SkipSeriesLoading, // Skip series loading if it times out or hangs
     
     // Item and episode loading
     ItemsLoaded {
@@ -135,6 +136,12 @@ pub enum Msg {
     EpgLoaded {
         stream_id: String,
         program: Option<String>,
+    },
+    
+    // SOCKS5 Proxy test
+    ProxyTestResult {
+        success: bool,
+        message: String,
     },
 }
 

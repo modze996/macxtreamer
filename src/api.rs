@@ -67,15 +67,26 @@ pub async fn fetch_categories(cfg: &Config, action: &str) -> Result<Vec<Category
     };
     if let Some(cached) = load_cache::<Vec<Category>>(key, CACHE_TTL_CATEGORIES_SECS) { return Ok(cached); }
     let url = format!("{}/player_api.php?username={}&password={}&action={}", cfg.address, cfg.username, cfg.password, action);
-    // println!("🌐 API-Aufruf: {}", url.replace(&cfg.password, "***"));
+    println!("🌐 [{}] API-Aufruf gestartet...", action);
+    let start = std::time::Instant::now();
     
-    let client = reqwest::Client::builder()
-        .timeout(std::time::Duration::from_secs(10))
-        .build()
-        .map_err(|e| format!("HTTP client error: {}", e))?;
+    // Use SOCKS5-configured client from network module
+    let client = crate::network::build_http_client(cfg).await
+        .map_err(|e| format!("Failed to build HTTP client: {}", e))?;
     
-    let res = client.get(&url).send().await
-        .map_err(|e| format!("API request failed: {}", e))?;
+    // Wrap the entire request in a timeout
+    let timeout_duration = tokio::time::Duration::from_secs(30);
+    let res = tokio::time::timeout(timeout_duration, client.get(&url).send()).await
+        .map_err(|_| {
+            let elapsed = start.elapsed();
+            eprintln!("⏱️ [{}] Request timeout after {:.1}s", action, elapsed.as_secs_f32());
+            format!("Request timeout after {:.1}s", elapsed.as_secs_f32())
+        })?
+        .map_err(|e| {
+            let elapsed = start.elapsed();
+            eprintln!("❌ [{}] API request failed after {:.1}s: {}", action, elapsed.as_secs_f32(), e);
+            format!("API request failed after {:.1}s: {}", elapsed.as_secs_f32(), e)
+        })?;
     let status = res.status();
     let body_text = res.text().await
         .map_err(|e| format!("Failed to read response body: {}", e))?;
@@ -92,8 +103,14 @@ pub async fn fetch_categories(cfg: &Config, action: &str) -> Result<Vec<Category
         Err(e) => {
             eprintln!("❌ JSON parse error for {}: {}", action, e);
             eprintln!("   Response status: {}", status);
-            eprintln!("   Response preview (first 200 chars): {}", 
-                body_text.chars().take(200).collect::<String>());
+            let preview = if body_text.len() > 500 { 
+                format!("{}...<truncated>", body_text.chars().take(500).collect::<String>())
+            } else {
+                body_text.clone()
+            };
+            eprintln!("   Full response: {}", preview);
+            eprintln!("   Response bytes: {:?}", &body_text.as_bytes()[..std::cmp::min(100, body_text.len())]);
+            eprintln!("   Response length: {}", body_text.len());
             return Err(format!("JSON parse error (status {}): {}", status, e));
         }
     };
@@ -110,6 +127,8 @@ pub async fn fetch_categories(cfg: &Config, action: &str) -> Result<Vec<Category
         }
     }
     save_cache(key, &out);
+    let elapsed = start.elapsed();
+    println!("✅ [{}] {} Kategorien geladen in {:.1}s", action, out.len(), elapsed.as_secs_f32());
     Ok(out)
 }
 
@@ -119,10 +138,8 @@ pub async fn fetch_items(cfg: &Config, kind: &str, category_id: &str) -> Result<
     if let Some(cached) = load_cache::<Vec<Item>>(&key, CACHE_TTL_ITEMS_SECS) { return Ok(cached); }
     let url = format!("{}/player_api.php?username={}&password={}&action={}&category_id={}", cfg.address, cfg.username, cfg.password, action, category_id);
     let net = async {
-        let client = reqwest::Client::builder()
-            .timeout(std::time::Duration::from_secs(10))
-            .build()
-            .map_err(|e| format!("HTTP client error: {}", e))?;
+        let client = crate::network::build_http_client(cfg).await
+            .map_err(|e| format!("Failed to build HTTP client: {}", e))?;
         let res = client.get(&url).send().await
             .map_err(|e| format!("API request failed: {}", e))?;
         let status = res.status();
