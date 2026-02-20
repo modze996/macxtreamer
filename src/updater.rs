@@ -41,9 +41,7 @@ pub struct GitHubAsset {
 pub struct UpdateInfo {
     pub latest_version: String,
     pub update_available: bool,
-    #[allow(dead_code)]
     pub release_notes: String,
-    #[allow(dead_code)]
     pub download_url: Option<String>,
 }
 
@@ -116,14 +114,34 @@ pub async fn check_for_updates(current_version: &str) -> Result<UpdateInfo, Stri
     })
 }
 
-/// Download DMG and install update automatically (macOS)
-#[allow(dead_code)]
-pub async fn download_and_install_update(download_url: &str, version: &str) -> Result<String, String> {
+/// Download DMG and install update automatically (macOS).
+/// `progress_tx` receives human-readable status strings (optional).
+pub async fn download_and_install_update(
+    download_url: &str,
+    version: &str,
+    progress_tx: Option<tokio::sync::mpsc::UnboundedSender<String>>,
+) -> Result<String, String> {
     use futures_util::StreamExt;
     use std::io::Write;
+
+    macro_rules! progress {
+        ($msg:expr) => {{
+            println!("{}", $msg);
+            if let Some(ref tx) = progress_tx {
+                let _ = tx.send($msg.to_string());
+            }
+        }};
+        ($fmt:expr, $($arg:tt)*) => {{
+            let s = format!($fmt, $($arg)*);
+            println!("{}", s);
+            if let Some(ref tx) = progress_tx {
+                let _ = tx.send(s);
+            }
+        }};
+    }
     
-    println!("📥 Downloading update from: {}", download_url);
-    
+    progress!("📥 Downloading update from: {}", download_url);
+
     // Create temp directory for download
     let temp_dir = std::env::temp_dir();
     let dmg_filename = format!("macxtreamer_{}.dmg", version);
@@ -147,7 +165,7 @@ pub async fn download_and_install_update(download_url: &str, version: &str) -> R
     }
     
     let total_size = response.content_length().unwrap_or(0);
-    println!("📦 Download size: {} MB", total_size / 1_048_576);
+    progress!("📦 Download size: {} MB", total_size / 1_048_576.max(1));
     
     // Create file and download with progress
     let mut file = std::fs::File::create(&dmg_path)
@@ -163,18 +181,18 @@ pub async fn download_and_install_update(download_url: &str, version: &str) -> R
         downloaded += chunk.len() as u64;
         
         if total_size > 0 {
-            let progress = (downloaded as f64 / total_size as f64 * 100.0) as u32;
-            if downloaded % (5 * 1_048_576) == 0 || downloaded == total_size {
-                println!("📥 Progress: {}%", progress);
+            let progress_pct = (downloaded as f64 / total_size as f64 * 100.0) as u32;
+            if progress_pct % 10 == 0 && downloaded % (2 * 1_048_576) < chunk.len() as u64 {
+                progress!("📥 Downloading... {}%", progress_pct);
             }
         }
     }
     
     drop(file);
-    println!("✅ Download complete: {}", dmg_path.display());
-    
+    progress!("✅ Download complete");
+
     // Mount DMG
-    println!("💿 Mounting DMG...");
+    progress!("💿 Mounting DMG...");
     let mount_output = std::process::Command::new("hdiutil")
         .args(&["attach", "-nobrowse", "-quiet"])
         .arg(&dmg_path)
@@ -194,7 +212,7 @@ pub async fn download_and_install_update(download_url: &str, version: &str) -> R
         .ok_or("Failed to parse mount point")?
         .trim();
     
-    println!("💿 Mounted at: {}", mount_point);
+    progress!("💿 Mounted at: {}", mount_point);
     
     // Find .app bundle in mounted volume
     let mount_path = std::path::Path::new(mount_point);
@@ -212,20 +230,20 @@ pub async fn download_and_install_update(download_url: &str, version: &str) -> R
         .ok_or("No .app bundle found in DMG")?;
     
     let source_app = app_bundle.path();
-    println!("📦 Found app: {}", source_app.display());
+    progress!("📦 Found app: {}", source_app.display());
     
     // Install to /Applications
     let dest_app = std::path::Path::new("/Applications/macxtreamer.app");
     
     // Remove old version if exists
     if dest_app.exists() {
-        println!("🗑️  Removing old version...");
+        progress!("🗑️  Removing old version...");
         std::fs::remove_dir_all(dest_app)
             .map_err(|e| format!("Failed to remove old version: {}", e))?;
     }
     
     // Copy new version
-    println!("📋 Installing new version...");
+    progress!("📋 Installing new version...");
     let copy_status = std::process::Command::new("cp")
         .args(&["-R"])
         .arg(&source_app)
@@ -238,17 +256,17 @@ pub async fn download_and_install_update(download_url: &str, version: &str) -> R
     }
     
     // Unmount DMG
-    println!("💿 Unmounting DMG...");
+    progress!("💿 Unmounting DMG...");
     let _ = std::process::Command::new("hdiutil")
         .args(&["detach", "-quiet"])
         .arg(mount_point)
         .status();
-    
+
     // Clean up DMG file
     let _ = std::fs::remove_file(&dmg_path);
-    
-    println!("✅ Installation complete!");
-    Ok("Update installed successfully. The app will restart.".to_string())
+
+    progress!("✅ Installation complete!");
+    Ok("Update installed successfully. Restarting...".to_string())
 }
 
 #[cfg(test)]

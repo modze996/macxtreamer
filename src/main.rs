@@ -345,6 +345,8 @@ struct MacXtreamer {
     update_downloading: bool,
     update_installing: bool,
     update_progress: String,
+    /// True when update check was triggered automatically on startup → auto-install without dialog.
+    startup_auto_install: bool,
     
     // Toast notifications
     toasts: Vec<Toast>,
@@ -512,6 +514,7 @@ impl MacXtreamer {
             update_downloading: false,
             update_installing: false,
             update_progress: String::new(),
+            startup_auto_install: false,
         };
 
         // Konfig prüfen – falls unvollständig, Config Dialog anzeigen
@@ -540,23 +543,15 @@ impl MacXtreamer {
             });
         }
 
-        // Auto-check for updates on startup (if enabled and not checked recently)
-        if app.config.check_for_updates && app.should_check_for_updates() {
+        // Auto-check for updates on startup (if enabled) — always silent on startup, auto-installs if newer found
+        if app.config.check_for_updates {
+            app.startup_auto_install = true;
             app.check_for_updates();
         }
 
         app
     }
     
-    fn should_check_for_updates(&self) -> bool {
-        let now = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_secs();
-        
-        // Check once per day (86400 seconds)
-        now - self.config.last_update_check > 86400
-    }
     
     fn add_toast(&mut self, message: String, toast_type: ToastType) {
         self.toasts.push(Toast {
@@ -780,19 +775,26 @@ impl MacXtreamer {
         }
     }
     
-    #[allow(dead_code)]
-    fn start_update_download(&mut self, update_info: &updater::UpdateInfo) {
+    fn start_update_download(&mut self, update_info: updater::UpdateInfo) {
         if let Some(ref download_url) = update_info.download_url {
             self.update_downloading = true;
-            self.update_progress = "0%".to_string();
+            self.update_progress = "Starting download...".to_string();
             
             let tx = self.tx.clone();
             let url = download_url.clone();
             let version = update_info.latest_version.clone();
             
+            let (prog_tx, mut prog_rx) = tokio::sync::mpsc::unbounded_channel::<String>();
+            let tx_prog = tx.clone();
+            tokio::spawn(async move {
+                while let Some(msg) = prog_rx.recv().await {
+                    let _ = tx_prog.send(Msg::UpdateProgress(msg));
+                }
+            });
+            
             tokio::spawn(async move {
                 println!("📥 Starting DMG download from: {}", url);
-                match updater::download_and_install_update(&url, &version).await {
+                match updater::download_and_install_update(&url, &version, Some(prog_tx)).await {
                     Ok(msg) => {
                         println!("✅ {}", msg);
                         let _ = tx.send(Msg::UpdateInstalled);
@@ -803,6 +805,8 @@ impl MacXtreamer {
                     }
                 }
             });
+        } else {
+            self.add_toast("⚠️ No DMG asset found in this release.".to_string(), ToastType::Warning);
         }
     }
 
@@ -3026,28 +3030,45 @@ impl eframe::App for MacXtreamer {
                     self.is_loading = false;
                 }
                 Msg::UpdateAvailable(update_info) => {
-                    println!("📲 Received UpdateAvailable message");
-                    let version = update_info.latest_version.clone();
-                    self.available_update = Some(update_info);
-                    self.add_toast(
-                        format!("🎉 {} {} {}", 
-                            t("new_version", self.config.language),
-                            version,
-                            t("available_short", self.config.language)
-                        ),
-                        ToastType::Success
-                    );
+                    println!("📲 Received UpdateAvailable message: v{}", update_info.latest_version);
                     self.checking_for_updates = false;
                     self.update_check_deadline = None;
+                    if self.startup_auto_install {
+                        self.startup_auto_install = false;
+                        self.add_toast(
+                            format!("🔄 Update v{} found — installing automatically...", update_info.latest_version),
+                            ToastType::Info
+                        );
+                        self.start_update_download(update_info);
+                    } else {
+                        let version = update_info.latest_version.clone();
+                        self.available_update = Some(update_info);
+                        self.add_toast(
+                            format!("🎉 {} {} {}", 
+                                t("new_version", self.config.language),
+                                version,
+                                t("available_short", self.config.language)
+                            ),
+                            ToastType::Success
+                        );
+                    }
                 }
                 Msg::NoUpdateAvailable => {
-                    println!("📲 Received NoUpdateAvailable message");
+                    println!("📲 No update available");
                     self.checking_for_updates = false;
                     self.update_check_deadline = None;
-                    self.add_toast(
-                        format!("✓ {}", t("up_to_date", self.config.language)),
-                        ToastType::Info
-                    );
+                    let was_startup = self.startup_auto_install;
+                    self.startup_auto_install = false;
+                    if !was_startup {
+                        // Only show toast for manual checks
+                        self.add_toast(
+                            format!("✓ {}", t("up_to_date", self.config.language)),
+                            ToastType::Info
+                        );
+                    }
+                }
+                Msg::UpdateProgress(msg) => {
+                    self.update_progress = msg;
                 }
                 Msg::UpdateError(error) => {
                     println!("📲 Received UpdateError message: {}", error);
@@ -3066,14 +3087,17 @@ impl eframe::App for MacXtreamer {
                     }
                 }
                 Msg::UpdateInstalled => {
-                    println!("📲 Received UpdateInstalled message");
+                    println!("📲 Update installed — restarting...");
                     self.update_downloading = false;
                     self.update_installing = false;
-                    self.update_progress = "Installation complete! Restarting app...".to_string();
-                    // Schedule app restart after a brief delay
+                    self.update_progress = "Installation complete! Restarting...".to_string();
                     std::thread::spawn(|| {
                         std::thread::sleep(std::time::Duration::from_secs(2));
-                        println!("🔄 Restarting application...");
+                        println!("🔄 Launching new version from /Applications/macxtreamer.app");
+                        let _ = std::process::Command::new("open")
+                            .arg("/Applications/macxtreamer.app")
+                            .spawn();
+                        std::thread::sleep(std::time::Duration::from_millis(500));
                         std::process::exit(0);
                     });
                 }
@@ -5469,7 +5493,7 @@ impl eframe::App for MacXtreamer {
                     }
                 });
             if start_download {
-                self.start_update_download(&update_info);
+                self.start_update_download(update_info);
                 self.available_update = None;
             } else if close_update {
                 self.available_update = None;

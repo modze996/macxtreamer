@@ -131,6 +131,7 @@ pub enum Msg {
     NoUpdateAvailable,
     UpdateError(String),
     UpdateInstalled,
+    UpdateProgress(String),
     
     // EPG data
     EpgLoaded {
