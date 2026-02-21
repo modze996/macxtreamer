@@ -2479,13 +2479,13 @@ impl eframe::App for MacXtreamer {
                                     let should_include = if self.config.filter_by_language && !self.config.default_search_languages.is_empty() {
                                         if let Some(langs) = &it.audio_languages {
                                             let langs_upper = langs.to_uppercase();
-                                            // Check if any configured language appears in item's languages
+                                            // Only filter out when language IS known and doesn't match
                                             self.config.default_search_languages.iter().any(|filter_lang| {
                                                 langs_upper.contains(&filter_lang.to_uppercase())
                                             })
                                         } else {
-                                            // Keep items without language info (channels, series, etc.)
-                                            info == "Channel" || info == "Series"
+                                            // No language info → always include (don't hide content just because provider omitted the field)
+                                            true
                                         }
                                     } else {
                                         // Filter disabled, include all
