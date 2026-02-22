@@ -191,10 +191,12 @@ pub async fn download_and_install_update(
     drop(file);
     progress!("✅ Download complete");
 
-    // Mount DMG
+    // Mount DMG at a fixed mount point so we don't need to parse stdout
     progress!("💿 Mounting DMG...");
+    let mount_point = format!("/tmp/macxtreamer_update_{}", std::process::id());
+    let _ = std::fs::create_dir_all(&mount_point);
     let mount_output = std::process::Command::new("hdiutil")
-        .args(&["attach", "-nobrowse", "-quiet"])
+        .args(&["attach", "-nobrowse", "-mountpoint", &mount_point])
         .arg(&dmg_path)
         .output()
         .map_err(|e| format!("Failed to mount DMG: {}", e))?;
@@ -203,19 +205,10 @@ pub async fn download_and_install_update(
         return Err(format!("DMG mount failed: {}", String::from_utf8_lossy(&mount_output.stderr)));
     }
     
-    // Parse mount point from output
-    let mount_info = String::from_utf8_lossy(&mount_output.stdout);
-    let mount_point = mount_info
-        .lines()
-        .last()
-        .and_then(|line| line.split('\t').last())
-        .ok_or("Failed to parse mount point")?
-        .trim();
-    
     progress!("💿 Mounted at: {}", mount_point);
     
     // Find .app bundle in mounted volume
-    let mount_path = std::path::Path::new(mount_point);
+    let mount_path = std::path::Path::new(&mount_point);
     let app_entries = std::fs::read_dir(mount_path)
         .map_err(|e| format!("Failed to read mount directory: {}", e))?;
     
@@ -259,8 +252,9 @@ pub async fn download_and_install_update(
     progress!("💿 Unmounting DMG...");
     let _ = std::process::Command::new("hdiutil")
         .args(&["detach", "-quiet"])
-        .arg(mount_point)
+        .arg(&mount_point)
         .status();
+    let _ = std::fs::remove_dir_all(&mount_point);
 
     // Clean up DMG file
     let _ = std::fs::remove_file(&dmg_path);
