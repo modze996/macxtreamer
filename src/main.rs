@@ -689,7 +689,15 @@ impl MacXtreamer {
                 .map(|s| s.trim().to_string())
                 .filter(|s| !s.is_empty())
         };
-        let vlc_path = which("vlc");
+        let mut vlc_path = which("vlc");
+        if vlc_path.is_none() {
+            let vlc_candidates = [
+                "/Applications/VLC.app/Contents/MacOS/VLC",
+                "/usr/local/bin/vlc",
+                "/opt/homebrew/bin/vlc",
+            ];
+            for c in vlc_candidates.iter() { if Path::new(c).exists() { vlc_path = Some(c.to_string()); break; } }
+        }
         let mut mpv_path = if !cfg.mpv_custom_path.trim().is_empty() { Some(cfg.mpv_custom_path.trim().to_string()) } else { which("mpv") };
         if mpv_path.as_ref().map(|p| !Path::new(p).exists()).unwrap_or(false) { mpv_path = None; }
         if mpv_path.is_none() {
@@ -714,7 +722,7 @@ impl MacXtreamer {
         let (has_vlc, has_mpv, vlc_path, mpv_path, vlc_version, mpv_version) = Self::detect_players(&self.config);
         self.has_vlc = has_vlc; self.has_mpv = has_mpv; self.detected_vlc_path = vlc_path; self.detected_mpv_path = mpv_path; self.vlc_version = vlc_version; self.mpv_version = mpv_version;
         if self.config.use_mpv && !self.has_mpv { self.config.use_mpv = false; self.last_error = Some("mpv not found – falling back to VLC".into()); self.pending_save_config = true; }
-        if !self.config.use_mpv && self.has_mpv && !self.has_vlc { self.config.use_mpv = true; self.pending_save_config = true; }
+        // Do not auto-enable MPV when VLC is not found: respect user's saved "Use MPV" preference (fixes installed app where PATH doesn't include vlc).
     }
 
     fn config_is_complete(&self) -> bool {
@@ -2395,8 +2403,7 @@ impl eframe::App for MacXtreamer {
                     self.detected_mpv_path = mpv_path;
                     // Policy: if user wanted mpv but not present -> disable
                     if self.config.use_mpv && !self.has_mpv { self.config.use_mpv = false; self.last_error = Some("mpv not found – falling back to VLC".into()); self.pending_save_config = true; }
-                    // If mpv only available -> auto enable
-                    if !self.config.use_mpv && self.has_mpv && !self.has_vlc { self.config.use_mpv = true; self.pending_save_config = true; }
+                    // Do not auto-enable MPV when VLC not found: respect saved "Use MPV" preference (installed app).
                 }
                 Msg::PlayerSpawnFailed { player, error } => {
                     // Detaillierte Fehlerbehandlung je nach Player-Typ
@@ -3397,12 +3404,15 @@ impl eframe::App for MacXtreamer {
                     {
                         let proxy_active = self.config.proxy_enabled && !self.config.proxy_host.is_empty();
                         let status_text = if proxy_active { t("proxy_status_connected", self.config.language) } else { t("proxy_status_disconnected", self.config.language) };
-                        if ui.add(egui::Button::new(status_text)).on_hover_text(&t("proxy_help", self.config.language)).clicked() {
-                            // Open full settings when clicking the proxy status
+                        let mut btn = egui::Button::new(status_text);
+                        if proxy_active {
+                            btn = btn.fill(egui::Color32::from_rgb(40, 120, 60)); // subtle green when proxy active
+                        }
+                        let r = ui.add(btn).on_hover_text(&t("proxy_help", self.config.language));
+                        if r.clicked() {
                             self.config_draft = Some(self.config.clone());
                             self.show_config = true;
                         }
-                        // (Top-bar test button removed; use Test in Settings dialog)
                     }
                     // Short hint about player URL placeholder
                     ui.add_space(6.0);

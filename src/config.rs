@@ -5,8 +5,14 @@ use crate::models::Config;
 use base64::{Engine as _, engine::general_purpose};
 
 fn config_file_path() -> PathBuf {
-    let home = std::env::var("HOME").unwrap_or_else(|_| ".".to_string());
-    PathBuf::from(format!("{}/Library/Application Support/MacXtreamer/xtream_config.txt", home))
+    // Prefer HOME env; when app is launched from Finder (installed .app), HOME is often unset.
+    // Use directories::UserDirs so the same path is used for read and save in that case.
+    let home: PathBuf = std::env::var("HOME")
+        .ok()
+        .map(PathBuf::from)
+        .or_else(|| directories::UserDirs::new().map(|u| u.home_dir().to_path_buf()))
+        .unwrap_or_else(|| PathBuf::from("."));
+    home.join("Library/Application Support/MacXtreamer/xtream_config.txt")
 }
 
 pub fn read_config() -> Result<Config, io::Error> {

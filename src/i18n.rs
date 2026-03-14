@@ -118,7 +118,7 @@ pub fn t(key: &str, lang: Language) -> String {
         ("proxy_test", Language::German) => "🔍 Verbindung testen",
         ("proxy_testing", Language::English) => "Testing connection...",
         ("proxy_testing", Language::German) => "Teste Verbindung...",
-        ("proxy_status_connected", Language::English) => "� Proxy",
+        ("proxy_status_connected", Language::English) => "🛡 Proxy",
         ("proxy_status_connected", Language::German) => "🛡 Proxy",
         ("proxy_status_disconnected", Language::English) => "🌐 Direct",
         ("proxy_status_disconnected", Language::German) => "🌐 Direkt",

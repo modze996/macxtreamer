@@ -165,7 +165,12 @@ pub async fn fetch_items(cfg: &Config, kind: &str, category_id: &str) -> Result<
         };
         
         let mut out = Vec::new();
-    if let Some(arr) = json.as_array() {
+        // Some providers return a direct array; others wrap in {"series": [...]} or {"data": [...]}
+        let arr = json.as_array()
+            .or_else(|| json.get("series").and_then(|x| x.as_array()))
+            .or_else(|| json.get("data").and_then(|x| x.as_array()))
+            .or_else(|| json.get("items").and_then(|x| x.as_array()));
+        if let Some(arr) = arr {
             for v in arr {
                 let id = v.get("stream_id").or_else(|| v.get("series_id")).or_else(|| v.get("id")).and_then(|x| x.as_i64()).map(|n| n.to_string()).unwrap_or_default();
                 let name = v.get("name").and_then(|x| x.as_str()).unwrap_or_default().to_string();
