@@ -689,15 +689,7 @@ impl MacXtreamer {
                 .map(|s| s.trim().to_string())
                 .filter(|s| !s.is_empty())
         };
-        let mut vlc_path = which("vlc");
-        if vlc_path.is_none() {
-            let vlc_candidates = [
-                "/Applications/VLC.app/Contents/MacOS/VLC",
-                "/usr/local/bin/vlc",
-                "/opt/homebrew/bin/vlc",
-            ];
-            for c in vlc_candidates.iter() { if Path::new(c).exists() { vlc_path = Some(c.to_string()); break; } }
-        }
+        let vlc_path = which("vlc");
         let mut mpv_path = if !cfg.mpv_custom_path.trim().is_empty() { Some(cfg.mpv_custom_path.trim().to_string()) } else { which("mpv") };
         if mpv_path.as_ref().map(|p| !Path::new(p).exists()).unwrap_or(false) { mpv_path = None; }
         if mpv_path.is_none() {
@@ -722,7 +714,7 @@ impl MacXtreamer {
         let (has_vlc, has_mpv, vlc_path, mpv_path, vlc_version, mpv_version) = Self::detect_players(&self.config);
         self.has_vlc = has_vlc; self.has_mpv = has_mpv; self.detected_vlc_path = vlc_path; self.detected_mpv_path = mpv_path; self.vlc_version = vlc_version; self.mpv_version = mpv_version;
         if self.config.use_mpv && !self.has_mpv { self.config.use_mpv = false; self.last_error = Some("mpv not found – falling back to VLC".into()); self.pending_save_config = true; }
-        // Do not auto-enable MPV when VLC is not found: respect user's saved "Use MPV" preference (fixes installed app where PATH doesn't include vlc).
+        if !self.config.use_mpv && self.has_mpv && !self.has_vlc { self.config.use_mpv = true; self.pending_save_config = true; }
     }
 
     fn config_is_complete(&self) -> bool {
@@ -2403,7 +2395,8 @@ impl eframe::App for MacXtreamer {
                     self.detected_mpv_path = mpv_path;
                     // Policy: if user wanted mpv but not present -> disable
                     if self.config.use_mpv && !self.has_mpv { self.config.use_mpv = false; self.last_error = Some("mpv not found – falling back to VLC".into()); self.pending_save_config = true; }
-                    // Do not auto-enable MPV when VLC not found: respect saved "Use MPV" preference (installed app).
+                    // If mpv only available -> auto enable
+                    if !self.config.use_mpv && self.has_mpv && !self.has_vlc { self.config.use_mpv = true; self.pending_save_config = true; }
                 }
                 Msg::PlayerSpawnFailed { player, error } => {
                     // Detaillierte Fehlerbehandlung je nach Player-Typ
@@ -2482,8 +2475,14 @@ impl eframe::App for MacXtreamer {
                                         _ => "Item",
                                     };
                                     
-                                    // Apply language filter if enabled
-                                    let should_include = if self.config.filter_by_language && !self.config.default_search_languages.is_empty() {
+                                    // Apply language filter if enabled (use per-type filter flag)
+                                    let type_filter_active = match kind.as_str() {
+                                        "vod" => self.filter_vod_language,
+                                        "subplaylist" => self.filter_live_language,
+                                        "series" => self.filter_series_language,
+                                        _ => false,
+                                    };
+                                    let should_include = if type_filter_active && !self.config.default_search_languages.is_empty() {
                                         if let Some(langs) = &it.audio_languages {
                                             let langs_upper = langs.to_uppercase();
                                             // Only filter out when language IS known and doesn't match
@@ -3404,15 +3403,12 @@ impl eframe::App for MacXtreamer {
                     {
                         let proxy_active = self.config.proxy_enabled && !self.config.proxy_host.is_empty();
                         let status_text = if proxy_active { t("proxy_status_connected", self.config.language) } else { t("proxy_status_disconnected", self.config.language) };
-                        let mut btn = egui::Button::new(status_text);
-                        if proxy_active {
-                            btn = btn.fill(egui::Color32::from_rgb(40, 120, 60)); // subtle green when proxy active
-                        }
-                        let r = ui.add(btn).on_hover_text(&t("proxy_help", self.config.language));
-                        if r.clicked() {
+                        if ui.add(egui::Button::new(status_text)).on_hover_text(&t("proxy_help", self.config.language)).clicked() {
+                            // Open full settings when clicking the proxy status
                             self.config_draft = Some(self.config.clone());
                             self.show_config = true;
                         }
+                        // (Top-bar test button removed; use Test in Settings dialog)
                     }
                     // Short hint about player URL placeholder
                     ui.add_space(6.0);
@@ -4461,8 +4457,17 @@ impl eframe::App for MacXtreamer {
                         // Hilfsfunktion: Spalten-Konfiguration speichern
                         // (column_config_to_csv als freie Funktion weiter unten)
             
-            // Apply language filter if enabled
-            if self.config.filter_by_language && !self.config.default_search_languages.is_empty() {
+            // Apply language filter if enabled (use per-type filter flag)
+            let render_filter_active = match &self.current_view {
+                Some(ViewState::Items { kind, .. }) => match kind.as_str() {
+                    "vod" => self.filter_vod_language,
+                    "subplaylist" => self.filter_live_language,
+                    "series" => self.filter_series_language,
+                    _ => false,
+                },
+                _ => false,
+            };
+            if render_filter_active && !self.config.default_search_languages.is_empty() {
                 rows.retain(|row| {
                     // If no audio_languages info, keep the item (could be a channel or missing metadata)
                     if let Some(langs) = &row.audio_languages {

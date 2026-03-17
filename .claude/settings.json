@@ -1,0 +1,8 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(grep -rn \"filter_language\\\\|filter_vod\\\\|filter_live\\\\|filter_series\\\\|audio_languages\" /Users/mamo/devel/macxtreamer/src/*.rs)",
+      "Bash(cargo build:*)"
+    ]
+  }
+}
