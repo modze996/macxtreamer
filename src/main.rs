@@ -60,7 +60,7 @@ use downloads::{BulkOptions, sanitize_filename};
 use helpers::{file_path_to_uri, format_file_size};
 use logger::log_line;
 use models::{Category, Config, FavItem, Item, Language, RecentItem, Row};
-use ui_helpers::{colored_text_by_type, render_loading_spinner};
+use ui_helpers::{colored_text_themed, type_color, accent_color, rating_color, play_button_fill, fav_active_color, render_loading_spinner};
 impl ColumnKey {
     pub fn as_str(&self) -> &'static str {
         match self {
@@ -383,7 +383,7 @@ impl MacXtreamer {
     let persisted_filter_live = config.filter_live_language;
     let persisted_filter_vod = config.filter_vod_language;
     let persisted_filter_series = config.filter_series_language;
-    let default_search_langs = config.default_search_languages.clone();
+    let _default_search_langs = config.default_search_languages.clone();
     let persisted_ai_panel_tab = config.ai_panel_tab.clone();
         let mut app = Self {
                         column_config: vec![
@@ -420,12 +420,12 @@ impl MacXtreamer {
             pending_decode_urls: HashSet::new(),
             decode_sem: Arc::new(Semaphore::new(2)),
             cover_sem: Arc::new(Semaphore::new(6)),
-            cover_height: 60.0,
+            cover_height: 80.0,
             search_text: String::new(),
             search_history: load_search_history(),
             show_search_history: false,
             search_status: SearchStatus::Idle,
-            search_language_filter: default_search_langs,
+            search_language_filter: Vec::new(), // empty = no filter, opt-in via 🌐 popup
             show_language_filter: false,
             is_loading: false,
             loading_done: 0,
@@ -2122,8 +2122,41 @@ impl eframe::App for MacXtreamer {
         // Theme anwenden (einmalig oder bei Wechsel)
         if !self.theme_applied {
             match self.current_theme.as_str() {
-                "light" => ctx.set_visuals(egui::Visuals::light()),
-                _ => ctx.set_visuals(egui::Visuals::dark()),
+                "light" => {
+                    let mut v = egui::Visuals::light();
+                    v.panel_fill = Color32::from_rgb(242, 244, 250);
+                    v.window_fill = Color32::from_rgb(255, 255, 255);
+                    v.extreme_bg_color = Color32::from_rgb(228, 232, 242);
+                    v.hyperlink_color = Color32::from_rgb(25, 80, 170);
+                    v.selection.bg_fill = Color32::from_rgba_premultiplied(25, 80, 170, 80);
+                    v.widgets.inactive.bg_fill = Color32::from_rgb(220, 224, 235);
+                    v.widgets.inactive.fg_stroke.color = Color32::from_rgb(40, 40, 55);
+                    v.widgets.hovered.bg_fill = Color32::from_rgb(190, 210, 245);
+                    v.widgets.hovered.fg_stroke.color = Color32::from_rgb(20, 20, 40);
+                    v.widgets.active.bg_fill = Color32::from_rgb(160, 195, 240);
+                    v.widgets.active.fg_stroke.color = Color32::from_rgb(10, 10, 30);
+                    v.widgets.noninteractive.bg_fill = Color32::from_rgb(235, 238, 248);
+                    v.widgets.noninteractive.fg_stroke.color = Color32::from_rgb(55, 55, 75);
+                    ctx.set_visuals(v);
+                }
+                _ => {
+                    let mut v = egui::Visuals::dark();
+                    // Richer, deeper dark theme
+                    v.panel_fill = Color32::from_rgb(14, 14, 20);
+                    v.window_fill = Color32::from_rgb(22, 22, 32);
+                    v.extreme_bg_color = Color32::from_rgb(8, 8, 12);
+                    v.hyperlink_color = Color32::from_rgb(100, 180, 255);
+                    v.selection.bg_fill = Color32::from_rgba_premultiplied(60, 110, 200, 160);
+                    v.widgets.inactive.bg_fill = Color32::from_rgb(30, 32, 45);
+                    v.widgets.inactive.fg_stroke.color = Color32::from_rgb(200, 200, 215);
+                    v.widgets.hovered.bg_fill = Color32::from_rgb(45, 70, 130);
+                    v.widgets.hovered.fg_stroke.color = Color32::WHITE;
+                    v.widgets.active.bg_fill = Color32::from_rgb(55, 95, 175);
+                    v.widgets.active.fg_stroke.color = Color32::WHITE;
+                    v.widgets.noninteractive.bg_fill = Color32::from_rgb(20, 20, 30);
+                    v.widgets.noninteractive.fg_stroke.color = Color32::from_rgb(180, 180, 200);
+                    ctx.set_visuals(v);
+                }
             }
             self.theme_applied = true;
         }
@@ -3264,6 +3297,7 @@ impl eframe::App for MacXtreamer {
             ctx.request_repaint_after(Duration::from_millis(200));
         }
 
+        let is_dark = self.current_theme != "light";
         let win_h = ctx.input(|i| i.screen_rect().height());
         let top_h = win_h / 3.0;
         egui::TopBottomPanel::top("top")
@@ -3273,13 +3307,13 @@ impl eframe::App for MacXtreamer {
             .show(ctx, |ui| {
                 // Kopfzeile mit Aktionen und Suche
                 ui.horizontal(|ui| {
-                    ui.heading("MacXtreamer");
+                    ui.heading(RichText::new("MacXtreamer").color(accent_color(is_dark)).strong());
                     if self.config.low_cpu_mode {
                         ui.label(egui::RichText::new("Low-CPU Mode").small().color(egui::Color32::from_rgb(150,255,150))).on_hover_text(format!("Ø Frame {:.1}ms", self.avg_frame_ms));
                     }
                     if !self.view_stack.is_empty() {
                         if ui
-                            .button("Back")
+                            .button("← Back")
                             .on_hover_text("Go to previous view")
                             .clicked()
                         {
@@ -3306,14 +3340,14 @@ impl eframe::App for MacXtreamer {
                             }
                         }
                     }
-                    if ui.button("Reload").clicked() {
+                    if ui.button("🔄 Reload").clicked() {
                         // Clear disk + memory caches and force a full fresh reload
                         self.clear_caches_and_reload();
                     }
                     if self.initial_config_pending && !self.config_is_complete() {
-                        ui.label(colored_text_by_type("Please complete settings to start", "warning"));
+                        ui.label(colored_text_themed("Please complete settings to start", "warning", is_dark));
                     }
-                    if ui.button("Open Log").clicked() {
+                    if ui.button("📋 Log").clicked() {
                         // Open log file directly in editor
                         let path = crate::logger::log_path();
                         #[cfg(target_os = "macos")]
@@ -3383,10 +3417,10 @@ impl eframe::App for MacXtreamer {
                             ui.label(egui::RichText::new(format!("Pending tex:{} covers:{} decodes:{} dl:{}", self.pending_texture_uploads.len(), self.pending_covers.len(), self.pending_decode_urls.len(), self.active_downloads())).small()).on_hover_text("Debug Statistiken im Low-CPU Mode");
                         }
                         if !self.has_mpv {
-                            ui.colored_label(egui::Color32::YELLOW, "mpv not found – open Settings and set the path if installed");
+                            ui.colored_label(type_color("warning", is_dark), "mpv not found – open Settings and set the path if installed");
                         }
                     });
-                    if ui.button("Settings").clicked() {
+                    if ui.button("⚙ Settings").clicked() {
                         self.config_draft = Some(self.config.clone());
                         self.show_config = true;
                     }
@@ -3667,17 +3701,17 @@ impl eframe::App for MacXtreamer {
                         SearchStatus::Searching => {
                             ui.horizontal(|ui| {
                                 ui.spinner();
-                                ui.label(colored_text_by_type("Searching...", "info"));
+                                ui.label(colored_text_themed("Searching...", "info", is_dark));
                             });
                         }
                         SearchStatus::NoResults => {
-                            ui.label(colored_text_by_type("⚠ Keine Ergebnisse gefunden", "warning"));
+                            ui.label(colored_text_themed("⚠ Keine Ergebnisse gefunden", "warning", is_dark));
                         }
                         SearchStatus::Error(err) => {
-                            ui.label(colored_text_by_type(&format!("❌ Suchfehler: {}", err), "error"));
+                            ui.label(colored_text_themed(&format!("❌ Suchfehler: {}", err), "error", is_dark));
                         }
                         SearchStatus::Completed { results } => {
-                            ui.label(colored_text_by_type(&format!("✅ {} Ergebnisse gefunden", results), "success"));
+                            ui.label(colored_text_themed(&format!("✅ {} Ergebnisse gefunden", results), "success", is_dark));
                         }
                         SearchStatus::Idle => {
                             // Keine Anzeige bei Idle
@@ -3685,7 +3719,7 @@ impl eframe::App for MacXtreamer {
                         SearchStatus::Indexing { progress } => {
                             ui.horizontal(|ui| {
                                 ui.spinner();
-                                ui.label(colored_text_by_type(&format!("🏗️ {}", progress), "info"));
+                                ui.label(colored_text_themed(&format!("🏗️ {}", progress), "info", is_dark));
                             });
                         }
                     }
@@ -3834,7 +3868,7 @@ impl eframe::App for MacXtreamer {
                         .collect();
                     
                     cols[0].horizontal(|ui| {
-                        ui.label(RichText::new("Live").strong());
+                        ui.label(RichText::new("📡 Live").strong().color(type_color("Channel", is_dark)));
                         if ui.checkbox(&mut self.filter_live_language, "Filter by Language").changed() {
                             // Persist change
                             self.config.filter_live_language = self.filter_live_language;
@@ -3912,7 +3946,7 @@ impl eframe::App for MacXtreamer {
                         .collect();
 
                     cols[1].horizontal(|ui| {
-                        ui.label(RichText::new("VOD").strong());
+                        ui.label(RichText::new("🎬 VOD").strong().color(type_color("Movie", is_dark)));
                         if ui.checkbox(&mut self.filter_vod_language, "Filter by Language").changed() {
                             self.config.filter_vod_language = self.filter_vod_language;
                             let _ = crate::config::save_config(&self.config);
@@ -3977,7 +4011,7 @@ impl eframe::App for MacXtreamer {
                         .collect();
 
                     cols[2].horizontal(|ui| {
-                        ui.label(RichText::new("Series").strong());
+                        ui.label(RichText::new("📺 Series").strong().color(type_color("Series", is_dark)));
                         if ui.checkbox(&mut self.filter_series_language, "Filter by Language").changed() {
                             self.config.filter_series_language = self.filter_series_language;
                             let _ = crate::config::save_config(&self.config);
@@ -4200,8 +4234,8 @@ impl eframe::App for MacXtreamer {
                                                 if let Some(sz)=size_opt { ui.weak(format_file_size(sz)); }
                                                 if waiting { ui.weak("waiting"); }
                                                 else if finished {
-                                                    if let Some(err)=error_opt.as_ref(){ ui.label(colored_text_by_type(&format!("error: {}",err),"error")); }
-                                                    else { ui.label(colored_text_by_type("done","success")); }
+                                                    if let Some(err)=error_opt.as_ref(){ ui.label(colored_text_themed(&format!("error: {}",err),"error",is_dark)); }
+                                                    else { ui.label(colored_text_themed("done","success",is_dark)); }
                                                 } else {
                                                     // Play button während des Downloads (wenn Pfad vorhanden)
                                                     if let Some(p)=&path_opt {
@@ -4651,15 +4685,23 @@ impl eframe::App for MacXtreamer {
                                             if let Some(tex) = self.textures.get(cu) {
                                                 ui.add(egui::Image::new(tex).fit_to_exact_size(egui::vec2(cover_w, self.cover_height)));
                                             } else {
-                                                let rect = ui.allocate_exact_size(egui::vec2(cover_w, self.cover_height), egui::Sense::hover()).0;
-                                                ui.painter().rect_filled(rect, 4.0, Color32::from_gray(60));
+                                                let (rect, _) = ui.allocate_exact_size(egui::vec2(cover_w, self.cover_height), egui::Sense::hover());
+                                                let (bg, border, icon_color) = if is_dark {
+                                                    (Color32::from_rgb(28, 28, 42), Color32::from_rgb(60, 60, 80), Color32::from_gray(120))
+                                                } else {
+                                                    (Color32::from_rgb(220, 224, 238), Color32::from_rgb(170, 175, 200), Color32::from_gray(140))
+                                                };
+                                                ui.painter().rect_filled(rect, 6.0, bg);
+                                                ui.painter().rect_stroke(rect, 6.0, egui::Stroke::new(1.0, border));
+                                                let icon = if r.info == "Channel" { "📡" } else if r.info == "Series" { "📺" } else { "🎬" };
+                                                ui.painter().text(rect.center(), egui::Align2::CENTER_CENTER, icon, egui::FontId::proportional(20.0), icon_color);
                                                 self.spawn_fetch_cover(cu);
                                             }
                                         }
                                     }); },
                             ColumnKey::Name => { row.col(|ui| {
                                 if r.info == "Series" {
-                                    if ui.link(&r.name).clicked() {
+                                    if ui.link(RichText::new(&r.name).color(type_color("Series", is_dark))).clicked() {
                                         if let Some(cv) = &self.current_view {
                                             self.view_stack.push(cv.clone());
                                         }
@@ -4670,14 +4712,20 @@ impl eframe::App for MacXtreamer {
                                         self.spawn_load_episodes(r.id.clone());
                                     }
                                 } else {
-                                    ui.label(&r.name);
+                                    ui.label(colored_text_themed(&r.name, &r.info, is_dark));
                                 }
                             }); },
-                            ColumnKey::ID => { row.col(|ui| { ui.label(&r.id); }); },
-                            ColumnKey::Info => { row.col(|ui| { ui.label(&r.info); }); },
-                            ColumnKey::Year => { row.col(|ui| { ui.label(r.year.clone().unwrap_or_default()); }); },
-                            ColumnKey::ReleaseDate => { row.col(|ui| { ui.label(r.release_date.clone().unwrap_or_default()); }); },
-                            ColumnKey::Rating => { row.col(|ui| { ui.label(r.rating_5based.map(|v| format!("{:.1}", v)).unwrap_or_default()); }); },
+                            ColumnKey::ID => { row.col(|ui| { ui.label(RichText::new(&r.id).weak()); }); },
+                            ColumnKey::Info => { row.col(|ui| { ui.label(colored_text_themed(&r.info, &r.info, is_dark)); }); },
+                            ColumnKey::Year => { row.col(|ui| { ui.label(RichText::new(r.year.clone().unwrap_or_default()).weak()); }); },
+                            ColumnKey::ReleaseDate => { row.col(|ui| { ui.label(RichText::new(r.release_date.clone().unwrap_or_default()).weak()); }); },
+                            ColumnKey::Rating => { row.col(|ui| {
+                                if let Some(v) = r.rating_5based {
+                                    let full = v.floor() as usize;
+                                    let stars: String = "★".repeat(full.min(5)) + &"☆".repeat(5usize.saturating_sub(full));
+                                    ui.label(RichText::new(format!("{} {:.1}", stars, v)).color(rating_color(is_dark)));
+                                }
+                            }); },
                             ColumnKey::Genre => { row.col(|ui| { ui.label(r.genre.clone().unwrap_or_default()); }); },
                             ColumnKey::Languages => { row.col(|ui| { ui.label(r.audio_languages.clone().unwrap_or_default()); }); },
                             ColumnKey::Path => { row.col(|ui| { ui.label(r.path.clone().unwrap_or_default()); }); },
@@ -4698,7 +4746,7 @@ impl eframe::App for MacXtreamer {
                             ColumnKey::Actions => { row.col(|ui| {
                                 ui.horizontal_wrapped(|ui| {
                                     if r.info == "Series" {
-                                        if ui.small_button("Episodes").clicked() {
+                                        if ui.small_button("▶ Episodes").clicked() {
                                             if let Some(cv) = &self.current_view {
                                                 self.view_stack.push(cv.clone());
                                             }
@@ -4709,8 +4757,9 @@ impl eframe::App for MacXtreamer {
                                             self.spawn_load_episodes(r.id.clone());
                                         }
                                         let is_fav = is_favorite(&r.id, &r.info, "Series");
+                                        let fav_color = if is_fav { fav_active_color(is_dark) } else { Color32::from_gray(140) };
                                         let fav_text = if is_fav { "★" } else { "☆" };
-                                        if ui.small_button(fav_text).on_hover_text("Zu Favoriten hinzufügen/entfernen").clicked() {
+                                        if ui.add(egui::Button::new(RichText::new(fav_text).color(fav_color))).on_hover_text("Zu Favoriten hinzufügen/entfernen").clicked() {
                                             toggle_favorite(&FavItem {
                                                 id: r.id.clone(),
                                                 info: r.info.clone(),
@@ -4727,7 +4776,7 @@ impl eframe::App for MacXtreamer {
                                             self.confirm_bulk = Some((r.id.clone(), r.name.clone()));
                                         }
                                     } else {
-                                        if ui.small_button("Play").clicked() {
+                                        if ui.add(egui::Button::new(RichText::new("▶ Play").color(Color32::WHITE)).fill(play_button_fill(is_dark))).clicked() {
                                             if self.config.address.is_empty() || self.config.username.is_empty() || self.config.password.is_empty() {
                                                 self.last_error = Some("Please set address/username/password in Settings".into());
                                             } else {
@@ -5500,7 +5549,7 @@ impl eframe::App for MacXtreamer {
                         ui.add_space(4.0);
                         ui.weak("The app will restart automatically after installation.");
                     } else {
-                        ui.colored_label(egui::Color32::YELLOW, "⚠️ No DMG asset found in this release.");
+                        ui.colored_label(type_color("warning", is_dark), "⚠️ No DMG asset found in this release.");
                         ui.horizontal(|ui| {
                             if ui.hyperlink_to("Open Releases page", "https://github.com/modze996/macxtreamer/releases").clicked() {}
                             if ui.button("Close").clicked() { close_update = true; }
